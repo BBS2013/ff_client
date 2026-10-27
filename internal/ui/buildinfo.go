@@ -5,6 +5,8 @@ import (
 	"os"
 	"regexp"
 	"time"
+
+	"wps_app/internal/buildinfo"
 )
 
 // DistFS 是这份产物内嵌的前端文件系统，由带 gui 标签的那份文件在 init 里装上。
@@ -19,6 +21,13 @@ var DistFS fs.FS
 // 而不是改动没做。与其让人去比 `strings wps_app-gui | grep index-` 与 `ls frontend/dist`，
 // 不如把这两个数摆到同一屏上，并且直接把结论说出来。
 type BuildInfo struct {
+	// Version 是 VERSION 文件里的版本号。
+	Version string `json:"version"`
+	// Stamp 是源码指纹（git 短 commit + -dirty，或内容哈希）。
+	// 它回答的是"这份二进制是从哪份源码编的"，exeModTime 回答不了。
+	Stamp string `json:"stamp"`
+	// BuiltAt 是构建时刻（UTC，ISO 8601）；空 = 没走构建脚本。
+	BuiltAt string `json:"builtAt"`
 	// ExePath 是本进程的可执行文件路径。
 	ExePath string `json:"exePath"`
 	// ExeModTime 是磁盘上那份二进制的改动时间（Unix 毫秒）。
@@ -58,7 +67,13 @@ func (a *App) BuildInfo() BuildInfo {
 // buildInfo 把"取路径 / 取磁盘时间"这两件不可注入的事隔在外面，
 // 判断本身交给 fillExe，好让 NewerOnDisk 那条能被正反两头验到。
 func buildInfo(started time.Time, asset string) BuildInfo {
-	info := BuildInfo{StartedAt: started.UnixMilli(), Frontend: asset}
+	info := BuildInfo{
+		Version:   buildinfo.Version,
+		Stamp:     buildinfo.Stamp,
+		BuiltAt:   buildinfo.BuiltAt,
+		StartedAt: started.UnixMilli(),
+		Frontend:  asset,
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return info

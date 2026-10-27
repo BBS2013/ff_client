@@ -1,10 +1,12 @@
 # wps_app v0.1.0 可交付性验收报告
 
-验收日期：2026-10-16　　被验版本：仓库 HEAD（`/home/chery/wps_app`，非 git 仓库）
+验收日期：2026-10-16　　被验版本：2026-10-16 工作树（当时尚未纳入 git；2026-10-27 已建立 baseline）
 构建环境：Ubuntu 22.04 / go1.26.9 / amd64
 
-复现本报告的全部证据脚本与原始输出在 `/tmp/accept/`（CLI 参数矩阵、`-check`、
-协议测试、信号处理、压测、TUN 实链各自的 `.sh`/`.py` 与 `.log`）。
+复现本报告的全部证据脚本与原始输出原在 `/tmp/accept/`。**该目录已随机器重启消失**
+（2026-10-27 发现），所以下面的复现命令不能再照抄。2026-10-27 起，
+A6 协议与 A8 信号脚本已重建到 `scripts/acceptance/` 并实跑通过（16/16、3/3）；
+B3 脚本入库但本次未跑；A4 CLI 矩阵、压测与 gctrace 仍未找回/重建。
 
 ---
 
@@ -377,34 +379,28 @@ README §12 已声明为限制（防回环）。本轮 TUN 实链用的是 hyste
 
 ## 7. 怎么复现本报告
 
+**2026-10-27 现状**：`/tmp/accept/` 已不存在。仓库内现在能跑的是 A6/A8：
+
 ```bash
 # A3 全量 race
 go test ./... -race
 
-# A4 CLI 参数矩阵（18 条）
-bash /tmp/accept/cli-matrix.sh
+# A6 协议行为（16 条）+ A8 信号处理（3 条），离线、隔离端口
+make acceptance
 
-# A6 协议行为（16 条）
-python3 /tmp/accept/proto-test.py
-
-# A8 信号处理（热重载 + 优雅退出）
-bash /tmp/accept/a8-signals.sh
+# B3 TUN root 实链（会改本机路由/DNS，必须显式启用）
+sudo WPS_ACCEPT_TUN=1 WPS_ACCEPT_TUN_CONFIG=/path/to/tun-test.yaml make acceptance-tun
 
 # 性能 P95（会按预算自动失败）
 go test ./internal/service/ -run 'P95' -v -race
-
-# 5 分钟压测
-bash /tmp/accept/stress.sh
-
-# 内存口径（活堆对照）
-bash /tmp/accept/gctrace.sh 90
-
-# B3 TUN root 实链
-bash /tmp/accept/b2-tun.sh
-
-# CONNECT 200 的成因对照实验
-python3 /tmp/accept/connect-unreachable.py
 ```
+
+仍未入库（原脚本随 `/tmp` 丢失，需要重建）：
+
+- A4 CLI 参数矩阵（18 条）
+- 5 分钟压测与 gctrace 内存口径
+- `connect-unreachable.py`（CONNECT 200 的成因对照）
+- B3 的原始证据脚本；`scripts/acceptance/tun_test.sh` 是重建版，2026-10-27 未在执行环境跑过
 
 ### 复现注意事项
 

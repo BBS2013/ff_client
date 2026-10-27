@@ -4,17 +4,23 @@
 # 用法:
 #   ./scripts/build-gui.sh              # 装依赖（缺依赖才装）→ 构建前端 → go build
 #   ./scripts/build-gui.sh --skip-frontend   # 复用已有的 frontend/dist，只重编 Go
+#   WPS_GUI_OUT=/tmp/x ./scripts/build-gui.sh --skip-frontend
+#                                       # 输出到别处。make gate 用这条把产物放进
+#                                       # dist/gate/，避免覆盖正在跑的面板二进制。
 #
 # 与 make build-gui 等价，这个脚本只是为了在没有 make 的机器上也能出产物。
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/wps_app-gui"
+# 默认仍是仓库根下的 wps_app-gui（发布/手工重建的惯用位置）；
+# gate 之类的验证构建必须用 WPS_GUI_OUT 指到临时目录。
+OUT="${WPS_GUI_OUT:-$ROOT/wps_app-gui}"
 # gui 是我们的隔离标签（把 GTK/WebKit 运行时关在默认构建之外），
 # production 是 Wails 自己的。两个都要给，缺一个都编不出可用产物。
 TAGS="gui production"
-LDFLAGS="-s -w"
+# 与 Makefile/package.sh 共用同一份注入：版本、源码指纹、构建时刻。
+LDFLAGS="$("$ROOT/scripts/build-ldflags.sh")"
 
 SKIP_FRONTEND=0
 for arg in "$@"; do
@@ -39,6 +45,7 @@ fi
 
 echo "==> 编译 GUI 二进制"
 # Wails 的 GTK 后端必须走 CGO，CGO_ENABLED=0 编不出窗口。
+mkdir -p "$(dirname "$OUT")"
 CGO_ENABLED=1 go build -tags "$TAGS" -ldflags="$LDFLAGS" -o "$OUT" .
 
 echo "完成: $OUT ($(du -h "$OUT" | cut -f1))"

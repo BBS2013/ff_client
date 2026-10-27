@@ -345,3 +345,18 @@ func TestParseArgsCheckHosts(t *testing.T) {
 		})
 	}
 }
+
+func TestParseArgsVersion(t *testing.T) {
+	o, err := parseArgs([]string{"-version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.version {
+		t.Fatal("-version 没有被解析成 version 动作")
+	}
+	// -version 不该顺带要求一个真实配置文件；默认值仍然可以指向 config.yaml，
+	// 但 runCLI 会在读配置之前就返回。
+	if o.configPath == "" {
+		t.Error("默认配置路径被清空了：这会让 -version 的解析路径与其它选项不一致")
+	}
+}

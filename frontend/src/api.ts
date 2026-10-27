@@ -1432,6 +1432,9 @@ function demoBridge(): AppBridge {
       // 所以这一格报的是"演示页自己用的那个 JS 文件"，newerOnDisk 恒为 false：
       // 造一个 true 出来只会让人去查一个不存在的旧进程。
       return {
+        version: '（演示）',
+        stamp: '（演示）',
+        builtAt: '',
         exePath: '（演示模式：没有本机二进制）',
         exeModTime: 0,
         startedAt: started,

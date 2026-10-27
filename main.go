@@ -8,12 +8,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"wps_app/internal/buildinfo"
 	"wps_app/internal/config"
 	"wps_app/internal/diag"
 	"wps_app/internal/logx"
@@ -55,7 +60,7 @@ func (t targetsFlag) Set(s string) error {
 }
 
 // boolFlags 是布尔开关，拆分参数时不吃掉后面那个参数。
-var boolFlags = map[string]bool{"check": true, "gui": true, "cli": true, "h": true, "help": true, "tun-helper": true}
+var boolFlags = map[string]bool{"check": true, "gui": true, "cli": true, "h": true, "help": true, "tun-helper": true, "version": true}
 
 // splitArgs 把命令行拆成 flag 部分与位置参数部分。
 // 标准库 flag.Parse 遇到第一个非 flag 参数就会停止，导致
@@ -99,6 +104,13 @@ type options struct {
 	sysProxy   string
 	// diag 打印一份离线诊断报告后退出：不抢实例锁、不启停任何东西。
 	diag bool
+	// version 打印版本、源码指纹与构建时刻后退出；不读配置、不碰网络。
+	version bool
+	// logFile 让日志除原输出外再写一份到文件（0600，20MB × 3 轮转）。
+	// GUI 没写这个参数时默认写 <config>.log；CLI 只有显式给了才写。
+	logFile string
+	// pprof 是可选的本机性能诊断监听地址（只允许回环）。默认关。
+	pprof string
 	// tunHelper 让同一个二进制以提权 helper 身份跑一次：面板把 argv 配上 sudo，
 	// 自己则以普通用户身份保住系统托盘（见 internal/tunx/helper_linux.go）。
 	tunHelper        bool
@@ -120,6 +132,9 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.BoolVar(&o.tunReset, "tun-reset", false, "清理 TUN 遗留的 iptables 劫持规则与网卡后退出")
 	fs.StringVar(&o.sysProxy, "sysproxy", "", "设置桌面系统代理：on | off | restore | status（写完即退出）")
 	fs.BoolVar(&o.diag, "diag", false, "打印一份离线诊断报告（口令已掩码、不碰外网）后退出")
+	fs.BoolVar(&o.version, "version", false, "打印版本、源码指纹与构建时刻后退出")
+	fs.StringVar(&o.logFile, "log-file", "", "日志同时写入这个文件（0600，20MB×3 轮转）；GUI 不写时默认 <config>.log")
+	fs.StringVar(&o.pprof, "pprof", "", "开启 pprof 诊断监听（只允许回环地址，如 127.0.0.1:6060；默认关）")
 	fs.BoolVar(&o.tunHelper, "tun-helper", false, "以 TUN 提权 helper 身份运行：连回面板、开/关网卡、退出（面板通过 tun.helper 配置唤起，需要 root）")
 	fs.StringVar(&o.tunHelperConnect, "tun-helper-connect", "", "helper 模式下要连接的套接字路径（由面板自动传入，不用手写）")
 	return fs
@@ -192,6 +207,34 @@ func main() {
 
 // runCLI 是 CLI 模式的入口，需要界面时改走 GUI 装配。
 func runCLI(o options) error {
+	if o.version {
+		fmt.Println(buildinfo.Summary())
+		return nil
+	}
+	// 显式给了 -log-file 就现在打开：一键式命令（-check/-diag/-sysproxy）也照写。
+	// GUI 的默认日志在 runGUI 里按 <config>.log 打开，避免与这里重复。
+	logOpened := false
+	if o.logFile != "" {
+		if closer, err := openLogFile(o.logFile); err != nil {
+			logx.Warnf("日志文件打不开（%s）: %v；继续只用原输出", o.logFile, err)
+		} else {
+			defer func() { _ = closer.Close() }()
+			logOpened = true
+			logx.Infof("日志同时写入 %s（%dMB × %d 轮转）", o.logFile, logx.DefaultMaxBytes>>20, logx.DefaultBackups)
+		}
+	}
+	if o.pprof != "" {
+		addr, err := pprofListenAddr(o.pprof)
+		if err != nil {
+			return err
+		}
+		go func() {
+			logx.Warnf("pprof 已开启：%s（只监听回环；诊断完请重启关掉）", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				logx.Warnf("pprof 退出: %v", err)
+			}
+		}()
+	}
 	if o.tunHelper {
 		return tunHelperCommand(o.tunHelperConnect)
 	}
@@ -205,9 +248,42 @@ func runCLI(o options) error {
 		return diagReport(o.configPath)
 	}
 	if wantGUI(o) {
-		return runGUI(o.configPath)
+		return runGUI(o.configPath, o.logFile, logOpened)
 	}
 	return run(o.configPath, o.checkOnly, o.checkHosts, o.checkFetch, o.mode)
+}
+
+// openLogFile 把相对路径钉成绝对路径再打开：调用方可能在 runGUI 里 chdir，
+// 相对路径会在打开之后指向别处，轮转时就会把新文件建到错误目录。
+func openLogFile(path string) (io.Closer, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	return logx.SetFileOutput(abs, logx.DefaultMaxBytes, logx.DefaultBackups)
+}
+
+// pprofListenAddr 只放行回环地址。
+//
+// pprof 的堆快照里有访问过的域名、连接目标与令牌；把一个默认关的诊断口
+// 开到 0.0.0.0 等于给局域网发一份运行期内存转储。这里宁可拒绝，
+// 也不做"先开再提醒"的自动降级。
+func pprofListenAddr(raw string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("-pprof %q: %w", raw, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("-pprof %q: 缺端口", raw)
+	}
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("-pprof %q: 只允许回环地址（127.0.0.1 或 ::1）", raw)
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 // wantGUI 决定这次启动是开桌面界面还是只跑代理服务。

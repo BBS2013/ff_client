@@ -12,6 +12,7 @@ import (
 	"embed"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 
@@ -48,8 +49,23 @@ const guiDefault = true
 // resolveConfigPath 与 chdirToConfigDir 住在 configpath.go（没有构建标签），
 // 这样它们才进得了 `go test ./...`——判断没被测过，就等于交给"哪天有人双击一次"。
 
-func runGUI(configPath string) error {
+func runGUI(configPath, logFile string, logOpened bool) error {
 	configPath = resolveConfigPath(configPath)
+	// 面板的 stdout 是启动器给的 socket，进程一退就没了。默认把日志写到
+	// <config>.log（0600，20MB × 3），至少让"昨天为什么断了"有纸可查。
+	if !logOpened {
+		abs, err := filepath.Abs(configPath)
+		if err != nil {
+			abs = configPath
+		}
+		logFile = abs + ".log"
+		if closer, err := logx.SetFileOutput(logFile, logx.DefaultMaxBytes, logx.DefaultBackups); err != nil {
+			logx.Warnf("日志文件打不开（%s）: %v；继续只用内存日志", logFile, err)
+		} else {
+			defer func() { _ = closer.Close() }()
+			logx.Infof("日志同时写入 %s（%dMB × %d 轮转）", logFile, logx.DefaultMaxBytes>>20, logx.DefaultBackups)
+		}
+	}
 	chdirToConfigDir(configPath)
 	app := ui.New(configPath)
 

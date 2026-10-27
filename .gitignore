@@ -16,6 +16,8 @@
 
 # 依赖目录
 /frontend/node_modules/
+/frontend/coverage/
+/frontend/.vitest/
 
 # 第三方数据（许可不允许再分发）与私人规则
 /assets/geoip.mmdb

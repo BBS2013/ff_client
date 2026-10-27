@@ -27,6 +27,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"wps_app/internal/buildinfo"
 	"wps_app/internal/config"
 	"wps_app/internal/metrics"
 	"wps_app/internal/netdev"
@@ -34,6 +35,7 @@ import (
 	"wps_app/internal/procid"
 	rulesPkg "wps_app/internal/rules"
 	"wps_app/internal/sysproxy"
+	"wps_app/internal/tunx"
 )
 
 // probeTimeout 是本机端口探测的预算。回环上的 connect 正常是微秒级，
@@ -175,6 +177,7 @@ func identity(b *builder, cfgPath string) {
 	// 这份东西是被贴出去看的，所以时刻要写在里面：
 	// "入站没人听"到底是现在的状态，还是三小时前那次崩溃之后没重启，差一个时间戳就是两回事。
 	b.line("生成于 %s", time.Now().Format("2006-01-02 15:04:05 -0700"))
+	b.line("构建 %s", buildinfo.Summary())
 	exe := procid.Self()
 	if exe == "" {
 		exe = "读不到（os.Executable 失败）"
@@ -491,6 +494,9 @@ func tun(b *builder, cfg *config.Config) {
 	b.line("假 IP 段 %s；DNS 劫持 %s；严格路由 %s",
 		orNoneStr(cfg.TUN.FakeIPRange, "（未配）"),
 		yesNo(cfg.TUN.HijackDNS), onOff(cfg.TUN.StrictRoute))
+	for _, note := range tunx.CapabilityNotes(cfg) {
+		b.line("注意：%s", note)
+	}
 }
 
 // ifaceSplit 讲清"分流到底有没有在跑"。这节是为那种"开关开了却没反应"的报障写的：

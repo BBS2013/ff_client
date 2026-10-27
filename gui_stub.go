@@ -14,6 +14,6 @@ const guiDefault = false
 // 那会把 GTK3/WebKit2GTK 的运行时依赖强加给 systemd 部署路径。
 // 用构建标签把两种产物彻底分开，这里只负责给出可操作的错误提示。
 // 带 GUI 的实现在 gui.go（//go:build gui）。
-func runGUI(configPath string) error {
+func runGUI(configPath, logFile string, logOpened bool) error {
 	return fmt.Errorf("-gui 需要带 gui 标签的构建产物（make build-gui）；当前二进制只含命令行模式，配置文件 %s", configPath)
 }

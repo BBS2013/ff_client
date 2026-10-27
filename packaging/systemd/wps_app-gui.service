@@ -1,0 +1,23 @@
+[Unit]
+Description=wps_app 桌面控制面板（崩溃自动重启）
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# 改成你自己的路径。配置文件必须和平时手动启动时用的是同一份，
+# 否则会变成两个实例抢不同的入站端口。
+ExecStart=%h/wps_app/wps_app-gui %h/wps_app/config.yaml
+Restart=on-failure
+RestartSec=2
+# TUN 收尾要拆网卡、摘 iptables，真机上见过十几秒；
+# 别在它拆完之前升级成 SIGKILL。
+KillSignal=SIGTERM
+TimeoutStopSec=40
+KillMode=mixed
+# 不要加 NoNewPrivileges=yes：TUN helper 依赖 setuid sudo。
+# GUI 需要会话总线与显示。若 systemd --user 没有继承，先执行：
+#   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=graphical-session.target

@@ -694,6 +694,12 @@ func (s *Service) startTUN(cfg *config.Config) error {
 	rt, resolve, reg := s.rt, s.resolve, s.reg
 	s.mu.Unlock()
 
+	// 先把"没端到端验过"的组合说在前面：TUN 不通时，用户第一步该换的是
+	// 有证据的那条路，而不是从 DHCP 开始怀疑。
+	for _, note := range tunx.CapabilityNotes(cfg) {
+		logx.Warnf("%s", note)
+	}
+
 	t, err := tunx.New(tunx.Options{
 		Conf:      cfg.TUN,
 		Router:    rt,

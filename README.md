@@ -53,7 +53,7 @@ v0.1.0 的可交付性验收结论、问题清单与复现步骤见 [ACCEPTANCE.
 
 ## 2. 构建
 
-需要 Go 1.24+（本项目用 `go 1.26.9` 构建）。国内网络先设 `GOPROXY`：
+需要 Go 1.26.9（`go.mod` 的 `go` 指令钉到 patch 版本；离线构建也要求本机已有这个版本的工具链）。国内网络先设 `GOPROXY`：
 
 ```bash
 export GOPROXY=https://goproxy.cn,direct   # proxy.golang.org 在本机不通
@@ -4797,14 +4797,14 @@ README 其余部分（规则、模式、TUN、helper）对两个产物完全一�
 make gate        # 一条命令跑全套离线门禁，约 2 分钟
 ```
 
-> **注意**：`make gate` 的最后一步是 `build-gui`，它会**直接覆盖 `./wps_app-gui`**——
-> 也就是此刻正在跑的那个面板所用的二进制。只想验证"能不能编"，
-> 别跑 `build-gui`，用 `go build -tags "gui production" -o /tmp/x .`。
-> 另外前面任何一步红，gate 会当场退出，`frontend` / `build-gui` 根本不会跑：
+> **注意**：`make gate` 的最后一步是 `gate-gui`，产物固定写到
+> `dist/gate/wps_app-gui`，**不会覆盖 `./wps_app-gui`**（正在跑的面板用的那份）。
+> 发布/手工重建仍用 `make build-gui`，那个目标会覆盖 `./wps_app-gui`。
+> 另外前面任何一步红，gate 会当场退出，`frontend` / `gate-gui` 根本不会跑：
 > 没看到它们的报错不等于它们通过了。
 
 它按顺序做：`fmt-check` → `build` → `vet`（两种 tag）→ `test` → `race` →
-`test-offline` → `fuzz-smoke` → `frontend`（含 `vue-tsc` 类型门）→ `build-gui`。
+`test-offline` → `fuzz-smoke` → `frontend`（含 `vue-tsc` 类型门）→ `gate-gui`。
 **全程不碰外网、不碰线上配置、不碰正在跑的面板**，所以断网的机器和 CI 都能跑。
 
 这里要分清两条容易混的命令，它们不是一回事：

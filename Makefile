@@ -7,11 +7,16 @@
 
 BIN      := wps_app
 GUI_BIN  := wps_app-gui
-LDFLAGS  := -s -w
+# 版本/源码指纹/构建时刻由同一个脚本注入，避免三份产物口径漂移。
+LDFLAGS  := $(shell ./scripts/build-ldflags.sh)
 # gui 把 GTK/WebKit 运行时限制在 GUI 产物里；production 是 Wails 自己的标签。
 GUI_TAGS := gui production
+# gate 的 GUI 产物单独放：它验证的是"能不能链接、能不能跑"，不该覆盖
+# ./wps_app-gui 这个正在被面板使用的发布产物。dist/ 已在 .gitignore 里。
+GATE_DIR     := dist/gate
+GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui frontend test test-offline fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package
+.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once
 
 all: build
 
@@ -20,12 +25,24 @@ build:
 	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BIN) .
 
 ## GUI 构建：先出前端产物再编 Go。完整逻辑见 scripts/build-gui.sh。
+## 这是发布/手工重建用的目标：它会覆盖 ./wps_app-gui。
 build-gui:
 	./scripts/build-gui.sh
+
+## gate 专用的 GUI 构建：产物进 dist/gate/，绝不覆盖 ./wps_app-gui。
+## 前端由 frontend 目标先构建，这里只做 go build 的链接验证。
+gate-gui: frontend
+	mkdir -p $(GATE_DIR)
+	WPS_GUI_OUT="$(abspath $(GATE_GUI_BIN))" ./scripts/build-gui.sh --skip-frontend
 
 ## 只重建前端产物，供本地调样式时快速迭代。
 frontend:
 	cd frontend && npm run build
+
+## 前端纯函数测试 + 覆盖率闸门（format/ageclock/nodetests/probes）。
+## 组件交互仍靠人工点验；这里守的是"算得对不对"。
+frontend-test:
+	cd frontend && npm run test:coverage
 
 ## test 带 -timeout 是有原因的：死锁的症状不是"测试失败"，是"门禁挂住"。
 ## 今天加一个投影字段时，Snapshot 在持锁期间调了另一个要抢同一把锁的读方法
@@ -117,10 +134,11 @@ fmt-check:
 ## 与 check 的区别要说清：check 拿仓库里的 config.yaml 做真机自检，
 ## 它会向你的节点与订阅源发请求、可能重写订阅缓存——那是"部署前自己看一眼"，
 ## 不是回归门禁。gate 只验证代码，断网的机器上、CI 上都能跑。
-## 里面刻意含 build-gui：只有它会把 `//go:build gui` 下的文件真链接一遍，
-## vet 能查语法、查不出链接期的缺失符号。
-gate: fmt-check build vet test race test-offline fuzz-smoke frontend build-gui
-	@echo "全套门禁通过"
+## 里面刻意含 gate-gui：只有它会把 `//go:build gui` 下的文件真链接一遍，
+## vet 能查语法、查不出链接期的缺失符号。产物固定写到 dist/gate/，
+## 所以 gate 跑完后 ./wps_app-gui（正在跑的面板）的字节与 mtime 都不变。
+gate: fmt-check build vet test race test-offline fuzz-smoke frontend frontend-test gate-gui
+	@echo "全套门禁通过（GUI 产物: $(GATE_GUI_BIN)，未触碰 ./$(GUI_BIN)）"
 
 ## package 出两个包：给使用者的运行包（预编译产物）与含 vendor 的源码包。
 ## 细节与三条红线（不带 config.yaml / 不带 GeoLite2 / 不带你的 user-rules）见 scripts/package.sh。
@@ -130,6 +148,26 @@ package:
 ## check 是程序自带的配置与链路自检，与 go test 互补。
 check: build
 	./$(BIN) config.yaml -check
+
+## acceptance 是仓库内可离线跑的验收：A6 协议 16 项 + A8 信号。
+## 自己起隔离实例（17891/17892），不碰线上 7891/7892、不碰外网。
+acceptance: build
+	python3 scripts/acceptance/proto_test.py --binary ./$(BIN)
+	bash scripts/acceptance/signals_test.sh ./$(BIN)
+
+## acceptance-tun 是 B3 根权限实链（会改本机路由/DNS）。默认不跑：
+## 没有 WPS_ACCEPT_TUN=1 或专用配置时脚本会打印 SKIP 并以 2 退出。
+acceptance-tun: build
+	bash scripts/acceptance/tun_test.sh ./$(BIN)
+
+## soak 被动采样正在跑的面板（不重启、不发信号），默认每 5 分钟一条。
+## CSV 在 dist/ 下；--summary 汇总已有 CSV。
+soak:
+	./scripts/panel-soak.sh
+
+## soak-once 只采一条，用来验证采样器本身。
+soak-once:
+	./scripts/panel-soak.sh --once
 
 clean:
 	rm -f $(BIN) $(GUI_BIN)

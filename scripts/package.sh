@@ -7,6 +7,7 @@
 # 用法:
 #   ./scripts/package.sh                 # 出两个包
 #   ./scripts/package.sh --no-src        # 只出运行包
+#   ./scripts/package.sh --no-gui        # 明确不要 GUI（缺 WebKit 开发包时用）
 #   ./scripts/package.sh --frontend      # 顺手 npm 重构建前端（默认复用已有 frontend/dist）
 #   ./scripts/package.sh --with-geoip    # 明知故犯地把 geoip.mmdb 打进包（见下面 NOTICE 的理由）
 #
@@ -29,12 +30,14 @@ DIST="$ROOT/dist"
 BUILD_SRC=1
 BUILD_FRONTEND=0
 WITH_GEOIP=0
+NO_GUI=0
 for arg in "$@"; do
   case "$arg" in
     --no-src)     BUILD_SRC=0 ;;
+    --no-gui)     NO_GUI=1 ;;
     --frontend)   BUILD_FRONTEND=1 ;;
     --with-geoip) WITH_GEOIP=1 ;;
-    -h|--help)    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $arg" >&2; exit 1 ;;
   esac
 done
@@ -49,6 +52,7 @@ STAGE="$DIST/$NAME"
 # 编译一律走 vendor：没有网络也能出包，且保证包里的依赖版本就是这个目录里的那份。
 export GOFLAGS=-mod=vendor
 export GOPROXY=off
+LDFLAGS="$("$ROOT/scripts/build-ldflags.sh")"
 
 say() { printf '==> %s\n' "$*"; }
 
@@ -65,14 +69,18 @@ mkdir -p "$STAGE/assets" "$STAGE/scripts"
 
 say "编译命令行产物（静态、零依赖）"
 # -trimpath 不只是让构建可复现：不带它，二进制的调试段里会留下你机器上的绝对路径。
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$STAGE/wps_app" "$ROOT"
+CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "$STAGE/wps_app" "$ROOT"
+"$STAGE/wps_app" -version >"$STAGE/BUILD-INFO.txt"
 
 say "编译图形面板（需要 GTK3/WebKit2GTK 的开发包）"
-if pkg-config --exists webkit2gtk-4.0 2>/dev/null && pkg-config --exists gtk+-3.0 2>/dev/null; then
-  go build -trimpath -tags "gui production" -ldflags "-s -w" -o "$STAGE/wps_app-gui" "$ROOT"
+if [[ $NO_GUI -eq 1 ]]; then
+  echo "    跳过：显式给了 --no-gui。"
+elif pkg-config --exists webkit2gtk-4.0 2>/dev/null && pkg-config --exists gtk+-3.0 2>/dev/null; then
+  go build -trimpath -tags "gui production" -ldflags "$LDFLAGS" -o "$STAGE/wps_app-gui" "$ROOT"
 else
-  echo "    跳过：本机没有 libgtk-3-dev / libwebkit2gtk-4.0-dev。" \
-       "命令行产物功能完整，只是没有托盘与窗口。" >&2
+  echo "!! 本机没有 libgtk-3-dev / libwebkit2gtk-4.0-dev，运行包会没有 wps_app-gui。" >&2
+  echo "   装上开发包再打包；确实只要命令行版，请显式加 --no-gui。" >&2
+  exit 1
 fi
 
 say "拷资源与文档"
@@ -190,16 +198,18 @@ if [[ $BUILD_SRC -eq 1 ]]; then
   rm -rf "$SRC"
   mkdir -p "$SRC/assets" "$SRC/scripts" "$SRC/frontend"
   # 逐项列出来拷，而不是"全拷 + 排除"：漏排除一次就是把口令发出去一次。
-  cp "$ROOT"/*.go "$ROOT/go.mod" "$ROOT/go.sum" "$ROOT/Makefile" "$ROOT/README.md" "$SRC/"
+  cp "$ROOT"/*.go "$ROOT/go.mod" "$ROOT/go.sum" "$ROOT/Makefile" "$ROOT/README.md" "$ROOT/ACCEPTANCE.md" "$SRC/"
   [[ -f "$ROOT/VERSION" ]] && cp "$ROOT/VERSION" "$SRC/VERSION"
   cp "$ROOT/config.example.yaml" "$SRC/"
   cp "$ROOT/assets/rules.txt" "$SRC/assets/"
   # 不拷 assets/user-rules.txt：那是你在面板里加的域名清单，反映使用习惯
   cp -a "$ROOT/internal" "$ROOT/scripts" "$ROOT/vendor" "$SRC/"
+  [[ -d "$ROOT/packaging" ]] && cp -a "$ROOT/packaging" "$SRC/"
   # dist 是 go:embed 的输入：带着它，对方没有 node 也能编出图形面板
   cp -a "$ROOT/frontend/dist" "$SRC/frontend/"
   cp -a "$ROOT/frontend/src" "$SRC/frontend/"
-  cp "$ROOT/frontend"/*.json "$ROOT/frontend"/*.html "$ROOT/frontend"/vite.config.* "$SRC/frontend/" 2>/dev/null || true
+  cp -a "$ROOT/frontend/tests" "$SRC/frontend/"
+  cp "$ROOT/frontend"/*.json "$ROOT/frontend"/*.html "$ROOT/frontend"/vite.config.* "$ROOT/frontend"/vitest.config.* "$SRC/frontend/" 2>/dev/null || true
   find "$SRC" -name '*.bak' -delete
 fi
 
@@ -234,6 +244,16 @@ if [[ $BUILD_SRC -eq 1 ]]; then
   tar -C "$DIST" -czf "$DIST/wps_app-$VER-src.tar.gz" "wps_app-$VER-src"
   rm -rf "$SRC"
 fi
+
+say "生成校验和"
+(
+  cd "$DIST"
+  sha256sum "$NAME.tar.gz" >SHA256SUMS
+  if [[ $BUILD_SRC -eq 1 ]]; then
+    sha256sum "wps_app-$VER-src.tar.gz" >>SHA256SUMS
+  fi
+)
+echo "    接收端校验： (cd dist && sha256sum -c SHA256SUMS)"
 
 say "产物"
 ls -l "$DIST" | awk 'NR>1 && $5 > 0 {printf "    %9s  %s\n", $1, $9}'

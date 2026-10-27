@@ -636,6 +636,12 @@ export interface DNSProbe {
  * 不如把这两个数摆到同一屏上，并直接给出结论（newerOnDisk）。
  */
 export interface BuildInfo {
+  /** VERSION 文件里的版本号 */
+  version: string
+  /** 源码指纹：git 短 commit（脏树带 -dirty），没有 git 时是内容哈希 */
+  stamp: string
+  /** 构建时刻（UTC ISO 8601）；空 = 没走构建脚本 */
+  builtAt: string
   /** 本进程的可执行文件路径 */
   exePath: string
   /** 磁盘上那份二进制的改动时间（Unix 毫秒），0 = 没读到 */

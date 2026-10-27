@@ -522,6 +522,12 @@ onMounted(load)
       <section class="card">
         <h2>这份界面是哪一次构建</h2>
         <dl class="kv">
+          <dt>版本</dt>
+          <dd class="mono">{{ build?.version || '（未注入）' }}</dd>
+          <dt>源码指纹</dt>
+          <dd class="mono">{{ build?.stamp || '（未注入）' }}</dd>
+          <dt>构建于</dt>
+          <dd class="mono">{{ build?.builtAt || '（未注入，可能不是脚本构建）' }}</dd>
           <dt>内嵌前端</dt>
           <dd class="mono">{{ build?.frontend || '（这份产物不带内嵌界面）' }}</dd>
           <dt>二进制</dt>

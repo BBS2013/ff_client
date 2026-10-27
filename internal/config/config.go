@@ -556,6 +556,10 @@ func (d Duration) MarshalYAML() (any, error) {
 // BackupSuffix 是 Save 备份旧配置时追加的文件名后缀。
 const BackupSuffix = ".bak"
 
+// OrigSuffix 保存"第一次被面板回写之前"的那份文件，且之后永不覆盖。
+// .bak 每次保存都会被上一版盖掉；连续点几次面板，手写注释就只剩 .orig 一份。
+const OrigSuffix = ".orig"
+
 // Save 校验配置后写回磁盘。
 //
 // GUI 允许在线改配置，写坏一次就够停机了，因此这里做三件事：
@@ -576,8 +580,17 @@ func Save(path string, c *Config) error {
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
+	existed := false
+	if _, statErr := os.Stat(path); statErr == nil {
+		existed = true
+	}
 	if err := backup(path); err != nil {
 		return err
+	}
+	if existed {
+		// 整表 marshal 不保留注释；至少把"为什么注释没了、原件在哪"写在文件头上，
+		// 而不是让人对着一个变干净的文件猜。
+		body = append(rewriteHeader(path), body...)
 	}
 
 	dir, base := filepath.Split(path)
@@ -623,11 +636,31 @@ func Save(path string, c *Config) error {
 	return nil
 }
 
-// backup 把当前文件另存为 <path>.bak。文件不存在时不算错误（首次保存）。
+// backup 把当前文件另存为 <path>.bak，并在第一次保存时留下 <path>.orig。
+// 文件不存在时不算错误（首次保存）。
 func backup(path string) error {
 	old, err := os.ReadFile(path)
 	switch {
 	case err == nil:
+		// .orig 用 O_EXCL 只建一次：并发保存或连续点击都不会把第一份原件盖掉。
+		orig := path + OrigSuffix
+		f, oerr := os.OpenFile(orig, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		switch {
+		case oerr == nil:
+			if _, werr := f.Write(old); werr != nil {
+				_ = f.Close()
+				_ = os.Remove(orig)
+				return fmt.Errorf("写原始备份 %s: %w", orig, werr)
+			}
+			if cerr := f.Close(); cerr != nil {
+				_ = os.Remove(orig)
+				return fmt.Errorf("关闭原始备份 %s: %w", orig, cerr)
+			}
+		case errors.Is(oerr, os.ErrExist):
+			// 已经有一份原件了，按约定不再覆盖。
+		default:
+			return fmt.Errorf("创建原始备份 %s: %w", orig, oerr)
+		}
 		if err := os.WriteFile(path+BackupSuffix, old, 0o600); err != nil {
 			return fmt.Errorf("backup %s: %w", path+BackupSuffix, err)
 		}
@@ -637,6 +670,14 @@ func backup(path string) error {
 	default:
 		return fmt.Errorf("read %s: %w", path, err)
 	}
+}
+
+// rewriteHeader 是面板整表回写后加在文件头的两行说明。
+func rewriteHeader(path string) []byte {
+	return []byte(fmt.Sprintf(
+		"# 本文件由 wps_app 于 %s 回写；面板不保留 YAML 注释。\n"+
+			"# 首次回写前的原件保留在 %s（之后不再覆盖）。\n",
+		time.Now().Format("2006-01-02 15:04:05"), filepath.Base(path+OrigSuffix)))
 }
 
 // Load 读取并校验配置文件。
