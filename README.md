@@ -25,15 +25,15 @@ v0.1.0 的可交付性验收结论、问题清单与复现步骤见 [ACCEPTANCE.
 - **门禁隔离**：`make gate` 的 GUI 产物写到 `dist/gate/`，不再覆盖正在跑的面板；发布仍用 `make build-gui`。
 - **构建指纹**：`-version`、`-diag` 与设置页都报出版本、源码指纹（git 短 commit + `-dirty`，无 git 时为内容哈希）与构建时间；`package.sh` 在包里写 `BUILD-INFO.txt`。
 - **验收证据回归仓库**：`/tmp/accept` 已随机器重启丢失；A6 协议 16 项与 A8 信号 3 项重建为 `scripts/acceptance/` 并实跑通过。B3 TUN 脚本入库但未在本机跑（需要 root + 真实节点），默认 `SKIP`。
-- **可观测**：GUI 默认把日志写到 `<config>.log`（0600，20MB×3 轮转），CLI 用 `-log-file`；新增 `-pprof`（仅回环、默认关）与 `make soak` 被动采样（不重启面板）。2026-10-27 09:34 首次采样：面板进程树约 688MB RSS / 122 fd / 40 线程，WebKit 约 432MB；72h 趋势待累积。
+- **可观测**：GUI 默认把日志写到 `<config>.log`（0600，20MB×3 轮转），CLI 用 `-log-file`；新增 `-pprof`（仅回环、默认关）与 `make soak` 被动采样（不重启面板）。2026-10-27 09:34 首次采样：面板进程树约 688MB RSS / 122 fd / 40 线程，WebKit 约 432MB；72h 趋势已开始采集。
 - **崩溃自愈**：`packaging/systemd/wps_app-gui.service`（`Restart=on-failure`）；2026-10-27 用隔离实例 `kill -9` 实测，新 MainPID 在数秒内起来、端口恢复。
 - **配置回写**：首次回写前的原件留在 `config.yaml.orig`（永不覆盖），上一版在 `.bak`；回写文件头会说明注释不保留。
 - **前端测试**：vitest 覆盖 `format/ageclock/nodetests/probes` 纯函数，32 个用例，目标模块行覆盖 100%；组件交互仍靠人工。
 - **打包**：生成 `SHA256SUMS`；缺 WebKit 开发包时默认失败，`--no-gui` 显式放行；README 的 Go 版本要求改为 1.26.9。
 - **能力边界**：TUN+trojan 与 TUN IPv6 的"未实链"状态写进启动日志与 `-diag`，不再只藏在文档里。
-- **代码结构**：`internal/service/service.go` 1936 → 935 行，按 profiles / tun / providers / proxy 拆成同包文件，行为不变。
+- **代码结构**：`internal/service/service.go` 1936 → 931 行，按 profiles / tun / providers / proxy 拆成同包文件，行为不变。
 
-仍未闭环：B3 未在本机重跑；72h 内存观察刚开始；TUN+trojan / IPv6 / UDP 远端仍没有端到端证据。
+仍未闭环：B3 未在本机重跑；72h 内存观察已开始；TUN+trojan / IPv6 / UDP 远端仍没有端到端证据。
 
 ---
 
