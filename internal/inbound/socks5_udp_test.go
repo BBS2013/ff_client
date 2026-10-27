@@ -1,0 +1,451 @@
+package inbound
+
+import (
+	"context"
+	"encoding/binary"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"wps_app/internal/outbound"
+	"wps_app/internal/router"
+	"wps_app/internal/rules"
+)
+
+// rulesProxy 是「全部走代理」的最小规则集。UDP 关联的测试必须用它：
+// 直连出站明确不支持 UDP，拿 rulesDirect 去跑只会一路撞上那一句拒绝。
+const rulesProxy = "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\nFINAL,PROXY"
+
+// udpEchoOutbound 是一个走真实 UDP 回环的假 PROXY 出站：报文发给哪儿就真发到哪儿。
+// 用真的 socket 而不是把实现复述一遍——UDP 关联的每一个字节都要经过真实收发，
+// 才算真的在验证它。
+type udpEchoOutbound struct {
+	dials atomic.Int32
+
+	mu   sync.Mutex
+	sent []string
+}
+
+func (e *udpEchoOutbound) Name() string { return string(outbound.PolicyProxy) }
+
+func (e *udpEchoOutbound) DialContext(context.Context, string) (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+func (e *udpEchoOutbound) Close() error { return nil }
+
+func (e *udpEchoOutbound) DialUDP(context.Context) (outbound.PacketConn, error) {
+	e.dials.Add(1)
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		return nil, err
+	}
+	return &echoPacket{conn: pc, owner: e}, nil
+}
+
+type echoPacket struct {
+	conn  *net.UDPConn
+	owner *udpEchoOutbound
+}
+
+func (p *echoPacket) WriteTo(b []byte, addr string) error {
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	p.owner.mu.Lock()
+	p.owner.sent = append(p.owner.sent, addr)
+	p.owner.mu.Unlock()
+	_, err = p.conn.WriteToUDP(b, ua)
+	return err
+}
+
+func (p *echoPacket) ReadFrom(b []byte) (int, string, error) {
+	if err := p.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return 0, "", err
+	}
+	// 来源就是真实对端的地址：客户端据此认出「这是谁回的」，
+	// 测试也正是靠这一点验证应答头里的地址没被写错。
+	n, from, err := p.conn.ReadFromUDP(b)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, from.String(), nil
+}
+
+func (p *echoPacket) Close() error { return p.conn.Close() }
+
+// startSOCKS5UDP 起一个 PROXY 出站为真发真收的 SOCKS5 入口。
+func startSOCKS5UDP(t *testing.T, ruleText string) (string, *udpEchoOutbound) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rules.txt")
+	if err := os.WriteFile(path, []byte(ruleText), 0o644); err != nil {
+		t.Fatalf("写规则文件: %v", err)
+	}
+	eng, err := rules.Load(path, nil, nil)
+	if err != nil {
+		t.Fatalf("加载规则: %v", err)
+	}
+	echo := &udpEchoOutbound{}
+	out := outbound.NewSet(outbound.NewDirect(3*time.Second), echo)
+	t.Cleanup(func() { _ = out.Close() })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = NewSOCKS5(router.New(eng, out, 3*time.Second), "", "").Serve(ln) }()
+	return ln.Addr().String(), echo
+}
+
+// startUDPEcho 起一个「原样回显」的 UDP 服务，充当隧道的对端。
+func startUDPEcho(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, udpAssocBuffer)
+		for {
+			n, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := pc.WriteToUDP(buf[:n], from); err != nil {
+				return
+			}
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+// assocOpenUDP 完成协商并发起 UDP ASSOCIATE，返回控制连接与中继地址。
+func assocOpenUDP(t *testing.T, proxyAddr string) (net.Conn, string) {
+	t.Helper()
+	c := dialProxy(t, proxyAddr)
+	socksGreeting(t, c, authNone)
+	readSocksMethod(t, c)
+	socksConnectRequest(t, c, cmdUDPAssociate, atypIPv4, []byte{127, 0, 0, 1}, 0)
+	var b [10]byte
+	if _, err := io.ReadFull(c, b[:]); err != nil {
+		t.Fatalf("读 ASSOCIATE 应答: %v", err)
+	}
+	if b[1] != repSuccess {
+		t.Fatalf("UDP ASSOCIATE 应答 = %#x, want %#x", b[1], repSuccess)
+	}
+	if b[3] != atypIPv4 {
+		t.Fatalf("BND ATYP = %#x, 本地中继只可能是 IPv4", b[3])
+	}
+	relayIP := net.IP(b[4:8])
+	if !relayIP.IsLoopback() {
+		t.Fatalf("BND.ADDR = %v, 中继口应绑在控制连接的本地地址上", relayIP)
+	}
+	port := binary.BigEndian.Uint16(b[8:10])
+	if port == 0 {
+		t.Fatalf("BND.PORT = 0，客户端无从知道往哪儿发包")
+	}
+	relay := net.JoinHostPort(relayIP.String(), strconv.Itoa(int(port)))
+	t.Logf("中继地址 %s", relay)
+	return c, relay
+}
+
+func TestSOCKS5UDPAssociateRelaysDatagram(t *testing.T) {
+	echoAddr := startUDPEcho(t)
+	proxyAddr, echo := startSOCKS5UDP(t, rulesProxy)
+	_, relay := assocOpenUDP(t, proxyAddr)
+
+	uc, err := net.DialUDP("udp", nil, mustUDPAddr(t, relay))
+	if err != nil {
+		t.Fatalf("连中继: %v", err)
+	}
+	defer func() { _ = uc.Close() }()
+
+	host, port := mustHostPort(t, echoAddr)
+	if _, err := uc.Write(assocPacket(t, "hello udp", atypIPv4, net.ParseIP(host).To4(), uint16(port))); err != nil {
+		t.Fatalf("发报文: %v", err)
+	}
+	from, payload := readAssoc(t, uc)
+	if string(payload) != "hello udp" {
+		t.Fatalf("回包正文 = %q", payload)
+	}
+	// 回包头里的地址必须是对端真实来源，客户端靠它认人。
+	if from != echoAddr {
+		t.Fatalf("回包来源 = %q, want %q", from, echoAddr)
+	}
+	if got := echo.sentAt(0); got != echoAddr {
+		t.Fatalf("转发目标 = %q, want %q", got, echoAddr)
+	}
+}
+
+func TestSOCKS5UDPAssociateDialsOncePerAssociation(t *testing.T) {
+	echoAddr := startUDPEcho(t)
+	proxyAddr, echo := startSOCKS5UDP(t, rulesProxy)
+	_, relay := assocOpenUDP(t, proxyAddr)
+
+	uc, err := net.DialUDP("udp", nil, mustUDPAddr(t, relay))
+	if err != nil {
+		t.Fatalf("连中继: %v", err)
+	}
+	defer func() { _ = uc.Close() }()
+
+	host, port := mustHostPort(t, echoAddr)
+	for i := 0; i < 3; i++ {
+		if _, err := uc.Write(assocPacket(t, "ping", atypIPv4, net.ParseIP(host).To4(), uint16(port))); err != nil {
+			t.Fatalf("发第 %d 包: %v", i, err)
+		}
+		if _, payload := readAssoc(t, uc); string(payload) != "ping" {
+			t.Fatalf("第 %d 个回包正文 = %q", i, payload)
+		}
+	}
+	// 一条控制连接对应一条隧道会话：客户端往多少个目标发包都不该再开新会话。
+	if n := echo.dials.Load(); n != 1 {
+		t.Fatalf("建立 UDP 会话 %d 次, want 1", n)
+	}
+}
+
+func TestSOCKS5UDPAssociateEndsWithControlConnection(t *testing.T) {
+	echoAddr := startUDPEcho(t)
+	proxyAddr, _ := startSOCKS5UDP(t, rulesProxy)
+	c, relay := assocOpenUDP(t, proxyAddr)
+
+	uc, err := net.DialUDP("udp", nil, mustUDPAddr(t, relay))
+	if err != nil {
+		t.Fatalf("连中继: %v", err)
+	}
+	defer func() { _ = uc.Close() }()
+
+	host, port := mustHostPort(t, echoAddr)
+	if _, err := uc.Write(assocPacket(t, "alive", atypIPv4, net.ParseIP(host).To4(), uint16(port))); err != nil {
+		t.Fatalf("发报文: %v", err)
+	}
+	readAssoc(t, uc)
+
+	_ = c.Close()
+	// 中继口是在服务端那个 goroutine 里、等控制连接读到 EOF 之后才关的
+	// （见 socks5_udp.go 主循环末尾那句 pc.Close()），所以"客户端关掉控制连接"与
+	// "中继口作废"之间必然有一段窗口。
+	//
+	// 这里原来只等 500ms 就断言"再也收不到回声"：机器一忙、或者被挪进独立网络
+	// 命名空间跑（make test-offline 就是），服务端注意到 EOF 会慢过 500ms，
+	// 于是回声真的还在——用例随机红，而产品什么都没做错。
+	//
+	// 换成量它真正要保证的那件事：**中继口必须在有限时间内不再回包**。
+	// 会话漏掉的后果（客户端走了、UDP 转发还开着）照样当场红；
+	// 而"收尾慢了几百毫秒"不再被当成缺陷。
+	// 连续两次探针没回声才算作废——单次超时可能只是网络慢，不是口关了。
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 2048)
+	var probes, quietRun int
+	start := time.Now()
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("控制连接已断 %v，中继仍在回包（探针 %d 次）：这条 UDP 会话漏了",
+				time.Since(start), probes)
+		}
+		if _, err := uc.Write(assocPacket(t, "gone-"+strconv.Itoa(probes), atypIPv4, net.ParseIP(host).To4(), uint16(port))); err != nil {
+			break // 口已经关了，写不进去——正是它作废的证据
+		}
+		probes++
+		_ = uc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := uc.Read(buf); err != nil {
+			if quietRun++; quietRun >= 2 {
+				break
+			}
+			continue
+		}
+		quietRun = 0
+		// 还在回包就再探一次。没有这一句，会话真漏了的时候这里会在 10 秒里
+		// 空转几十万发探针——红是红了，但把一个失败用例跑成了打自己机器的 DoS。
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Logf("中继在控制连接断开后 %v 内停止回包，探针 %d 次", time.Since(start), probes)
+}
+
+func TestSOCKS5UDPAssociateSurvivesOutboundWithoutUDP(t *testing.T) {
+	// rulesDirect 配的 PROXY 出站是 failingDialer，它没有 DialUDP。
+	// ASSOCIATE 仍要应答成功——RFC 要求应答早于第一个报文，那时还不知道能不能转发；
+	// 真正被拒的是那一条带原因的日志，而不是把关联建不起来。
+	proxyAddr := startSOCKS5(t, rulesDirect, "", "")
+	c := dialProxy(t, proxyAddr)
+	socksGreeting(t, c, authNone)
+	readSocksMethod(t, c)
+	socksConnectRequest(t, c, cmdUDPAssociate, atypIPv4, []byte{127, 0, 0, 1}, 0)
+	if rep := readSocksReply(t, c); rep != repSuccess {
+		t.Fatalf("UDP ASSOCIATE 应答 = %#x, want %#x", rep, repSuccess)
+	}
+}
+
+func TestParseAssocPacketRejectsFragmentedDatagram(t *testing.T) {
+	p := append([]byte{0, 0, 1 /* FRAG=1 */, atypIPv4}, []byte{127, 0, 0, 1, 0x27, 0x10}...)
+	p = append(p, []byte("data")...)
+	if _, _, ok := parseAssocPacket(p); ok {
+		t.Fatal("分片报文被接受了")
+	}
+}
+
+func TestParseAssocPacketRejectsTruncatedHeader(t *testing.T) {
+	if _, _, ok := parseAssocPacket([]byte{0, 0, 0, atypIPv4, 127}); ok {
+		t.Fatal("截断的地址被接受了")
+	}
+	if _, _, ok := parseAssocPacket([]byte{0, 0, 0, atypIPv4, 127, 0, 0, 1}); ok {
+		t.Fatal("缺端口的报文被接受了")
+	}
+}
+
+func TestAssocPacketRoundTripsEveryAddressType(t *testing.T) {
+	cases := []struct {
+		name string
+		atyp byte
+		addr []byte
+		host string
+	}{
+		{"IPv4", atypIPv4, []byte{1, 2, 3, 4}, "1.2.3.4:443"},
+		{"IPv6", atypIPv6, net.ParseIP("2001:db8::1").To16(), "[2001:db8::1]:443"},
+		{"域名", atypDomain, domainAddr("example.com"), "example.com:443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, payload, ok := parseAssocPacket(assocPacket(t, "body", tc.atyp, tc.addr, 443))
+			if !ok {
+				t.Fatal("报文未被接受")
+			}
+			if addr != tc.host {
+				t.Fatalf("地址 = %q, want %q", addr, tc.host)
+			}
+			if string(payload) != "body" {
+				t.Fatalf("正文 = %q", payload)
+			}
+		})
+	}
+}
+
+func TestBuildAssocPacketRoundTripsEveryAddressType(t *testing.T) {
+	for _, from := range []string{"1.2.3.4:443", "[2001:db8::1]:53", "example.com:80"} {
+		pkt, err := buildAssocPacket(from, []byte("x"))
+		if err != nil {
+			t.Fatalf("封装 %q: %v", from, err)
+		}
+		addr, payload, ok := parseAssocPacket(pkt)
+		if !ok {
+			t.Fatalf("%q 封装后无法解析: %x", from, pkt)
+		}
+		if addr != from {
+			t.Fatalf("回环地址 = %q, want %q", addr, from)
+		}
+		if string(payload) != "x" {
+			t.Fatalf("正文 = %q", payload)
+		}
+	}
+}
+
+func TestBuildAssocPacketRejectsBadAddress(t *testing.T) {
+	if _, err := buildAssocPacket("not-an-addr", []byte("x")); err == nil {
+		t.Fatal("缺端口的地址被接受了")
+	}
+	if _, err := buildAssocPacket("example.com:99999", []byte("x")); err == nil {
+		t.Fatal("越界端口被接受了")
+	}
+}
+
+func TestBindAssocSocketReusesControlLocalAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			time.Sleep(50 * time.Millisecond)
+			_ = c.Close()
+		}
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	uc, bound, clientIP, err := bindAssocSocket(c)
+	if err != nil {
+		t.Fatalf("bindAssocSocket: %v", err)
+	}
+	defer func() { _ = uc.Close() }()
+	if !clientIP.IsLoopback() {
+		t.Fatalf("客户端地址 = %v", clientIP)
+	}
+	if !uc.LocalAddr().(*net.UDPAddr).IP.IsLoopback() {
+		t.Fatalf("中继口没有绑在控制连接的本地地址上: %s", bound)
+	}
+	// 端口必须是内核现给的，不能与控制连接撞上。
+	if port := uc.LocalAddr().(*net.UDPAddr).Port; port == 0 {
+		t.Fatalf("中继口没有分配到端口: %s", bound)
+	}
+}
+
+// --- 小工具 ---
+
+func (e *udpEchoOutbound) sentAt(i int) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if i >= len(e.sent) {
+		return ""
+	}
+	return e.sent[i]
+}
+
+// assocPacket 按 SOCKS5 UDP 头拼一个请求报文。
+func assocPacket(t *testing.T, payload string, atyp byte, addr []byte, port uint16) []byte {
+	t.Helper()
+	buf := []byte{0x00, 0x00, 0x00, atyp}
+	buf = append(buf, addr...)
+	var p [2]byte
+	binary.BigEndian.PutUint16(p[:], port)
+	buf = append(buf, p[:]...)
+	return append(buf, payload...)
+}
+
+func readAssoc(t *testing.T, uc *net.UDPConn) (string, []byte) {
+	t.Helper()
+	_ = uc.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, udpAssocBuffer)
+	n, err := uc.Read(buf)
+	if err != nil {
+		t.Fatalf("读回包: %v", err)
+	}
+	addr, payload, ok := parseAssocPacket(buf[:n])
+	if !ok {
+		t.Fatalf("回包不是合法的 SOCKS5 UDP 报文: %x", buf[:n])
+	}
+	return addr, payload
+}
+
+func mustUDPAddr(t *testing.T, hostport string) *net.UDPAddr {
+	t.Helper()
+	a, err := net.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		t.Fatalf("解析中继地址 %q: %v", hostport, err)
+	}
+	return a
+}
+
+func mustHostPort(t *testing.T, hostport string) (string, int) {
+	t.Helper()
+	h, p, err := net.SplitHostPort(hostport)
+	if err != nil {
+		t.Fatalf("拆分 %q: %v", hostport, err)
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil {
+		t.Fatalf("端口 %q 不是数字: %v", p, err)
+	}
+	return h, n
+}

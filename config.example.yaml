@@ -1,0 +1,96 @@
+# wps_app 配置样例。复制成 config.yaml 再把节点换成你自己的。
+#
+# 三条最常走的路：
+#   1) 只给浏览器用   -> 保持 tun.enable: false，用面板里的「系统代理」开关；
+#   2) 全局接管(TUN)  -> 需要特权。桌面机器推荐配 tun.helper（面板仍以普通用户跑，
+#                        托盘才能常驻，见 README §4.3），或者直接 sudo 跑面板；
+#   3) 规则分流       -> 没跑 scripts/fetch-assets.sh 也能用，只是 GEOIP 与 gfw
+#                        那部分规则命中不了，退到 FINAL。
+#
+# 注意：这个文件里不要填真实口令后随手发给别人。config.yaml 是你的私有文件。
+
+proxies:
+    # hysteria2：QUIC/UDP，带宽与拥塞算法这两个字段只有它用得到
+    - name: "hy2-示例"
+      # 可选：这个节点的流量配额。写成能从服务商页面上抄下来的样子，
+      # GB=10^9、GiB=2^30 两套后缀都认（"1000GB"、"1.5TiB"、"500G"）。
+      # 节点页据此显示"已用 N%"，用的量是跨重启累计的那份（README §9.5.2）。
+      # quota: "1000GB"
+      server:
+        type: hysteria2
+        addr: "hy2.example.com:443"
+        auth: "换成你的密码"
+        tls:
+            sni: "hy2.example.com" # 留空则取 addr 的 host
+            insecure: false # 证书链能校验就保持 false
+        bandwidth:
+            up: "200 mbps"
+            down: "1000 mbps"
+        congestion: bbr
+        fast_open: true
+
+    # trojan：TCP+TLS。自签证书节点必须 insecure: true，否则握手一定失败；
+    # 协议本身不承载 UDP，所以没有带宽/拥塞这些概念。
+    - name: "trojan-示例"
+      server:
+        type: trojan
+        addr: "tj.example.com:8443"
+        auth: "换成你的口令"
+        tls:
+            sni: "tj.example.com"
+            insecure: true
+
+active: "hy2-示例"
+
+# 分流模式：rule（按规则）| global（全走代理）| direct（全直连）
+mode: rule
+
+inbounds:
+    - type: socks5
+      listen: "127.0.0.1:7891"
+    - type: http
+      listen: "127.0.0.1:7892"
+    # 要让局域网别人也用，改成 "0.0.0.0:7893" 并配上用户名密码（两者必须成对填写）
+    # - { type: socks5, listen: "0.0.0.0:7893", username: "alice", password: "change-me" }
+
+geoip:
+    # 缺失只是 GEOIP 规则不生效，启动时告警一句，不影响其余功能
+    path: "./assets/geoip.mmdb"
+
+rules_file: "./assets/rules.txt"
+
+tun:
+    enable: false
+    device: wps-tun
+    address: "172.19.0.1/30"
+    mtu: 1500
+    dns: "172.19.0.2" # 留空则取 address 所在网段的下一个地址
+    fake_ip_range: "198.18.0.0/15"
+    hijack_dns: true
+    strict_route: false
+    # 桌面推荐姿势：面板以普通用户身份跑（托盘正常），把建网卡与改路由交给 helper。
+    # 用绝对路径，并给该用户配免密 sudo（写法见 README §4.3 的 sudoers 例子）。
+    # helper:
+    #     - sudo
+    #     - "-n"
+    #     - "/usr/local/bin/wps_app"
+    #     - "--tun-helper"
+
+dns:
+    servers:
+        - 223.5.5.5
+        - 119.29.29.29
+    timeout: 3s
+    cache: 5m
+    # 经隧道去问上游，用来避开本地 DNS 污染。默认关闭，且建议保持关闭。
+    # geo-CDN 按提问者位置给答案：节点视角会把 www.qq.com 答成海外地址，
+    # 于是 GEOIP,CN,DIRECT 判不中、国内流量白绕一圈隧道（实测见 README §5）。
+    # tunnel_resolve: false
+
+# 两张无线都在时按网卡分流：直连走内置无线，代理走 USB 无线。
+# 只在规则模式下生效；只找到一张无线时照常按系统默认路由走（界面会写明原因）。
+iface_split:
+    enable: false
+
+log:
+    level: info # debug | info | warn | error

@@ -1,0 +1,33 @@
+# 运行期秘密与账本：绝不进仓库
+/config.yaml
+/config.yaml.bak
+/config.yaml.orig
+/config.yaml.lock
+/config.yaml.usage.json
+/config.yaml.sysproxy.json
+*.log
+*.log.*
+
+# 构建产物
+/wps_app
+/wps_app-gui
+/dist/
+/.spike/spike
+
+# 依赖目录
+/frontend/node_modules/
+
+# 第三方数据（许可不允许再分发）与私人规则
+/assets/geoip.mmdb
+/assets/gfw.txt
+/assets/gfw-proxy.txt
+/assets/user-rules.txt
+/assets/user-rules.txt.bak
+
+# 本机工具配置
+/.commandcode/
+
+# 临时/坏文件
+*.tmp-*
+*.bad
+*.bad-*

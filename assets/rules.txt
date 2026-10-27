@@ -1,0 +1,38 @@
+# wps_app 规则集
+#
+# 语法: TYPE,VALUE[,POLICY][,no-resolve]
+#   TYPE    DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / IP-CIDR / GEOIP / FINAL
+#   POLICY  DIRECT（直连） 或 PROXY（经 hysteria2）
+#   备注    # 之后为注释，空行忽略
+#
+# 匹配顺序：先域名规则，再 IP 规则（必要时才解析 DNS），最后由 FINAL 兜底。
+#
+# #include  <路径>  把另一份规则文件原地展开（路径相对于本文件目录）
+# #include? <路径>  可选，文件不存在时跳过
+#
+# 注意：域名规则在 DNS 查询之前匹配。被污染的 DNS（GFW 环境下国内上游会给
+# 被墙域名返回伪造 IP）只会污染 IP/GEOIP 规则，因此“被墙域名走代理”必须
+# 靠域名规则声明，不能靠 GEOIP 反推。
+
+# --- 自定义规则（面板「域名规则」页维护）---
+# 引在被墙域名表**之前**：这里写的域名优先，想让某个被墙域名直连、
+# 或让某个国内域名走代理，加到这里就行，不会被脚本重新生成主表时冲掉。
+#include? ./user-rules.txt
+
+# --- 被墙域名表（由 scripts/fetch-assets.sh --seed 生成）---
+# 纯域名规则命中即代理，不依赖 DNS，所以能规避 DNS 污染。
+#include? ./gfw-proxy.txt
+
+# --- 本机与私有地址：始终直连，避免代理自身流量绕圈 ---
+IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+
+# --- 国内直连 ---
+GEOIP,CN,DIRECT
+
+# --- 兜底：其余全部走代理 ---
+FINAL,PROXY
