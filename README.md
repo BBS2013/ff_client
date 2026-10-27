@@ -17,6 +17,26 @@ v0.1.0 的可交付性验收结论、问题清单与复现步骤见 [ACCEPTANCE.
 
 ---
 
+## 0. 2026-10-27 工程化改造（台账）
+
+这一轮不改协议行为，只补"过程可信"；命令见 §2、§9、§13。
+
+- **版本控制**：`git init` + baseline 提交（`baseline-2026-10-27`），排除 `config.yaml` 与运行期账本；此后每次改动可回滚。
+- **门禁隔离**：`make gate` 的 GUI 产物写到 `dist/gate/`，不再覆盖正在跑的面板；发布仍用 `make build-gui`。
+- **构建指纹**：`-version`、`-diag` 与设置页都报出版本、源码指纹（git 短 commit + `-dirty`，无 git 时为内容哈希）与构建时间；`package.sh` 在包里写 `BUILD-INFO.txt`。
+- **验收证据回归仓库**：`/tmp/accept` 已随机器重启丢失；A6 协议 16 项与 A8 信号 3 项重建为 `scripts/acceptance/` 并实跑通过。B3 TUN 脚本入库但未在本机跑（需要 root + 真实节点），默认 `SKIP`。
+- **可观测**：GUI 默认把日志写到 `<config>.log`（0600，20MB×3 轮转），CLI 用 `-log-file`；新增 `-pprof`（仅回环、默认关）与 `make soak` 被动采样（不重启面板）。2026-10-27 09:34 首次采样：面板进程树约 688MB RSS / 122 fd / 40 线程，WebKit 约 432MB；72h 趋势待累积。
+- **崩溃自愈**：`packaging/systemd/wps_app-gui.service`（`Restart=on-failure`）；2026-10-27 用隔离实例 `kill -9` 实测，新 MainPID 在数秒内起来、端口恢复。
+- **配置回写**：首次回写前的原件留在 `config.yaml.orig`（永不覆盖），上一版在 `.bak`；回写文件头会说明注释不保留。
+- **前端测试**：vitest 覆盖 `format/ageclock/nodetests/probes` 纯函数，32 个用例，目标模块行覆盖 100%；组件交互仍靠人工。
+- **打包**：生成 `SHA256SUMS`；缺 WebKit 开发包时默认失败，`--no-gui` 显式放行；README 的 Go 版本要求改为 1.26.9。
+- **能力边界**：TUN+trojan 与 TUN IPv6 的"未实链"状态写进启动日志与 `-diag`，不再只藏在文档里。
+- **代码结构**：`internal/service/service.go` 1936 → 935 行，按 profiles / tun / providers / proxy 拆成同包文件，行为不变。
+
+仍未闭环：B3 未在本机重跑；72h 内存观察刚开始；TUN+trojan / IPv6 / UDP 远端仍没有端到端证据。
+
+---
+
 ## 1. 目录结构
 
 ```
@@ -69,15 +89,20 @@ make build                   # 命令行产物：CGO_ENABLED=0、-ldflags "-s -w
 make build-gui   # 桌面面板：npm 构建前端 → go build -tags "gui production"
                  #   ⚠ 会覆盖 ./wps_app-gui，也就是正在跑的那个面板用的二进制
 make frontend    # 只重出前端产物，改样式时快（先跑 vue-tsc，类型错就不出 dist）
+make frontend-test # 前端纯函数测试 + 覆盖率闸门（不启浏览器）
+make acceptance  # A6 协议 16 项 + A8 信号，离线、隔离端口
+make soak        # 被动采样当前面板的 RSS/fd/线程（不重启、不发信号）
 make test-offline # 断网跑全套：只留回环的网络命名空间，见 §9.1
-make gate        # 改完跑这一条：全套离线门禁（约 2 分钟，见 §14.9；末尾含 build-gui）
+make gate        # 改完跑这一条：全套离线门禁（约 2 分钟，见 §14.9；末尾含 gate-gui，
+                 #   产物在 dist/gate/，不覆盖 ./wps_app-gui）
 make check       # 用仓库 config.yaml 跑一次 -check 自检——会真连节点与订阅源
 make package     # 出「给别人的包」：运行包 + 含 vendor 的源码包，见 §13
 
+./wps_app -version   # 版本 + 源码指纹 + 构建时间
 cd frontend && npm run dev   # 只在浏览器里调界面，不启 Go；?demo= 切状态场景，见 §9
 ```
 
-仓库里带了 `vendor/`（39MB），所以**全程不联网也能编译**：
+仓库里带了 `vendor/`（39MB），所以**全程不联网也能编译**（前提是本机已有 Go 1.26.9；vendor 不含工具链）：
 
 ```bash
 GOFLAGS=-mod=vendor GOPROXY=off go build ./...                        # 离线
@@ -199,8 +224,12 @@ block:
     - "ads.example.com"
 ```
 
-### 4.1 多节点：`proxies` 与 `active`
+> **面板回写与注释**：面板保存配置会整表重写 YAML，手写注释与顺序不会保留。
+> 第一次回写前的原件自动留在 `config.yaml.orig`（之后永不覆盖），每次回写前的上一版在
+> `config.yaml.bak`；回写文件头两行会写明这件事。要长期保留说明，写在
+> `config.example.yaml` 或 `.orig` 里。
 
+### 4.1 多节点：`proxies` 与 `active`
 旧配置只有一个顶层 `server:` 段，照样能读：加载时它会被迁成第一个节点（名字默认取
 `addr` 的 host），保存时统一只写 `proxies` + `active`——磁盘上不会同时留两份服务端配置。
 
@@ -1422,6 +1451,9 @@ OK www.baidu.com:443 via DIRECT matched=GEOIP,CN,DIRECT
   -mode string         本次运行的分流模式：rule | global | direct（不写回配置文件）
   -sysproxy string     设置桌面系统代理：on | off | restore | status（写完即退出）
   -diag                打印一份离线现场快照（口令已掩码、不碰外网）后退出
+  -version             打印版本、源码指纹与构建时刻后退出
+  -log-file string     日志同时写入该文件（0600，20MB×3 轮转）；GUI 默认写 <config>.log
+  -pprof string        开启 pprof 诊断监听（只允许 127.0.0.1 / ::1；默认关）
   -tun-reset           清理 TUN 遗留的 iptables 劫持规则与 SNAT 后退出
   -tun-helper          以 TUN 提权 helper 身份运行一次（由面板按 tun.helper 唤起，需要 root）
   -tun-helper-connect  helper 要连回的套接字路径（面板自动传，不用手写）
@@ -1431,7 +1463,11 @@ OK www.baidu.com:443 via DIRECT matched=GEOIP,CN,DIRECT
 
 `-sysproxy` 与 GUI 里的系统代理开关走的是同一份 `internal/sysproxy`，
 两条路径行为不会漂移；三条后端都探不到时它如实报不支持，不会假装改成功。
-写给桌面的端口取自配置文件里的入站（`Config.SystemProxyTarget`，三条使用路径共用），
+
+`-version` 与 `-diag` 里的「构建」一行会带上源码指纹（git 短 commit + `-dirty`，
+没有 git 时是内容哈希）。面板默认把日志写到 `<config>.log`（0600，20MB × 3 轮转），
+CLI 只有显式 `-log-file` 才写；`-pprof` 只接受回环地址，堆快照里可能有访问过的域名，
+诊断完请重启关掉。写给桌面的端口取自配置文件里的入站（`Config.SystemProxyTarget`，三条使用路径共用），
 不是写死的 7891/7892——换了端口的配置若还被拿默认端口去比，
 「桌面明明指着我们」会被读成「和我们无关」，最该报警的那一种反而不报。
 
@@ -1456,7 +1492,7 @@ OK www.baidu.com:443 via DIRECT matched=GEOIP,CN,DIRECT
 
 ```bash
 ./wps_app config.yaml -diag
-## 运行身份        可执行文件 / exe 路径、PID、uid、配置文件绝对路径
+## 运行身份        可执行文件 / exe 路径、PID、uid、配置文件绝对路径、构建（版本/源码指纹/时间）
 ## 入站            每个监听地址：在听 / 没人听 / 未测（非回环）
 ## 出站节点        协议、地址、SNI、auth=已设置（不印值）
 ## 节点用量账本    跨重启那份累计（见 §9.5.2/§9.5.3）：每个节点多少字节、
@@ -1502,11 +1538,13 @@ OK www.baidu.com:443 via DIRECT matched=GEOIP,CN,DIRECT
 演示模式（`?demo=`）下那个按钮**不会真的写文件**，返回的路径里会明说这一点。
 
 旁边还有一个**「导出日志」**：把面板内存里那份日志环形缓冲（最近 1000 条）写成
-配置文件旁边的 `wps_app-log.txt`。它存在的理由是"出问题的时刻往往已经滚过去了"——
-面板可以双击启动，那种情况下 stdout 根本没有去处，日志只活在那 1000 条里。
+配置文件旁边的 `wps_app-log.txt`。从 2026-10-27 起，GUI 默认还会把同一份日志持续写到
+`<config>.log`（0600，20MB × 3 轮转），CLI 用 `-log-file`；内存那 1000 条仍是界面与
+「导出日志」的来源。它存在的理由是"出问题的时刻往往已经滚过去了"——
+面板可以双击启动，那种情况下 stdout 根本没有去处。
 与诊断报告**不同的一点必须写在界面上**：这份文件里有本机访问过的域名，
 等于一份浏览记录，所以权限给 0600（报告是默认权限），并且前言里直接说
-"这只是最近 1000 条、更老的已被覆盖、要长期留档请在启动时重定向输出"。
+"这只是最近 1000 条、更老的已被覆盖；要看更早的请读 `<config>.log`（轮转窗口内）"。
 掩码走的是同一套两层（先按形状换 URL 里的 `user:pass@` 与 `?token=`，
 再按配置里"值本身就是口令"的字段换），而且现在收在一个 `diag.maskAll` 里——
 两条路各写一遍迟早有一边漏一层。三层反向对照都做过：不掩码 / 只漏形状层 / 只漏按值层，
@@ -1729,11 +1767,25 @@ ExecReload=/bin/kill -HUP $MAINPID
 
 ---
 
+### 8.1 桌面面板的崩溃自愈（用户级 unit）
+
+面板与代理同进程，崩溃即断网。`packaging/systemd/wps_app-gui.service` 用
+`Restart=on-failure` 把它拉起来；安装、导入会话环境与 `kill -9` 验证步骤见
+`packaging/systemd/README.md`。它与上面的服务端 unit 是两条路：同一份配置文件只能有
+一个实例（`.lock`），用不同配置即可共存。
+
+2026-10-27 用隔离实例实测：`kill -9` 后新 MainPID 在数秒内起来，17891/17892 恢复监听；
+`systemctl --user stop` 后端口释放。没有在正在使用的面板上做这一步——那会掐断隧道几秒。
+
 ## 9. 测试
 
 ```bash
 go test ./...                  # 单元测试
 make test-offline              # 断网跑：只留回环的网络命名空间，见 §9.1
+make frontend-test             # 前端纯函数（vitest）+ 覆盖率闸门
+make acceptance                # A6 协议 16 项 + A8 信号，离线、隔离端口
+make acceptance-tun            # B3 TUN，显式启用（root + 真实节点）
+make soak-once / make soak     # 被动采样面板 RSS/fd/线程（不重启、不发信号）
 make latency                   # 面板侧：切到每一页那一下 + 改一次筛选那一下，见 §9.3 末了两张表
                                # （要一个伺服着的 frontend/dist 与 agent-browser，缺前置直接退出码 2）
 go test ./... -race            # 带竞态检测（出站连接复用是共享状态，建议跑）
@@ -1763,6 +1815,11 @@ go test ./internal/ui -run TestBridgeArgs -v
 # 调试入站协议时可打开日志（默认丢弃，避免刷屏）
 WPS_TEST_LOG=1 go test ./internal/inbound/ -run SOCKS5 -v
 ```
+
+`make acceptance` 的脚本在 `scripts/acceptance/`；A6/A8 在 2026-10-27 实跑 16/16、3/3。
+它们固定用 17891/17892，不碰线上 7891/7892，也不碰外网；B3 需要 root 与真实节点，
+未在本机重跑。前端测试只守纯函数（`format` / `ageclock` / `nodetests` / `probes`，
+32 个用例，目标模块行覆盖 100%），组件交互仍按 §10 的清单人工点。
 
 ### 9.1 断网跑：`make test-offline`
 
@@ -3394,7 +3451,7 @@ Xvfb 里开一个 WebKitGTK 窗，`hardware-acceleration-policy` 设成 `NEVER`�
 | 规则 | **自定义域名规则（哪些域名走代理/哪些直连 + 查走向——含判成代理时**落到哪个节点** + 按关键字/走向筛选 + **取一个真页面**（贴网址按规则真取一次，摆出状态码、`Server:` 头、字节数与这一条实际走的判定，见 §5）**、**看解析**（第三问：引擎此刻拿去判定的那批 IP 与每个地址的归属码，两半判定分开报，见 §10.13）**）、**拦截域名栏（可直接加/删，见 §5.1，并显示本次运行累计拦下多少条）**、内置规则集与 GeoIP 计数、**规则文件（自动重载）栏**（看着哪些文件、上次生效于何时，见 §7.1）、**规则集订阅栏**（每条上次拉于何时、连着失败几次、缓存还在不在，见 §5.3）。拦截栏显示的是**引擎里正在生效**的那份（重载失败时与磁盘那份会分家），并一起给出模式与是否运行——直连模式下会明说「这 N 条现在一条都不拦」。手写的 `REJECT` 行只读展示成「已拦截」：策略开关只有走代理/直连两档，一键翻转等于把拦截悄悄放开 |
 | 流量 | 大图 + **各节点用量**（见 §9.5.1）+ 活跃连接表 + 最近结束表 + 累计流量 + **累计拦截**（下面一行写清它是静默丢弃、点「清空统计」会归零），同一屏不用翻页对照。各节点那一行的**名字可以点**：点下去只看走这个节点的连接（精确匹配，再点取消），顺带把表滚进视野；连接表「走向」那一格在 pill 下面写着这条连接**实际**走的节点名（`node`，与那张表同一个字符串）。有跨重启账时那一栏是"本次 X · 累计 Y"两个数，另有一行说清起点与上次落盘，以及"只会少算不会多算"（§9.5.2），旁边是**累计也清零**——它和「清空统计」是两个按钮。两张表共用一条**过滤**：关键字（域名 / 客户端 / 命中规则 / 错误原文）+ 走向档（全部 / 走代理 / 直连 / 拦截 / **拨不通**，档上直接标条数）；过滤中表头写「显示 N / 共 M」，空表也分得清是没连接还是过滤后没有。拨不通那一档见 §10.2 |
 | 日志 | 环形缓冲里的最近日志，可按级别与关键字过滤（命中的关键字会高亮）。级别那一排是**阈值**语义（`≥ INFO` / `≥ WARN` / `≥ ERROR`），不是精确匹配——这一页最常见的动作是"有没有出过事"，而精确匹配下回答它要先点 WARN 数一遍、再点 ERROR 数一遍；条数直接印在按钮上（与连接表那排走向按钮同一个做法），不点也能看见。没有 `≥ DEBUG` 那一档：它和「全部」是同一件事，摆出来就是让人猜两者有什么区别。「只看拦截」一键把关键字填成 `拦截`——这件事在应用侧是静默的，日志是它唯一的自证之地。第一批日志还没读到时写「正在读第一批日志…」，不写「还没有日志」。缓冲写满 2000 行时一次铺开要 190ms，所以只画**最后** 200 行（`LOG_WINDOW`），上面那一段留「再多画 200 行 / 全部画出」两个口子——窗口只管"画多少"，过滤照旧走整份缓冲；换过滤条件时窗口回到 200，展开时重新贴回底部（往上补旧行浏览器不会自己重算滚动位置，不贴就会悄悄从最新那行滑走）。往上翻过历史之后（「跟随最新」一关）框底下多出一行**「回到最新」**，并报出这一段又来了几行——按**当前过滤**算，挂着「只看拦截」时那 500 行转发日志不算数；数字与方法见 §9.3 |
-| 设置 | 入站、规则文件、GeoIP、DNS、日志级别、TUN 参数与运行态、系统代理明细（含生效后端与它改动的文件），两个导出按钮（**导出诊断信息**、**导出日志**——后者是内存里那 1000 条，里面有访问过的域名所以落盘是 0600，见 §7.1），外加一格**「这份界面是哪一次构建」**：内嵌前端的资源名、磁盘上二进制的路径与改动时间、本进程启动时刻；磁盘那份比进程新时会明说「你现在看到的界面不是最新的，重启才会换」——因为界面是 embed 进二进制的，"面板上怎么没有那个界面"的第一嫌疑从来是进程旧（见 §10.5） |
+| 设置 | 入站、规则文件、GeoIP、DNS、日志级别、TUN 参数与运行态、系统代理明细（含生效后端与它改动的文件），两个导出按钮（**导出诊断信息**、**导出日志**——后者是内存里那 1000 条，里面有访问过的域名所以落盘是 0600，见 §7.1），外加一格**「这份界面是哪一次构建」**：版本、源码指纹、构建时间、内嵌前端的资源名、磁盘上二进制的路径与改动时间、本进程启动时刻；磁盘那份比进程新时会明说「你现在看到的界面不是最新的，重启才会换」——因为界面是 embed 进二进制的，"面板上怎么没有那个界面"的第一嫌疑从来是进程旧（见 §10.5） |
 
 几个约定：
 
@@ -4464,11 +4521,10 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 
 ## 12. 已知限制
 
-- 日志只活在本机内存里那 **1000 条**（`logCapacity`）。面板可以双击启动，那种情况下
-  stdout 没有去处，所以"上周三那次为什么断了"这类问题**答不了**——超出这一段的只能靠
-  启动时自己重定向输出。设置页的「导出日志」把这一千条写成 0600 的文件（见 §7.1），
-  那是当前能给的最好形态：它至少不让"刚才那二十分钟"在滚动中丢掉。
-  单条超过 8 KiB 的会带"已截断，原长 N 字节"的标记——不静默截断。
+- 日志：界面仍只保留最近 **1000 条**（`logCapacity`），但 GUI 默认还会把同一份日志写到
+  `<config>.log`（0600，20MB × 3 轮转），启动日志会打印路径；CLI 只有显式 `-log-file` 才写。
+  所以"上周三那次为什么断了"现在有机会答——前提是它还在轮转窗口内。设置页的「导出日志」
+  仍只导出内存那 1000 条（见 §7.1）。单条超过 8 KiB 的会带"已截断，原长 N 字节"的标记——不静默截断。
 - 拦截（`REJECT` / `block:`，见 §5.1）是**静默丢弃**：应用侧拿不到任何原因，
   症状就是"这个网站打不开且不报错"。本机有日志、连接表、累计计数、最近留痕和 `-check` 五条线索，
   但如果只盯着浏览器看，它是查不出来的——这是选定语义的代价，不是缺陷。
@@ -4557,6 +4613,16 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
   中间那段"5 秒轮询真的看到并动手"只有代码，没有现场。
   换代理那一侧会重建隧道，这条复用的是换节点那条已经跑熟的路。
 
+### 能力矩阵（2026-10-27）
+
+| 能力 | 证据 | 现在的处置 |
+|---|---|---|
+| TUN + hysteria2（v4） | ACCEPTANCE §B3 9/9（2026-10-16） | 支持 |
+| TUN + trojan | 未做同机实链 | 启动警告；不通先切 hysteria2 |
+| TUN IPv6 | 只有命令形状、回滚与降级测试 | 路由装不上时 DNS 回 NODATA；不声称可用 |
+| UDP 远端 | 只到本地回环对端 | 不声称真实服务端互通 |
+| KDE / env 系统代理 | 假 HOME 全链路 | 真实会话未验；gnome 已实测 |
+
 ---
 
 ## 13. 打包分发（给别人能直接用）
@@ -4564,6 +4630,7 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 ```bash
 make package                        # 等价于 ./scripts/package.sh
 ./scripts/package.sh --no-src       # 只出运行包
+./scripts/package.sh --no-gui       # 明确不要 GUI（缺 WebKit 开发包时用）
 ./scripts/package.sh --frontend     # 顺手用 npm 重构建前端（默认复用已有 frontend/dist）
 ```
 
@@ -4571,8 +4638,12 @@ make package                        # 等价于 ./scripts/package.sh
 
 | 包 | 里面有什么 | 对方需要什么 |
 |---|---|---|
-| `wps_app-<ver>-linux-amd64.tar.gz` | `wps_app`(静态) + `wps_app-gui` + `assets/rules.txt` + `config.example.yaml` + `INSTALL.md` / `NOTICE.md` + `check-deps.sh` + `fetch-assets.sh` | 命令行版**零依赖**；图形版要 `libgtk-3-0 libwebkit2gtk-4.0-37 libepoxy0` |
-| `wps_app-<ver>-src.tar.gz` | 源码 + **`vendor/`** + `frontend/dist` | Go 工具链；出图形版还要 `-dev` 头文件。不需要 node，也不需要网络 |
+| `wps_app-<ver>-linux-amd64.tar.gz` | `wps_app`(静态) + `wps_app-gui` + `assets/rules.txt` + `config.example.yaml` + `BUILD-INFO.txt` + `INSTALL.md` / `NOTICE.md` + `check-deps.sh` + `fetch-assets.sh` | 命令行版**零依赖**；图形版要 `libgtk-3-0 libwebkit2gtk-4.0-37 libepoxy0` |
+| `wps_app-<ver>-src.tar.gz` | 源码 + **`vendor/`** + `frontend/dist` + `frontend/tests` + `scripts/acceptance` + `packaging/systemd` | Go 工具链；出图形版还要 `-dev` 头文件。只构建不需要 node，也不需要网络；跑前端测试要 `npm install` |
+
+两个包旁边有 `dist/SHA256SUMS`，接收端跑 `cd dist && sha256sum -c SHA256SUMS`。
+缺 WebKit 开发包时脚本默认 `exit 1`，不再悄悄产出没有 GUI 的"运行包"；确实只要命令行版用 `--no-gui`。
+包里的 `BUILD-INFO.txt` 记录 `-version` 的版本、源码指纹与构建时间。
 
 编译一律走 vendor（`GOFLAGS=-mod=vendor GOPROXY=off`），产物加 `-trimpath`：
 不把 `/home/你/...` 这类本机路径打进二进制（脚本会 `strings | grep` 自检为 0 处）。
@@ -4804,14 +4875,14 @@ make gate        # 一条命令跑全套离线门禁，约 2 分钟
 > 没看到它们的报错不等于它们通过了。
 
 它按顺序做：`fmt-check` → `build` → `vet`（两种 tag）→ `test` → `race` →
-`test-offline` → `fuzz-smoke` → `frontend`（含 `vue-tsc` 类型门）→ `gate-gui`。
+`test-offline` → `fuzz-smoke` → `frontend`（含 `vue-tsc` 类型门）→ `frontend-test` → `gate-gui`。
 **全程不碰外网、不碰线上配置、不碰正在跑的面板**，所以断网的机器和 CI 都能跑。
 
 这里要分清两条容易混的命令，它们不是一回事：
 
 | 命令 | 实际做的事 | 什么时候用 |
 |---|---|---|
-| `make gate` | 只验证代码：格式、编译、测试、竞态、离线、模糊、前端类型 | 改完东西、提交前 |
+| `make gate` | 只验证代码：格式、编译、测试、竞态、离线、模糊、前端类型与纯函数测试 | 改完东西、提交前 |
 | `make check` | `./wps_app config.yaml -check`——拿**你自己的**配置做真机自检 | 部署前自己看一眼通不通 |
 
 **这套门禁的一次真交付**（2026-10-19，给「查走向」补节点那一格，见 §5）。

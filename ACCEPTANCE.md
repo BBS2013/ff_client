@@ -24,6 +24,10 @@ B3 脚本入库但本次未跑；A4 CLI 矩阵、压测与 gctrace 仍未找回/
 **1 个查清后判定为「按设计如此」**、改正了误导性注释并加了防回归测试。
 **当前无遗留缺陷。**
 
+**2026-10-27 复跑**：A6 协议 16/16、A8 信号 3/3 通过（`make acceptance`）；
+`gofmt` / `go vet`（两种 tag）/ `go test` / `go test -race` 全绿。
+B3 TUN 脚本已入库但本轮未重跑（需要 root + 真实节点）。
+
 ---
 
 ## 1. A 层（本机可完整验证）
@@ -171,7 +175,8 @@ P95 用 nearest-rank（排序后取 `ceil(0.95n)` 位），不做插值。
 与 `curl -x http:// http://example.com/`（绝对 URI 转发）——两者走不同转发路径。
 **300 秒内共 820 个请求进两种入站。**
 
-原始样本见 `/tmp/accept/stress-out.txt`，服务日志 `/tmp/accept/stress.log`。
+原始样本原在 `/tmp/accept/stress-out.txt`，服务日志 `/tmp/accept/stress.log`
+（该目录已丢失；压测脚本尚未重建）。
 
 **结果**：
 
