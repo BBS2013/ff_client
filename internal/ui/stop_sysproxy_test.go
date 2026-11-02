@@ -350,10 +350,9 @@ func TestCloseKillsOrphanPointer(t *testing.T) {
 
 	app := New(path)
 	t.Cleanup(func() { _ = app.Close() })
-	if err := app.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
 	requireGnomeFake(t, app)
+	// 不调 Start：新的 Start 看到桌面指着我们会主动补记账；这条用例要的是
+	// 「指针在、账没了」的孤儿现场，Start 会把现场破坏掉。
 	if _, err := os.Stat(sysproxy.StatePath(path)); err == nil {
 		t.Fatal("这条用例要的就是没有记账")
 	}
@@ -453,5 +452,104 @@ func TestSystemProxySwitchStartsAndStopsService(t *testing.T) {
 	}
 	if got := f.modeNow(); got != "none" {
 		t.Fatalf("关闭总开关后桌面应恢复 none，实际 %q", got)
+	}
+}
+
+func writeIntentForTest(t *testing.T, path string, on bool) {
+	t.Helper()
+	body := "off\n"
+	if on {
+		body = "on\n"
+	}
+	if err := os.WriteFile(sysProxyIntentPath(path), []byte(body), 0o600); err != nil {
+		t.Fatalf("写总开关状态: %v", err)
+	}
+}
+
+// TestStartupOffIntentStaysStopped：上次总开关是关的，启动时服务和桌面都不动。
+// 这是 2026-11-02 用户看到的「顶栏运行中、系统代理关闭」的另一半：
+// 持久化之后，关着启动就应该两个都关，而不是偷偷起服务。
+func TestStartupOffIntentStaysStopped(t *testing.T) {
+	path, httpAddr, socksAddr := stopTestCfg(t)
+	f := useDesktop(t, "none", httpAddr, socksAddr)
+	writeIntentForTest(t, path, false)
+
+	app := New(path)
+	t.Cleanup(func() { _ = app.Close() })
+	if err := app.Startup(); err != nil {
+		t.Fatalf("Startup: %v", err)
+	}
+	if app.Status().Running {
+		t.Fatal("总开关为关，启动时不该自动起服务")
+	}
+	if got := f.modeNow(); got != "none" {
+		t.Fatalf("总开关为关，桌面应保持 none，实际 %q", got)
+	}
+}
+
+// TestStartupOnIntentStartsAndEnables：上次是开的，启动后服务和系统代理都应打开。
+func TestStartupOnIntentStartsAndEnables(t *testing.T) {
+	path, httpAddr, socksAddr := stopTestCfg(t)
+	f := useDesktop(t, "none", httpAddr, socksAddr)
+	writeIntentForTest(t, path, true)
+
+	app := New(path)
+	t.Cleanup(func() { _ = app.Close() })
+	requireGnomeFake(t, app)
+	if err := app.Startup(); err != nil {
+		t.Fatalf("Startup: %v", err)
+	}
+	if !app.Status().Running {
+		t.Fatal("总开关为开，启动时服务没起来")
+	}
+	if got := f.modeNow(); got != "manual" {
+		t.Fatalf("总开关为开，桌面应是 manual，实际 %q", got)
+	}
+	if got := f.addrNow(schemaHTTP); got != httpAddr {
+		t.Fatalf("桌面 HTTP 指针 = %s, want %s", got, httpAddr)
+	}
+	if got := readSysProxyIntent(path); got != sysProxyIntentOn {
+		t.Fatalf("启动后状态文件应保持 on，实际 %v", got)
+	}
+}
+
+// TestStartupWithoutIntentStaysStopped：旧版本没有状态文件时按关处理，
+// 不擅自改桌面；桌面已经指着我们的孤儿指针则顺手收掉。
+func TestStartupWithoutIntentStaysStopped(t *testing.T) {
+	path, httpAddr, socksAddr := stopTestCfg(t)
+	f := useDesktop(t, "manual", httpAddr, socksAddr)
+
+	app := New(path)
+	t.Cleanup(func() { _ = app.Close() })
+	requireGnomeFake(t, app)
+	if err := app.Startup(); err != nil {
+		t.Fatalf("Startup: %v", err)
+	}
+	if app.Status().Running {
+		t.Fatal("没有总开关状态时不该自动起服务")
+	}
+	if got := f.modeNow(); got != "none" {
+		t.Fatalf("孤儿桌面指针应被收掉，实际 %q", got)
+	}
+}
+
+// TestSetSystemProxyPersistsIntent：总开关的两次操作都要落到状态文件。
+func TestSetSystemProxyPersistsIntent(t *testing.T) {
+	path, httpAddr, socksAddr := stopTestCfg(t)
+	_ = useDesktop(t, "none", httpAddr, socksAddr)
+
+	app := New(path)
+	t.Cleanup(func() { _ = app.Close() })
+	if err := app.SetSystemProxy(true); err != nil {
+		t.Fatalf("打开总开关: %v", err)
+	}
+	if got := readSysProxyIntent(path); got != sysProxyIntentOn {
+		t.Fatalf("打开后状态文件 = %v, want on", got)
+	}
+	if err := app.SetSystemProxy(false); err != nil {
+		t.Fatalf("关闭总开关: %v", err)
+	}
+	if got := readSysProxyIntent(path); got != sysProxyIntentOff {
+		t.Fatalf("关闭后状态文件 = %v, want off", got)
 	}
 }

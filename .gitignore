@@ -5,6 +5,7 @@
 /config.yaml.lock
 /config.yaml.usage.json
 /config.yaml.sysproxy.json
+*.sysproxy.want
 *.log
 *.log.*
 

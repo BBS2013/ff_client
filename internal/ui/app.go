@@ -240,15 +240,54 @@ func (a *App) ExportDiagnostics() (string, error) {
 // Status 返回服务状态总览。
 func (a *App) Status() service.Snapshot { return a.svc.Snapshot() }
 
+// Startup 是 GUI 启动时走的那条路：它按上次总开关状态决定要不要起服务。
+//
+// 以前这里直接调 Start()，于是每次都是「服务起来、系统代理关着」——
+// 因为正常退出会把桌面还原、账本删掉，新进程没有记忆。现在状态落在
+// <config>.sysproxy.want：on 启动服务并接管桌面，off 两个都不启动。
+//
+// 没有状态文件（首次运行 / 旧版本升级）时按“关”处理：保持停止；
+// 如果桌面还残留着指向本程序的指针，顺手收回，不留在那里指向死端口。
+// 用户点一次总开关后，状态就会持久化，不再出现启动后的分裂。
+func (a *App) Startup() error {
+	switch readSysProxyIntent(a.svc.ConfigPath()) {
+	case sysProxyIntentOn:
+		return a.SetSystemProxy(true)
+	case sysProxyIntentOff:
+		if a.desktopPointsAtUs() {
+			if err := a.disableSystemProxyOnly(); err != nil {
+				return err
+			}
+			logx.Infof("启动时系统代理总开关为关，已收回残留的桌面指针")
+		}
+		return nil
+	default:
+		// 没有状态文件：按“关”处理，不擅自起服务，也不留死指针。
+		if a.desktopPointsAtUs() {
+			if err := a.disableSystemProxyOnly(); err != nil {
+				return err
+			}
+			logx.Infof("启动时没有总开关状态，桌面残留指针已收回")
+		}
+		return nil
+	}
+}
+
 // Start 启动代理。已在运行时等价于重启。
 //
 // 端口真的绑上之后再放回桌面指针：inboundAddrs 取的是实际监听的地址，
 // 先写桌面等于把用户导向一个还没在收流量的端口。
+//
+// 如果上次是「停止/总开关」替用户拔掉了指针（paused），或者总开关状态是 on，
+// 启动时把系统代理一并接回来；否则只启动服务（顶栏「启动」仍是服务级动作）。
 func (a *App) Start() error {
 	if err := a.svc.Start(); err != nil {
 		return err
 	}
-	a.restoreSystemProxy(false, "启动")
+	if a.takeSysProxyPaused() || a.desktopPointsAtUs() ||
+		readSysProxyIntent(a.svc.ConfigPath()) == sysProxyIntentOn {
+		return a.enableSystemProxy()
+	}
 	return nil
 }
 
@@ -270,7 +309,13 @@ func (a *App) Stop() error {
 		return err
 	}
 	// 端口已经关了，这一步失败必须让用户知道：那意味着桌面还挂着一根死指针。
-	return relErr
+	if relErr != nil {
+		return relErr
+	}
+	// 总开关状态跟着停：下次启动不再自动起服务。顶栏「启动」在同一会话里
+	// 仍会凭 paused 标志把指针接回来，所以这里是「持久关闭」而不是「临时停」。
+	a.writeSysProxyIntent(false)
+	return nil
 }
 
 // Restart 停止后重新启动，用于让改过的配置立即生效。
@@ -562,25 +607,26 @@ func (a *App) sysProxyEnableConfig() sysproxy.Config {
 // 已在 README/界面提示里写明。
 func (a *App) SetSystemProxy(enable bool) error {
 	if !enable {
-		// 服务在跑：Stop 会先拔桌面指针（按记账还原），再关端口。
-		// 服务没跑：只恢复桌面，不能因为总开关反向去启动一个本来没跑的服务。
+		// 服务在跑：Stop 会先拔桌面指针（按记账还原），再关端口，并把
+		// 持久状态写成 off。服务没跑：只恢复桌面，不能反向启动服务。
 		if a.svc.Snapshot().Running {
 			if err := a.Stop(); err != nil {
 				return err
 			}
+			// Stop 的 paused 是给「同一会话里再点启动」用的；总开关关闭是
+			// 持久决定，必须清掉它，否则下一次顶栏启动又会把代理打开。
+			a.setSysProxyPaused(false)
+			a.writeSysProxyIntent(false)
 			logx.Infof("系统代理总开关关闭：代理已停止")
 			return nil
 		}
-		statePath := sysproxy.StatePath(a.svc.ConfigPath())
-		err := withTimeout(func(ctx context.Context) error {
-			return sysproxy.Disable(ctx, sysxRunner, statePath, a.sysProxyBackend())
-		})
-		if err == nil {
-			// 服务本来就没跑：用户只关了桌面，下一次「启动」不该替他打开。
-			a.setSysProxyPaused(false)
-			logx.Infof("已按界面操作把桌面系统代理切回关闭")
+		if err := a.disableSystemProxyOnly(); err != nil {
+			return err
 		}
-		return err
+		a.setSysProxyPaused(false)
+		a.writeSysProxyIntent(false)
+		logx.Infof("已按界面操作把桌面系统代理切回关闭")
+		return nil
 	}
 
 	// 开：先保证服务在跑，再写桌面指针。反过来会出现一小段「桌面指着一个
@@ -591,11 +637,7 @@ func (a *App) SetSystemProxy(enable bool) error {
 			return fmt.Errorf("系统代理总开关：启动代理失败，桌面代理未改动: %w", err)
 		}
 	}
-	statePath := sysproxy.StatePath(a.svc.ConfigPath())
-	c := a.sysProxyEnableConfig()
-	if err := withTimeout(func(ctx context.Context) error {
-		return sysproxy.Enable(ctx, sysxRunner, statePath, c)
-	}); err != nil {
+	if err := a.enableSystemProxy(); err != nil {
 		// 服务是这次开关拉起来的、桌面却写失败：回滚到「没启动」，
 		// 否则界面会出现「系统代理关着、代理却在跑」的分裂状态。
 		if !wasRunning {
@@ -605,10 +647,33 @@ func (a *App) SetSystemProxy(enable bool) error {
 		}
 		return err
 	}
+	return nil
+}
+
+// enableSystemProxy 只做「把桌面指过来」这一件事，并记下总开关为 on。
+// 调用方必须已经保证服务在跑（SetSystemProxy 与 Start 各自负责那一步）。
+func (a *App) enableSystemProxy() error {
+	statePath := sysproxy.StatePath(a.svc.ConfigPath())
+	c := a.sysProxyEnableConfig()
+	if err := withTimeout(func(ctx context.Context) error {
+		return sysproxy.Enable(ctx, sysxRunner, statePath, c)
+	}); err != nil {
+		return err
+	}
 	a.setSysProxyPaused(false) // 现在这根指针是用户要的了，停止时该由停止拔掉它
+	a.writeSysProxyIntent(true)
 	logx.Infof("系统代理总开关开启：代理已启动并指向本客户端入站（http %s / socks %s），记账 %s",
 		c.HTTPAddr, c.SOCKSAddr, statePath)
 	return nil
+}
+
+// disableSystemProxyOnly 只恢复桌面设置，不碰服务、不碰持久状态。
+// 调用方负责写 off / 清 paused；Startup 的残留指针清理也用它。
+func (a *App) disableSystemProxyOnly() error {
+	statePath := sysproxy.StatePath(a.svc.ConfigPath())
+	return withTimeout(func(ctx context.Context) error {
+		return sysproxy.Disable(ctx, sysxRunner, statePath, a.sysProxyBackend())
+	})
 }
 
 // releaseSystemProxy 在释放入站端口之前收掉桌面上指着它们的那根指针。
@@ -671,6 +736,7 @@ func (a *App) restoreSystemProxy(ours bool, why string) {
 		logx.Errorf("%s后恢复桌面系统代理失败，流量将继续直连（可在界面重新打开系统代理开关）: %v", why, err)
 		return
 	}
+	a.writeSysProxyIntent(true)
 	logx.Infof("已把桌面系统代理指回本客户端入站（http %s / socks %s）", c.HTTPAddr, c.SOCKSAddr)
 }
 

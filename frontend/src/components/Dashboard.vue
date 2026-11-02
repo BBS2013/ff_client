@@ -602,7 +602,7 @@ const split = computed(() => {
 
           <label
             class="switch-item"
-            title="总开关：打开会启动代理并接管桌面；关闭会恢复桌面指针并停止代理（监听、隧道、TUN 一起停）"
+            title="总开关：打开会启动代理并接管桌面；关闭会恢复桌面指针并停止代理（监听、隧道、TUN 一起停）。状态会被记住，下次启动按上次状态恢复"
           >
             <span class="si-text">
               <span class="si-title">系统代理</span>

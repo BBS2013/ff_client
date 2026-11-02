@@ -152,9 +152,10 @@ func runGUI(configPath, logFile string, logOpened bool) error {
 				runtime.Quit(ctx)
 				return
 			}
-			// GUI 进程就是代理进程：窗口一亮就该在转发。启动失败也不退出，
-			// 界面会把 lastError 显示出来，用户改完配置还能在面板里重试。
-			if serr := app.Start(); serr != nil {
+			// 启动按总开关的持久状态走：上次 on 就起服务并接管桌面，
+			// 上次 off 就保持停止，不再出现「顶栏运行中、系统代理关着」。
+			// 启动失败也不退出，界面会把 lastError 显示出来，用户还能重试。
+			if serr := app.Startup(); serr != nil {
 				logx.Errorf("GUI 启动代理失败: %v", serr)
 			}
 		},
