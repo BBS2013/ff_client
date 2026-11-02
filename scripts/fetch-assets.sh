@@ -6,7 +6,7 @@
 #   ./scripts/fetch-assets.sh --seed       # 再拉 gfw.txt 并生成 assets/gfw-proxy.txt
 #   ./scripts/fetch-assets.sh --full-geo   # 把 mmdb 换成 7.6MB 全球库（可与 --seed 同用）
 #
-# 拉取完成后可 `kill -HUP $(pgrep -f wps_app)` 热重载，无需重启。
+# 拉取完成后可 `kill -HUP $(pgrep -x wps_app-gui)` 热重载，无需重启。
 
 set -euo pipefail
 

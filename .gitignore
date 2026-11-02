@@ -28,8 +28,16 @@
 
 # 本机工具配置
 /.commandcode/
+/.workbuddy/
+
+# 面板以 root 跑时，HOME 就设在本仓库目录下（用户选的落点），它造的缓存与状态不进仓库
+/.cache/
+/.local/
 
 # 临时/坏文件
 *.tmp-*
 *.bad
 *.bad-*
+
+# 真链验收用的临时配置（含节点凭据，绝不进仓库）
+/config.tun-test.yaml

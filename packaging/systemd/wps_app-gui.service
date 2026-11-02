@@ -16,6 +16,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=40
 KillMode=mixed
 # 不要加 NoNewPrivileges=yes：TUN helper 依赖 setuid sudo。
+# 面板与 tun.helper 是同一个二进制（2026-10-29 起只有一个产物），
+# 所以 config.yaml 里 tun.helper 那条要指着同一个绝对路径。
 # GUI 需要会话总线与显示。若 systemd --user 没有继承，先执行：
 #   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS
 

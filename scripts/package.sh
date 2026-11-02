@@ -7,9 +7,13 @@
 # 用法:
 #   ./scripts/package.sh                 # 出两个包
 #   ./scripts/package.sh --no-src        # 只出运行包
-#   ./scripts/package.sh --no-gui        # 明确不要 GUI（缺 WebKit 开发包时用）
 #   ./scripts/package.sh --frontend      # 顺手 npm 重构建前端（默认复用已有 frontend/dist）
 #   ./scripts/package.sh --with-geoip    # 明知故犯地把 geoip.mmdb 打进包（见下面 NOTICE 的理由）
+#
+# 产物只有一个二进制 wps_app-gui（面板 + 代理 + 提权 helper 同一个文件）。
+# 2026-10-29 之前这里还会打一个静态命令行版 ./wps_app，可以 --no-gui 跳过 GTK 依赖；
+# 那个产物已经删了，代价写在这里：本机必须有 libgtk-3 / libwebkit2gtk-4.0 的运行库，
+# 否则连无头模式（./wps_app-gui config.yaml -cli）都起不来——动态链接期就要加载它们。
 #
 # 三条不能进包的东西，脚本会主动拦住：
 #   1) config.yaml / *.bak / *.lock —— 里面是你真实节点的口令和运行痕迹；
@@ -30,11 +34,9 @@ DIST="$ROOT/dist"
 BUILD_SRC=1
 BUILD_FRONTEND=0
 WITH_GEOIP=0
-NO_GUI=0
 for arg in "$@"; do
   case "$arg" in
     --no-src)     BUILD_SRC=0 ;;
-    --no-gui)     NO_GUI=1 ;;
     --frontend)   BUILD_FRONTEND=1 ;;
     --with-geoip) WITH_GEOIP=1 ;;
     -h|--help)    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -67,21 +69,17 @@ fi
 rm -rf "$STAGE"
 mkdir -p "$STAGE/assets" "$STAGE/scripts"
 
-say "编译命令行产物（静态、零依赖）"
-# -trimpath 不只是让构建可复现：不带它，二进制的调试段里会留下你机器上的绝对路径。
-CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "$STAGE/wps_app" "$ROOT"
-"$STAGE/wps_app" -version >"$STAGE/BUILD-INFO.txt"
-
-say "编译图形面板（需要 GTK3/WebKit2GTK 的开发包）"
-if [[ $NO_GUI -eq 1 ]]; then
-  echo "    跳过：显式给了 --no-gui。"
-elif pkg-config --exists webkit2gtk-4.0 2>/dev/null && pkg-config --exists gtk+-3.0 2>/dev/null; then
-  go build -trimpath -tags "gui production" -ldflags "$LDFLAGS" -o "$STAGE/wps_app-gui" "$ROOT"
-else
-  echo "!! 本机没有 libgtk-3-dev / libwebkit2gtk-4.0-dev，运行包会没有 wps_app-gui。" >&2
-  echo "   装上开发包再打包；确实只要命令行版，请显式加 --no-gui。" >&2
+say "编译唯一产物：面板/代理/提权 helper 同一个二进制"
+# -trimpath 不只是让构建可复现：不带它，二进制的调试段里会留下你机器上的绝对路径，
+# 而这份产物现在同时是 root 侧 helper，路径会进别人机器的日志。
+if ! pkg-config --exists webkit2gtk-4.0 2>/dev/null || ! pkg-config --exists gtk+-3.0 2>/dev/null; then
+  echo "!! 本机没有 libgtk-3-dev / libwebkit2gtk-4.0-dev：没有产物可打。" >&2
+  echo "   单产物之后 GUI 就是唯一的构建目标（命令行版 ./wps_app 已删，见脚本开头那段）。" >&2
+  echo "   装上开发包再打包：sudo apt install libgtk-3-dev libwebkit2gtk-4.0-dev" >&2
   exit 1
 fi
+go build -trimpath -tags "gui production" -ldflags "$LDFLAGS" -o "$STAGE/wps_app-gui" "$ROOT"
+"$STAGE/wps_app-gui" -version >"$STAGE/BUILD-INFO.txt"
 
 say "拷资源与文档"
 cp "$ROOT/config.example.yaml" "$STAGE/config.example.yaml"
@@ -126,11 +124,15 @@ cat >"$STAGE/INSTALL.md" <<'EOF'
     ./wps_app-gui config.yaml               # 出窗口与托盘
     # 在「节点与模式」里把「系统代理」打开，浏览器立刻生效，不用改任何环境变量
 
-没有图形界面、或者不想装 GTK/WebKit 就用命令行版（静态二进制，零依赖）：
+没有图形界面（服务器、SSH 里跑）用同一个二进制的命令行模式，加 `-cli` 就不起窗口与托盘：
 
-    ./wps_app config.yaml &
+    ./wps_app-gui config.yaml -cli &
     curl -x http://127.0.0.1:7892 -sS -o /dev/null -w '%{http_code}\n' https://www.google.com/
     curl --socks5-hostname 127.0.0.1:7891 -sS -o /dev/null -w '%{http_code}\n' https://www.google.com/
+
+注意：`-cli` 只是不开界面，二进制仍然动态链接 GTK/WebKit，那几套运行库得装上
+（Ubuntu 22.04 上是 `libgtk-3-0` + `libwebkit2gtk-4.0-37`，别的发行版包名不同；
+`./check-deps.sh` 会按 SONAME 列出缺哪几个）。
 
 ## 先拉一句资源，否则"规则模式"其实等于全局代理
 
@@ -139,7 +141,7 @@ cat >"$STAGE/INSTALL.md" <<'EOF'
 `FINAL,PROXY`——表现是"国内站点也绕了一圈出去"，而不是报错。
 
     ./scripts/fetch-assets.sh --seed                  # 拉 GeoIP + gfw 列表，规则集才完整
-    kill -HUP $(pgrep -x wps_app)                     # 热重载，不用重启
+    kill -HUP $(pgrep -x wps_app-gui)                 # 热重载，不用重启
 
 不想拉数据也能精准控制：在面板「节点与模式 → 域名规则」里，把你常用的几个域名加进去即可。
 
@@ -152,8 +154,8 @@ TUN 要特权，两种给法（README §4.3 讲了原理与差别）：
     # B. 直接 sudo 跑面板（TUN 可用，但 root 连不上桌面会话总线，托盘图标会没有）
     sudo ./wps_app-gui config.yaml
 
-    sudo ./wps_app config.yaml -check        # 只验一次与服务端的链路
-    sudo ./wps_app config.yaml -tun-reset    # 上次被 kill -9 后本机 DNS 挂了就用它复位
+    sudo ./wps_app-gui config.yaml -check        # 只验一次与服务端的链路
+    sudo ./wps_app-gui config.yaml -tun-reset    # 上次被 kill -9 后本机 DNS 挂了就用它复位
 
 ## 打包给别人的注意事项
 
@@ -164,9 +166,10 @@ EOF
 
 say "自检：产物里不该留下本机绝对路径（-trimpath 的作用）"
 # 打进二进制的构建路径会暴露用户名/目录结构，也是最容易被忽略的一处泄漏。
-leak=$(strings "$STAGE/wps_app" | grep -c "$HOME" || true)
+# 扫的就是唯一产物——它现在还同时是 root 侧 helper，路径泄漏会进别人机器的日志。
+leak=$(strings "$STAGE/wps_app-gui" | grep -c "$HOME" || true)
 if [[ "$leak" != "0" ]]; then
-  echo "    !! 静态产物里出现 $leak 处本机路径（\$HOME），检查 -trimpath 是否被去掉" >&2
+  echo "    !! 产物里出现 $leak 处本机路径（\$HOME），检查 -trimpath 是否被去掉" >&2
   exit 1
 fi
 

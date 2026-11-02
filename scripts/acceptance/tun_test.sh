@@ -10,13 +10,13 @@
 # 用法：
 #   sudo WPS_ACCEPT_TUN=1 \
 #        WPS_ACCEPT_TUN_CONFIG=/path/to/tun-test.yaml \
-#        bash scripts/acceptance/tun_test.sh ./wps_app
+#        bash scripts/acceptance/tun_test.sh ./wps_app-gui
 #
 # 退出码：0 = 9/9；1 = 有 FAIL；2 = 前置不满足（未显式启用、缺 root/配置/工具）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="${1:-$ROOT/wps_app}"
+BIN="${1:-$ROOT/wps_app-gui}"
 CFG="${WPS_ACCEPT_TUN_CONFIG:-}"
 
 skip() { echo "SKIP  $*" >&2; exit 2; }
@@ -99,6 +99,11 @@ else
   bad "nat 表里没有 wps_app_dns 规则"
 fi
 
+# 先刷一遍系统解析器缓存再问：这个域名在跑之前很可能刚被问过（比如操作者自己 getent 过），
+# systemd-resolved 会把那次**真地址**的答案压着回给我们，于是劫持明明在工作，这一格却判失败。
+# 2026-10-29 实测踩过：同一条命令刷完缓存立刻变 PASS，而 nat 表里 9 条劫持规则一直在。
+resolvectl flush-caches >/dev/null 2>&1 || true
+sleep 1
 FAKE="$(getent ahostsv4 www.google.com 2>/dev/null | awk 'NR==1 {print $1}')"
 if [[ "$FAKE" == 198.18.* ]]; then
   ok "www.google.com 解析成假 IP $FAKE"

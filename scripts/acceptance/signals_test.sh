@@ -3,13 +3,13 @@
 #
 # 与 A6 一样自己起隔离实例（17891/17892），不碰线上面板的 7891/7892，
 # 不碰外网。用法：
-#   bash scripts/acceptance/signals_test.sh ./wps_app
+#   bash scripts/acceptance/signals_test.sh ./wps_app-gui
 #
 # 退出码：0 = 通过；1 = 失败；2 = 前置不满足（端口被占、二进制缺失）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="${1:-$ROOT/wps_app}"
+BIN="${1:-$ROOT/wps_app-gui}"
 [[ -x "$BIN" ]] || { echo "找不到可执行文件: $BIN" >&2; exit 2; }
 
 TMP="$(mktemp -d -t wps-accept-signals.XXXXXX)"

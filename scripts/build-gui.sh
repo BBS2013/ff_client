@@ -49,4 +49,7 @@ mkdir -p "$(dirname "$OUT")"
 CGO_ENABLED=1 go build -tags "$TAGS" -ldflags="$LDFLAGS" -o "$OUT" .
 
 echo "完成: $OUT ($(du -h "$OUT" | cut -f1))"
-echo "提示: GUI 产物依赖系统已装 libgtk-3 与 libwebkit2gtk-4.0；服务端部署仍用默认的 make build。"
+echo "提示: 这是唯一产物——面板、代理、root 侧 tun.helper 都指着它。"
+echo "      它依赖系统已装 libgtk-3 与 libwebkit2gtk-4.0；没有图形界面就加 -cli 跑："
+echo "      $OUT config.yaml -cli"
+echo "      面板正在跑时重建它会覆盖 tun.helper 指着的那个文件，重建完要重启面板。"

@@ -17,6 +17,10 @@ systemctl --user enable --now wps_app-gui.service
 如果面板是手动起的，先退掉它再启用 unit：两份实例抢同一把
 `<config>.lock`，后启动的只会报"已有另一个实例"。
 
+`ExecStart` 默认写成 `%h/wps_app/wps_app-gui %h/wps_app/config.yaml`——
+面板与 root 侧的 `tun.helper` 是同一个文件，所以换二进制路径时要连
+`config.yaml` 里 `tun.helper` 那条一起换，否则 helper 那条路会指向一个不存在的文件。
+
 ## 验证
 
 ```bash

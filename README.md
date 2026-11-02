@@ -28,12 +28,450 @@ v0.1.0 的可交付性验收结论、问题清单与复现步骤见 [ACCEPTANCE.
 - **可观测**：GUI 默认把日志写到 `<config>.log`（0600，20MB×3 轮转），CLI 用 `-log-file`；新增 `-pprof`（仅回环、默认关）与 `make soak` 被动采样（不重启面板）。2026-10-27 09:34 首次采样：面板进程树约 688MB RSS / 122 fd / 40 线程，WebKit 约 432MB；72h 趋势已开始采集。
 - **崩溃自愈**：`packaging/systemd/wps_app-gui.service`（`Restart=on-failure`）；2026-10-27 用隔离实例 `kill -9` 实测，新 MainPID 在数秒内起来、端口恢复。
 - **配置回写**：首次回写前的原件留在 `config.yaml.orig`（永不覆盖），上一版在 `.bak`；回写文件头会说明注释不保留。
-- **前端测试**：vitest 覆盖 `format/ageclock/nodetests/probes` 纯函数，32 个用例，目标模块行覆盖 100%；组件交互仍靠人工。
+- **前端测试**：vitest 覆盖 `format/ageclock/nodetests/probes` 纯函数，36 个用例，目标模块行覆盖 100%；组件交互仍靠人工。
 - **打包**：生成 `SHA256SUMS`；缺 WebKit 开发包时默认失败，`--no-gui` 显式放行；README 的 Go 版本要求改为 1.26.9。
-- **能力边界**：TUN+trojan 与 TUN IPv6 的"未实链"状态写进启动日志与 `-diag`，不再只藏在文档里。
-- **代码结构**：`internal/service/service.go` 1936 → 931 行，按 profiles / tun / providers / proxy 拆成同包文件，行为不变。
+- **能力边界**：TUN+trojan 与 UDP 远端的"未实链"状态写进启动日志与 `-diag`，不再只藏在文档里；TUN IPv6 于 2026-10-29 首次实链（A48）。
+- **代码结构**：`internal/service/service.go` 1936 → 1004 行，按 profiles / tun / providers / proxy 拆成同包文件，行为不变。
 
-仍未闭环：B3 未在本机重跑；72h 内存观察已开始；TUN+trojan / IPv6 / UDP 远端仍没有端到端证据。
+仍未闭环：B3 未在本机重跑；72h 内存观察已开始；TUN+trojan / UDP 远端仍没有端到端证据；IPv6 已实链（A48）。
+
+---
+
+## 0.1 2026-10-28 双栈全局接管（台账）
+
+这一轮补的是 P0 的头一条：**开启 TUN 全局模式后，IPv4 与 IPv6 的默认路由各自被接管**，
+并且面板如实标出「哪一族真的接管了」。
+
+**改之前是什么样**：`strict_route` 只装 `ip route add default dev wps-tun`，
+IPv6 的默认路由根本没碰。于是面板上写着「接管默认路由」，
+实际上一半的公网流量（所有 AAAA 目标）绕过隧道从物理网卡走了，
+规则与节点对它们统统不生效。
+
+**改成了什么样**：
+
+| 能力 | 改前 | 改后 |
+|---|---|---|
+| v4 默认路由 | 接管 | 接管（不变） |
+| v6 默认路由 | **不接管** | 接管（`ip -6 route add default dev wps-tun`） |
+| 绕行路由（防环路） | 混在一张列表里 | 按地址族拆开，v4 走 `ip route`、v6 走 `ip -6 route` |
+| 组播 | 跟着默认路由进 tun | 钉回物理网卡（`224.0.0.0/4`、`ff00::/8`） |
+| 面板 | 一个「IPv6 假 IP」布尔值 | `takeoverV4` / `takeoverV6` 分开报，读的是**内核此刻的默认路由**（由网络监视器每 5 秒贴出来；问不到时标 `takeoverFrom=memory`，不冒充实测） |
+
+**两族是各自独立的**：只有 v4 默认路由就只接管 v4，只有 v6 就只接管 v6，
+两族都没有才报错（那时确实无处可去）。以前 v4 缺网关会把整个 TUN 掀掉——
+「只有 v6 的机器用不了代理」是不能接受的。
+
+- **按族拆开绕行路由**：节点的 v4 与 v6 地址都在排除列表里，
+  而 v4 的绕行命令是 `ip route add <cidr> via <v4 网关> dev <网卡>`——
+  把 v6 网段丢进去，内核报 invalid gateway，而那条命令不是 Optional，
+  失败就是整个 TUN 起不来：**一个双栈节点就能把整机代理拖下水**。
+  现在 `splitExclude` 按地址族拆，v6 网段只进 `ip -6 route`。
+- **两族各自成败**：`PlanV6Route` 是独立的一组命令，
+  装不上只降级 v6 接管（v6 流量走物理出口，v4 照常接管），不掀 v4。
+- **没有 v6 网关就不接管**：此时钉不回绕行路由，装上 v6 默认路由会让
+  我们自己发往 v6 节点的包被自己抓回来形成环路。宁可 v6 走系统出口。
+- **组播留在物理网卡**：本机内核默认不给物理网卡建组播路由，
+  224.0.0.0/4 会落到默认路由上进 tun——组播是链路本地流量，
+  出了这张网卡没有意义，只会让组播应用卡住。
+- **面板**：设置页新增「接管范围」一行，分开显示 IPv4 / IPv6 是否真接管；
+  v6 装了而 v4 没装这种组合不会出现（v4 装不上时整个 TUN 起不来）。
+
+**踩过的两个坑**（都是「命令看着对、内核不吃」，只有真跑才看得见）：
+
+1. `ip -6 route add … via fe80::5%wlp3s0f0` → `inet6 address is expected rather than "fe80::5%wlp3s0f0"`。
+   iproute2 的 `via` 只认纯地址，出口网卡由命令里的 `dev` 指明，zone 是多余的。
+2. 网关被配成本机地址时 → `Gateway can not be a local address`。
+   RA 下发的网关本来就不是本机地址。
+
+**验证**（都在仓库里，可复跑）：
+
+- 单元测试 `internal/tunx/dualstack_test.go`：路由解析（v4/v6）、按族拆分、
+  v6 默认路由安装与回滚、无网关时不接管、重复启停、helper 参数校验。
+- 内核级测试 `internal/tunx/netns_linux_test.go`：在私有 netns 里跑**真的** `ip` 命令，
+  验的是内核路由表而不是命令字符串；`make test-offline` 会带着 `WPS_NETNS=1` 跑它。
+  开关是显式的——这类用例会改默认路由，绝不能跑在宿主 netns 上。
+- `make gate` 全绿。
+
+**仍然没有证据的部分**：真实 v6 流量的端到端实链（要真实节点 + 真实 v6 出口），
+以及 TUN+trojan 同机实链。启动日志与 `-diag` 里都写着这两条，别当成已验证。
+
+### 0.2 2026-10-28 网络变化后的恢复（台账）
+
+**为什么必须有**：绕行路由是「按当时的网关钉死」的——
+`ip route add <节点地址>/32 via <当时的网关> dev <当时的网卡>`。
+换了 Wi-Fi、网关从 192.168.5.1 变成 192.168.1.1 之后，那条路由还指着旧出口，
+于是发往节点的包被送到一个不存在的出口。
+
+症状极具误导性：面板上只剩一句「节点超时」，而故障切换只能换节点、
+换不动这条路由，于是每个节点都超时——看起来像节点全挂了，实际只是一条路由过期。
+
+**做法**（`internal/tunx/netwatch.go`）：
+
+- 每 5 秒读一次当前默认路由（v4 + v6）与系统解析器；
+- **去抖**：连续两轮看到同一个新状态才动手。丢一次 DHCP 就会短暂地「没网关」，
+  那种抖动不该换来两次重建（纪律与网卡监视器同源，见 §7 的 ruleswatch / ifacewatch）；
+- **网卡掉了不动手**：没有网关就钉不了绕行路由，而拆掉现有的并不会让节点更快通；
+- **改钉用 `route replace`，不是先删后加**：同一目标地址不能同时存在两条路由，
+  先加会被内核以 `File exists` 挡掉——而那条命令带 `TolerateExists`，
+  于是「加不上」被当成「已经在位」，绕行路由却还指着旧网关：
+  节点照旧超时，日志却说一切正常；
+- **探测要跳过 tun 自己那条默认路由**：接管之后表里有两条默认路由
+  （我们那条 metric 0，物理那条 metric 20600），不跳过就会把 tun 当成出口网卡，
+  于是网关读成空、监视器从此认为网络一直断着；
+- **走 helper 的那条路也要能重钉**：面板是普通用户时所有特权操作都经 helper，
+  所以 helper 协议加了 `reroute` 动作（协议版本 1 → 2，
+  老 helper 不回 `V6RouteOK`，面板会把它读成「v6 没接管」——宁可当场报版本不匹配）。
+
+**面板与日志**：设置页「接管范围」一行会显示「网络变化后自动重钉过绕行路由 N 次（最近一次 21:42:33）」；
+日志里每次重钉都有一行 `TUN: 检测到网络变化（…），绕行路由已重新钉好`。
+
+**顺带补上的两处「切换与冷却要看得见」**（同一条验收项要求节点重连/切换/冷却在界面可见）：
+
+- `ProfileView.coolingUntil`：节点列表上多一枚「冷却 4m32s」的标记。
+  冷却**只约束自动切换，不约束用户手动选节点**——不说清的话，
+  手动选回一个还在冷却的节点，下一轮自动切换又把它挪走，看起来就是「程序不听我的」。
+- `Snapshot.autoSwitchedAt`：上一次自动切换的时刻。
+  光有 `autoSwitched` 那个布尔值答不了「刚才那下是不是它干的」，那需要时间和现象对齐。
+
+`profileViews` 因此多了一个 `cooling` 入参而不是去读全局状态：
+少传一个参数就会得到一份「所有节点都不冷却」的列表，
+而那和「从来没切过节点」长得一模一样——界面上分不出来的错，必须让编译器拦下来。
+
+**验证**：
+
+- 单元测试 `internal/tunx/netwatch_test.go`：去抖、落定才动手、
+  网络没变就不动手、网络断了保持原样、重钉失败不改计划（否则下一轮会以为不用再钉）。
+- 内核级 `internal/tunx/netns_linux_test.go` 里的
+  `TestNetnsGatewayChangeRepinsBypassRoutes`：在私有 netns 里真的换掉默认路由，
+  跑两轮监视，然后读内核路由表确认绕行路由已经指向新网关。
+- **DNS 故障**那一格以前只有推断：`resolve` 只在 `err == nil` 时写缓存，
+  所以"上游回来就该立刻好"看着显然，但从没被跑过。现在两条用例把它演完：
+  `internal/dnsx/resolver_test.go::TestResolverRecoversAfterEveryUpstreamFails`
+  让唯一那台上游**装死**（`dnstest.Server.Mute`：照常收包、就是不回——
+  这才是上游挂了在客户端眼里的样子，换地址等于换一次进程启动，测不到"同一个解析器自己好回来"），
+  连着失败两轮，再让它活过来，断言同一个域名立刻解析成功、而且第二次命中缓存不再打上游；
+  `internal/tunx/dns_counter_test.go::TestServeUDPDNSCountsFailureThenRecovers`
+  在 TUN 那一侧演同一件事：失败时应用收到 SERVFAIL 且计数进「解析失败」，
+  恢复时立刻答出真 IP 且失败那一格不再涨。
+  不成立的样子是「网都通了某些站点还是打不开，直到重启面板」——那种故障没人会怀疑到 DNS 上。
+
+### 0.3 2026-10-28 监控口径（台账）
+
+**先说结论：面板上那些字节是「本进程经手的载荷」，不是「这台机器的上网流量」。**
+
+这一条以前只存在于代码注释里，界面上「总流量」三个字会被读成后者。
+现在流量页与总览页都写明了口径：
+
+- 统计的是**从 SOCKS5 / HTTP / TUN 进来的连接搬了多少字节**（本次会话；
+  「各节点用量」那一档的「累计」另含上一次进程落盘留下的账）；
+- **选择性 TUN 下判成直连的真 IP 流量根本不进 tun**，不计入；
+  全局接管下进了 tun 的 TCP/UDP 才算。ICMP 等其它协议也不计入（两族都是，见 A37），
+  但要说清它去哪儿了：**本机协议栈会替 echo request 应答**（实测，见 §12 的能力边界与 A37），
+  所以接管状态下 `ping` 得通不代表对端可达——它不进隧道，也不会在面板上留一行；
+- **系统网卡总流量不采集**（那要读网卡计数，含协议头与重传，与载荷不是一个口径）；
+- **进程级归属不采集**（那要 socket 归属）。它不是"忘了写"，是单独评估过一轮：
+  权限与兼容性都在这台机器上量过，结论与"将来要满足哪三条才做"见 §12 末「进程归属」。
+
+最后一条尤其要说清：连接表里的「客户端」是**入站那一侧的地址**
+（SOCKS5/HTTP 是本机回环，TUN 是发起的那个源端口），
+不是「哪个程序发起的这条连接」——把两者混为一谈会得出完全错误的结论。
+
+**连接表本来就齐的**：路径（入站）、命中规则、节点、时长、上下行字节，
+以及四种走向——走代理 / 直连 / 已拦截 / 拨不通（失败行带着失败原因）。
+这一轮没有改它的结构，只是把口径写在页面上。
+
+**随后补上的一张表：按规则汇总的字节**（`traffic.byRule`，流量页）。
+原先只有「按节点」那一张，而节点会随故障切换变，规则不会——
+「这个站点的量为什么这么大」在节点表里问不出来。三条口径写在一起：
+
+- 一张表只数**真的搬过字节**的连接；规则页那栏「命中次数」含被拦与拨不通的
+  （那些一个字节也没有），两个数不同源是应有的差别，不是对不上账；
+- 行数有上限（12 行），超出的折成最后一行并标出折了几条——折进来的量仍然算在表里，
+  各行加起来必须等于总量，否则这张表就只是一个好看的东西；
+- 键必须与连接表「命中」那一列同一个字符串（都是引擎写下的 `rule.desc()`）。
+  演示数据里这张表是从那两份读数**现算**的，不是抄几个像样的假规则名：
+  抄来的名字点下去筛不出连接，那个错在按节点的表上已经犯过一次（`demo-hk`）。
+
+**DNS 那两个数现在也分开：`dnsServed` 与 `dnsFailed`。**
+
+这一条是同一把尺子量到自己身上：设置页那行「已应答 DNS N 次」以前把回 SERVFAIL 的
+查询也计进去了。上游全挂的时候那个数**照样涨**，而它唯一的用途是证明劫持在工作——
+于是最需要看见「解析在失败」的那一刻，界面报的是「解析很健康」。
+这不是估算偏差，是方向反了。
+
+- 现在 `dnsServer` 把「答上了」与「回 SERVFAIL」说给调用方（`Reply` 返回的
+  `DNSReply.ServFail`）；以前它只交出一段报文字节，`Serve` 那条路上错误码是**读不出来**的，
+  计数想分开也无从分起；
+- 「已应答」只数真答上的，「解析失败」单独一格，两个都不含"报文根本没解析成功"那类
+  （畸形查询直接报错，一条都不计）；
+- 只有判成直连的域名才会真去解析，所以这两个数天然只覆盖那一档：
+  代理域名领假 IP，本来就不做解析，两个计数都不动它——页面上写明了这一点，
+  免得有人拿它去核对总查询数。
+
+顺带把 UDP 的拒绝也补进了同一张表（见 §9.6）：`t.reg.Refuse` 原先只有 TCP 用。
+
+---
+
+### 0.4 2026-10-28 故障断网保护（台账）
+
+**先说结论：它堵的是「换节点那几百毫秒里流量裸奔」这个窗口，默认关闭，装不上时会明说「未生效」。**
+
+窗口是怎么来的：`strict_route` 下换节点必须整块重启（防环路路由钉的是当前节点的 IP），
+重启那一段默认路由回到了物理网卡——浏览器里每一条连接就此直接出去。
+路由回滚之后、helper 装失败之后也是同一个形状。界面上这些都长得像「只是切了个节点」。
+
+做法是把本机生成的出站收窄到一份白名单，其余 DROP（`internal/tunx/killswitch.go`）：
+
+- 白名单 = **所有**节点的地址 + DNS 上游 + `route_exclude` + 隧道内侧（网卡网段、
+  假 IP 网段、DNS 劫持落点）+ 回环 + DHCP；
+- 只在全局接管（`strict_route`）下有意义。选择性 TUN 里直连本来就该出去，
+  挂上它等于把这个模式要的功能关掉——所以那种配置会在能力提示里直接写明「不会挂上」；
+- 挂载点排在链的最后一步（`-I OUTPUT 1`）：前面的 ACCEPT 全装成功才可能开始拦，
+  中途失败等于什么都没发生，不会留下「只有 DROP」的半成品。
+
+三个坑是这轮设计里真正花时间的地方，每一个都有用例钉着：
+
+1. **白名单只有活动节点 = 保护把自己锁死**。备用节点不在名单里，自动切换试拨它会被
+   我们自己的规则拒掉，报错和「备用节点也死了」一模一样。所以名单由 service 侧
+   `killAllowList` 现场算全（域名当场解析），且名单变了就重挂——那是闸门唯一的自救通道。
+2. **隧道内侧没放行 = 开了保护之后连隧道都不通**。DNAT 之后的查询、发往假 IP 的连接
+   都会在 filter OUTPUT 里被自己的 DROP 拦下。
+3. **只有挂上的动作、没有抬起的动作 = 网络一直断着**。所以补了 `router.RecoverObserver`：
+   一次经当前活动节点建起来的连接就解除；自动切换成功、用户手动选点、停止 TUN
+   也都解除。判据与失败观察者对称——直连成功不算「节点通了」。
+
+**这一轮验到哪**：命令生成（族拆分、放行先于 DROP、摘挂互逆、残链可重入）、执行路径
+（本进程与 helper 两条）、失败回滚并把状态报成「未生效」、停止与残留清理摘链、
+service 的挂/摘时机都有单测；而**包真的被拦住**这一条是实测——
+`make test-netns-fw` 把规则装进真内核的 filter 表，读 `iptables -L` 的包计数：
+白名单外的 SYN 让 DROP 计数上涨，白名单内的让那条 ACCEPT 上涨而 DROP 不动，
+摘链之后表里连链名都找不到。v6 那一族同构地各验一次（见 §9.1b）。
+
+仍然没有端到端证据的是**隧道那一段**：这套 netns 里没有真节点，
+「HY2 带 UDP、Trojan 只带 TCP」这条边界要靠 `make acceptance-tun`（root + 真实节点）才量得出来。
+网卡与协议栈那一段已经补上了，见下面 §0.5。
+
+---
+
+### 0.5 2026-10-28 数据面实核（台账）
+
+**先说结论：包确实穿过了一块真的 tun 网卡与一个真的协议栈，而这一段以前从来没被跑过。**
+
+验收清单里那句「在网络命名空间验证 … TCP/UDP 转发」，此前的证据其实是假的：
+数据面用例（`udp_test.go`、`block_relay_test.go`）用普通 socket 顶替了栈那一端，
+验的是转发逻辑，不是「包真能穿过网卡与栈的接缝」。
+而那个接缝恰恰是最容易坏又最难看见的一段——fd 交接、`IFF_NO_PI` 与
+`EthernetHeader=false` 是否相配、假 IP 路由有没有真装进内核——
+任何一个错了表现都一样：面板显示已启用，浏览器什么都打不开。
+
+现在 `make test-netns-fw` 里有三条（见 §9.6 与 ACCEPTANCE A28–A30）：
+TCP 与 UDP 各一条真穿网卡、真进栈、真按规则判定、回程真送回应用 socket，
+字节同时落在连接账上；UDP 另有一条反向证据——判成直连时明确拒绝，
+而拒绝**必须在流量页留下一行原因**。
+
+顺手红出两个真 bug（细节与教训在 §9.1b 末）：`Stop` 报三条假错，
+以及 `fdDevice` 会把同一个 fd 关两遍。**两个都只在「本进程执行」这条路上**，
+线上走的是尊重 `Optional` 的 helper 那条——所以修完之后，
+两条拆除路径共用同一份容忍判据（`tolerates`），而不是各写一遍。
+
+一件口径上的事顺便钉死：UDP 被拒以前只有日志里那一句。
+UDP 传不回「拒绝」给应用，界面上不出现就等于用户手上什么都没有
+（QUIC 站点打不开，而流量页一片干净）。现在它和拨不通的 TCP 走同一条 `Refuse`：
+零字节、计入「拨不通」、带着「这条路承载不了 UDP」那句话。
+SOCKS5 的 UDP 关联同理，而且一次关联只记一行——出站是第一个报文定下来的，
+客户端重试十包不会刷出十行。
+
+**同一把尺子也量到了 `-diag` 上：接管范围读内核，不读本进程的记忆。**
+报告里新增两行「IPv4/IPv6 默认路由此刻指向哪块网卡」，四句互斥的话：
+接管成立 / 接管没成立（点名哪一族、此刻走的是物理出口）/
+没撤销干净的残留（配置没要求接管，默认路由却还指着 tun——机器此刻没有出口）/ 与配置一致。
+面板那两格读的是本进程记得的状态，两者不一致的那一刻恰恰最需要这份报告。
+读不到就写「读不到」，绝不下结论。本机实跑（选择性 TUN，两族默认路由都在物理卡上）
+给的是最后那句：「IPv4/IPv6 默认路由指向 wlp3s0f0：未接管，与配置一致」。
+
+2026-10-29 把这四句判据从「喂给替身的字符串」升级成「内核真长成那样」（A38）：
+替身只能证明解析器认得我认识的那种写法，而这个项目被「命令看着对、内核不吃」咬过两次。
+现在私有 netns 里真的把默认路由交给 tun，再让真 `Report()` 走真 `ip` 出报告：
+同一个内核现状换两种配置必须给两种说法（要求接管→成立 / 没要求→点名「没撤销干净的残留」），
+把路由撤掉之后必须改口「没成立」并点名此刻走的物理卡；v6 那一族在没有 v6 默认路由的
+netns 里必须说「与它无关」，不能跟着 v4 一起宣布接管。本机今天已经能看到其中两句的真话
+（改一份最小配置就能复现：`mode: rule` + 一个入站 + 一个节点 + `tun.strict_route: true`，
+`./wps_app-gui -diag -c=<那份配置>` → 「接管没成立，这一族此刻走的是物理出口」）。
+突变验证过：短路掉「接管成立」那一支，第一条断言就红。
+
+**2026-10-29 补：只有一个产物了（`./wps_app-gui`），旧的静态命令行版 `./wps_app` 已删除。**
+按使用者要求做的。动机是 A41 那一类故障少一半来源：过去「跑着的面板」与
+「`tun.helper` 指着的那个文件」是两个文件、两套构建，谁先被重建就错位——
+那天就是这样坏的（面板协议 1、磁盘上的 helper 协议 3，此后每一次特权操作都被拒）。
+现在面板与 helper 是同一个文件，「刷新产物」与「重启面板」成了同一件事。
+代价照实写在这里，不只写在 Makefile 头上：
+
+- **root 那条提权路径现在要加载 146 个共享库**（实测 helper 分支的 `LD_DEBUG` 计数；
+  静态版是 0 个）。helper 分支入口的 RSS 从 12.5 MB 变 51.9 MB、起进程 0.01s 变 0.04s。
+- **没装 `libgtk-3-0` / `libwebkit2gtk-4.0-37` 的机器从此跑不了任何产物**——
+  连无头模式（`-cli`）也一样，动态链接期就要加载它们。纯交叉编译那条路也没了。
+- `make gate` 的依赖里**删掉了 `build`**：单产物之后它覆盖的就是 helper 指着的那个文件，
+  面板在跑时跑一次门禁就会自己造出上面那类错位。门禁改用 `gate-gui`（产物进 `dist/gate/`）。
+- `make build` 现在等价于 `make build-gui`；`make clean` 会顺手清掉遗留的 `wps_app`。
+- 预检（A43）照旧有效，而且现在更重要：helper 与面板是同一个文件，
+  「磁盘上这份比跑着的那个新」正是它要认出来的形状。
+
+实测（2026-10-29）：`bash scripts/acceptance/tun_test.sh ./wps_app-gui` 仍然 **10/10**
+（被测二进制与 `tun.helper` 都是 GUI 产物）；非 root 实例实测 helper 那条路——
+`网卡 wps-tun-acc 由 tun.helper 创建，fd 已交给本进程（uid=1000）`；
+`-diag` 印 `提权 helper：sudo -n /home/chery/wps_app/wps_app-gui --tun-helper` 与
+`它自报提权协议 3，与本程序一致`。详见 ACCEPTANCE A51。
+
+**2026-10-29 再补：验收清单那三种接管形状，最后缺的一种（只有 v4 出口）补上了内核级用例（A45）。**
+这一种的价值在于它能让「两族必须分开」被证伪：没有 v6 网关时，一个双栈节点的 v6 地址若混进 v4 的
+`ip route`，内核会当场拒（实测原话 `Error: inet6 address is expected rather than "10.60.0.254"`）；
+而把 v6 报成「已接管」是承诺了一个走不通的出口。用例先把前提立住（显式清掉 v6 默认路由，再验一次
+这张网真的没有 v6 出口），然后同时看内核与面板：v4 交给 tun、v6 一格都没装、两格来源都是 kernel、
+发往 8.8.8.8:53 的查询按**增量**落进解析器（拿「计数 >0」当证据会在别的用例先跑过之后变成空跑）。
+同一轮把面板那两格的落笔处合成一个 `publishTakeoverStateLocked`——Start 与监视器以前各抄一遍赋值，
+这种重复不会立刻出事，但会让两处的「读不到时怎么办」慢慢走岔。
+
+**2026-10-29 再补：面板那两格「IPv4/IPv6 已接管」也改成问内核（A40）。**
+`-diag` 那三句先修好了，界面读的还是本进程的记忆——而这两处会分叉的那一刻，
+恰恰是最需要说实话的那一刻：DHCP 续约、NetworkManager 重启、另一个 VPN 起来，
+都会把默认路由从 tun 上拿回去，而 TUN 自己一无所知（还在跑、协议栈还活着）。
+现在这一格读内核：**网络监视器每 5 秒本来就要把两族的默认路由读一遍**（它是为了重钉绕行路由），
+同一份输出顺手给出「接管还在不在」这第二份结论——面板每 1–2 秒问一次状态，为它专门 fork 两次 `ip` 是给一个数字把常驻开销翻倍，所以 `Status()` 只拿贴出来的读数、自己一条命令都不起（`TestStatusNeverForksForTakeover` 把这条钉住）。读数旧过三个周期就不再自称实测；问不到就退回记忆，
+并把来源一起交出去（`takeoverFrom=memory`），设置页那行跟着写明
+「以上两格是按本进程装过的东西推的，不是实测」——宁可少一分笃定，
+也不让人把「我们相信还在接管」读成「内核说还在接管」。
+证据是 netns 里演的三幕：接管装好→报已接管；**把默认路由抢回物理卡**（完全不碰 TUN）
+→一个周期之内自己改口；再把路由交回去→又跟着改回来。
+突变验证过：让这一格改回读进程记忆，中间那句立刻红在
+「默认路由都被抢回去了，面板还在报 IPv4 已接管」。
+
+**2026-10-29 补：台账里「故障时的安全行为」那格，把「升级重启」补成了实核证据（A34/A35）**。
+老进程装完一切就没了（网卡随 fd 消失、nat 表原样留着），新进程走真实 `Start()` 之后
+断的是终态：每条劫持规则各一份、上游的出口仍在物理网卡、指向 tun 的默认路由恰好一条、
+真发的查询仍然落进重启后的解析器。这一格以前只有间接证据——`RepeatedStartStop` 走完
+正常拆除再 Start（表里没残留），`StaleCleanup` 那条只验「删掉了」没验「之后还能不能用」。
+它红出来的真 bug 是**清残留不收敛**：`-D` 一次只摘一份跳转，重复装载留下的第二份
+让 `-X` 永远失败，于是 nat 表里永久挂着一个指向不存在地址的劫持链。
+现在按内容扫 OUTPUT、每一份都摘掉（v4/v6 两条清理路径共用），细节与教训在 §9.1b 末。
+
+这条修的是**启动时**的清理（`CleanupStale` / `applyStale6`），也就是重复残留真正会遇到的那一处：
+每一次 `Start` 都先扫，所以「装两遍」从此攒不起来。正常 `Stop` 用的仍是 Down 列表里那两条精确 `-D`，
+一份残留能摘干净；真要遇上历史遗留的两份，下一次启动会收掉它——
+这是取舍，不是遗漏：把 `Stop` 也改成「扫一遍再删」要先在提权 helper 的协议里加一次列表读取，
+而那条路径上没有已知的失败证据。
+
+**2026-10-29 补：升级重启的另一半不在路由表里，在进程与 helper 之间（A41）——而且它是今天日志里真响过的。**
+`make build-gui` 把 `tun.helper` 指着的那个文件覆盖了，而跑着的面板还是提交版构建：面板发的是协议 1 的请求，
+文件里那个 helper 已经是协议 3，于是**这个进程从此每一次特权操作都被同一句话拒掉**，
+TUN 再也开不起来。日志里躺着的是
+`helper 协议版本 1 不被支持（本程序是 3）`——两个数字都摆出来了，
+可没有任何一句说该动哪一边；用户手上只剩「再点一次开关」，而每点一次都多两趟注定白跑的 root 调用。
+本包早就在注释里预见过这种「部署错位」（面板与 helper 来自同一个二进制，对不上只可能是错位），
+但把它写成了一句只有开发者读得懂的话。
+现在这句话必须是能照着做的：解析出两个版本号，**比面板新就说「用那个路径重启面板」，
+比面板旧就说「用当前构建刷新那个路径（make build-gui）」**，并指名 `tun.helper` 配的是哪个文件——
+路径取自配置而不是客户端结构体，因为要动的就是配置指着的那个文件。
+原文一并留着（对面到底说了什么，对排查仍然有用），并且它走的还是面板已有的那行错误，
+不需要新加投影字段。
+认得不一定是版本问题还不够：**「已知对不上」之后不许再白跑**——清残留那一趟直接跳过（日志说明为什么），
+但用户显式的一次启用仍然实打实问一次，否则文件刷新的那一刻这个进程就再也恢复不了；
+一次成功的往返立刻把结论作废，过期（60 秒）之后也会重新去问。
+用例是 `helper_mismatch_test.go`（四条）：两种方向各说对各的话、非版本问题的失败不许误认、
+第二次启用只起 3 趟而不是 4 趟、成功后结论当场作废。突变验证过三次：保质期归零（跳过不生效）、
+建议里不指名路径、把任何 helper 失败都当版本问题——三种退化各自红在该红的那一条。
+
+**同一句处方必须覆盖全部六条 helper 路径，而「跳过」只能给其中三条**（A42）。
+`up`/`cleanup` 只是启用的开头，跑着的 TUN 还有另外四条会撞上同一个错位：
+`reroute`（监视器每 5 秒一轮，版本对不上就是每轮一趟白跑的 root 调用 + 每轮一条一模一样的 WARN，
+把日志里真出事那几行埋掉）、`down`（拆网卡/路由/劫持规则）、以及 `kill` 的挂与摘。
+分界线按**副作用**划，不按调用频率划：
+- **重复断言型可以跳过**（`cleanup`、`reroute`）——它们做的事是"把同一份配置再钉一遍"，
+  不发出去只是"没再钉一次"，机器上不会多出遗留；`reroute` 跳过时**计划照旧不改**，
+  进程于是仍然只知道"绕行路由钉在老网关上"，不会误以为已经跟着新网关走了。
+- **拆除型绝不跳过**（`down`、`kill` 摘）——跳过的后果不是"这次没成功"而是"那条还在 DROP
+  本机所有出站的链被留在机器上，而面板写着已停止"。这两条只把处方加进错误里，调用照发。
+`TestTeardownNeverSkipsHelperMismatch` 钉的就是这条不对称：已知版本对不上之后，
+拆除那一路必须**照样起一次**真实调用，并且错误里要写清"这一步不能跳"——
+否则读日志的人会以为是我们偷懒。跳过用 `errHelperMismatchSkip` 这个哨兵标出来，
+让 `checkNetworkChanged` 把它记成 Debug：不跳过日志的刷屏，就等于没有跳过。
+
+**再往前一步：这件事在动 root 之前就能问出来（A43）。**
+A41/A42 都是「被拒之后把话说清楚」，但那次故障里每一次点开关都要先起一个 sudo、
+生一个 root 进程、发一份注定被拒的请求——**代价花在 root 上，结论本来就写在磁盘上**。
+于是 `-version` 多打一行机器可读的 `提权协议 3`（实测：`./wps_app-gui -version` 的第二行就是它，
+不读配置、不抢锁、不碰网络、退出码 0），面板在叫 root 之前用**普通用户身份**把
+`tun.helper` 那个文件跑一次 `-version`：对不上就给出「该动哪一边」并**一次 root 都不叫**；
+对得上就顺手把「已知对不上」的结论作废——那正是文件刚被刷新、本该立刻恢复的那一刻。
+三条边界是三条不同的判据，各有一条用例：
+① 预检**问不出来时必须放行**（文件读不到、对面太老没有这一行）：把「读不到」当成「版本不对」，
+   等于用一次预检的失败取消掉一次本来能成功的启用；
+② 进程内 helper（`Spawn`）整个跳过预检，配置里那个路径一次都不许 exec；
+③ 那句「没有去叫 root」必须进 `Status.lastError`，让界面看得见。
+用例是真 fork/exec：夹具是一个会把自己被调用的参数记进日志的 shell 脚本，
+所以「到底叫了几次、每次带什么参数」是读出来的，不是推断的。
+突变验证过三次：把预检从 `Start` 里摘掉 → 红在「叫了 root 且错误里没有处方」；
+把「问不出来」当成「版本不对」 → 红在放行那一条；匹配时不作废结论 → 红在永久拉黑。
+
+**顺带修掉一处“说真话但把话说烂了”的地方（A46）。**
+2026-10-29 13:56 的现场：一张 USB 网卡从系统里消失，NetworkManager 收敛的那几分钟里物理默认路由时有时无；
+判据如实报了 `TUN: 网络断了（v4 无网关 · v6 无网关 …），绕行路由保持原样，等网络回来`——
+这句话本身是对的（那阵子确实钉不了绕行路由，也确实不该拆已有的），
+但它**每 5 秒重复一遍**，把同一时间段里真正要看的「拨不通」「隧道故障」全埋了。
+现在同一次中断只说一次（形态变了才再说：v4 回来 v6 没回来、DNS 换人都算新消息），
+恢复时说一次「网络回来了」，然后闭嘴。判据是**条数**（`TestNetworkDownWarningSpeaksOncePerEpisode`：
+四轮只许一条、恢复一条、稳定后再跑三轮一条都不许多、第二次中断重新说一次）；
+突变验证过：把去重拿掉，四轮立刻变成三条。
+
+**同一句话也进了 `-diag`（A44）：不启用 TUN 就能看见。**
+故障当天要想知道「面板和 helper 是不是同一份」，只能去翻被拒之后的日志；
+现在报告在 `tun.helper` 那一行下面直接跟一句它自报的协议。两次真跑（本机与一份指向
+「自报协议 1」的假 helper 的最小配置，后者不含任何真凭据）：
+`它自报提权协议 3，与本程序一致` / `比跑着的面板（协议 3）旧：…请用当前构建刷新 <那个文件>（make build-gui）`。
+读不到的那一支只说读不到，并补一句「这不等于版本不对，启用时照旧会去试」——
+报告要是把「问不出来」写成「版本不对」，它就会劝用户做一次根本没必要的重装。
+
+**同一类 bug 在断网保护上更狠，而且也是这条用例顺手撞出来的**（A36）。
+把「重挂之后数一数」这个动作挪到保护链上，第一次跑就红在两个地方：
+
+1. `TolerateExists` 只认 iproute2 的 `File exists`，而 iptables 说的是 `Chain already exists.`。
+   于是**第二次重挂在 `-N` 那一步就判失败**，走回滚、报「未生效」——
+   每一次白名单变化都把刚挂上的保护摘掉，用户以为它在，其实它从来没有第二次生效过。
+   一份判据必须同时对上两套工具的措辞，因为它们本来就挂在同一份计划上。
+2. `killArm` 末尾那条 `-I OUTPUT 1` 是无条件往前插：挂 N 次就有 N 份挂载点，
+   而拆除的 `-D` 一次只摘一份。剩下那些让链永远被引用着、`-X` 删不掉——
+   面板写「已关闭」，内核里那条拦本机所有出站的链一直挂着。
+
+修法是两条各管一头：挂之前先摘（`killArm` 开头一条 Optional 的 `-D`，挂载点恒等于一份），
+拆的时候扫干净（`CleanupKill` 先按内容把每一份挂载点摘掉，再清链删链）。
+**并且把「摘下保护」收成一个实现**——本进程、helper、启动清理三条路以前各写一遍，
+而判据写三份早晚不一致，这一处不一致的代价正是「说已关闭却没关闭」。
+顺序也是判据的一部分：`TestKillArmHeadIsReentrant` 现在按内容查出「先摘」必须排在「后挂」前面，
+反过来就等于把刚挂上的那份摘掉、叠上第二份。突变验证过：拿掉先摘，两份/三份立刻现形。
+
+顺着这类 bug 摸到底，剩下的一处**不在命令里，在措辞里**（A39）。整套拆除的容忍判据只靠三句话认「效果已经达成」：`File exists`、`already exists`、`Cannot find device "x"`。让真工具现场说一遍才发现漏了一种：重复挂地址内核说的是 `Error: ipv4: Address already assigned.`，而 `Plan` 里两条 `addr add` 都写着 `TolerateExists`——声明的意图是「卡上已经有这个地址就算成功」，判据接不住这句，意图就是空的（上一次跑 netns 时它真的把「装第二遍」判成了失败）。现在 `tolerance_netns_test.go` 把这三句交给真工具去说、把「网关不可达」这类真失败交给判据去拒：**判据依赖的措辞本身是有用例的**，将来 iproute2 改了措辞会红在这里，而不是红在某个用户的重挂上。
+
+告警那句「现在还在解析失败吗」也不用累计数，用 `dnsFailedAt`（最近一次失败的时刻）：
+只看累计数的话，一次抖动留下的告警会一直亮到重启，而那种告警教给用户的不是排查，是忽略它。
+判据本身是一个纯函数（`format.ts::recentlyFailed`），带四条 vitest（窗口内外、0/NaN、
+未来的时刻、窗口不合法）——面板是软件光栅画的，"看上去对了"不算验过。
+
+---
+
+## 0.2 2026-11-02 交付状态修复（台账）
+
+这一轮不改协议行为，只把 10-27 之后散在工作区的能力收进 git，并修掉三处
+“说法与事实不一致”。
+
+- **入库**：10-27 之后的 71 个修改、2 个删除、45 个未跟踪文件按后端、前端、文档三批提交；
+  干净 clone 能直接 `go build ./...` 与 `go test ./...`。
+- **前端产物**：`frontend/dist/index.html` 与它引用的哈希资源同批入库；
+  `make frontend` / `make dist-check` 会检查引用是否真的存在，缺一个就失败。
+- **`-diag`**：普通权限探针钉不上时，若配置了 `tun.helper`，报告改说
+  “面板会把钉卡交给提权 helper，本报告未验证 helper”，不再断言“按系统默认路由走”。
+- **root 落盘属主**：`sudoown` 扩到用户规则、规则备份、日志轮转与配置备份；
+  root 跑完面板后普通用户仍能读写这些文件。
+- **文档**：修正前端用例数、service.go 行数、TUN IPv6 能力矩阵与“无遗留缺陷”的表述；
+  `.workbuddy/` 加入忽略。
 
 ---
 
@@ -84,21 +522,25 @@ go build ./...                                 # 编译全部包
 go vet ./...                                   # 静态检查（两种构建都要跑，见 make vet）
 go vet -tags "gui production" ./...            # 带 gui 标签那一份：漏了它，gui.go 的错误没人检查
 go test -race ./...                            # 单元测试
-make build                   # 命令行产物：CGO_ENABLED=0、-ldflags "-s -w"、静态无 GTK
-
-make build-gui   # 桌面面板：npm 构建前端 → go build -tags "gui production"
-                 #   ⚠ 会覆盖 ./wps_app-gui，也就是正在跑的那个面板用的二进制
+make build                   # 等价于 make build-gui（只有一个产物了）
+make build-gui   # 唯一的产物：npm 构建前端 → go build -tags "gui production"
+                 #   ⚠ 会覆盖 ./wps_app-gui —— 它同时是正在跑的面板，和 tun.helper 指着的那个文件
 make frontend    # 只重出前端产物，改样式时快（先跑 vue-tsc，类型错就不出 dist）
 make frontend-test # 前端纯函数测试 + 覆盖率闸门（不启浏览器）
 make acceptance  # A6 协议 16 项 + A8 信号，离线、隔离端口
 make soak        # 被动采样当前面板的 RSS/fd/线程（不重启、不发信号）
 make test-offline # 断网跑全套：只留回环的网络命名空间，见 §9.1
+make test-netns-fw # 在私有 netns 里真跑 iptables：劫持与断网保护装进内核、读包计数，见 §9.1b
+make probe-attribution # 全程只读：量「连接归到哪个进程」在这台机器上能给到哪一步，见 §12
 make gate        # 改完跑这一条：全套离线门禁（约 2 分钟，见 §14.9；末尾含 gate-gui，
                  #   产物在 dist/gate/，不覆盖 ./wps_app-gui）
 make check       # 用仓库 config.yaml 跑一次 -check 自检——会真连节点与订阅源
+                 #   ⚠ 默认目标是 www.gstatic.com:443；本机直连也拨不通它时它会红，
+                 #     那是目标站不通，不是程序坏了。换目标：
+                 #     make check CHECK_HOSTS=cp.cloudflare.com:443
 make package     # 出「给别人的包」：运行包 + 含 vendor 的源码包，见 §13
 
-./wps_app -version   # 版本 + 源码指纹 + 构建时间
+./wps_app-gui -version   # 版本 + 源码指纹 + 构建时间；第二行「提权协议 N」是给预检读的
 cd frontend && npm run dev   # 只在浏览器里调界面，不启 Go；?demo= 切状态场景，见 §9
 ```
 
@@ -109,11 +551,16 @@ GOFLAGS=-mod=vendor GOPROXY=off go build ./...                        # 离线
 GOFLAGS=-mod=vendor GOPROXY=off go test ./...                         # 测试同理
 ```
 
-两个产物刻意用构建标签分开：`wps_app` 无 CGO、可直接给 systemd；`wps_app-gui` 依赖
-系统 `libgtk-3` 与 `libwebkit2gtk-4.0`，进程内部自己跑代理，不需要另一个守护进程。
+**只有一个产物 `./wps_app-gui`**：依赖系统 `libgtk-3` 与 `libwebkit2gtk-4.0`，
+进程内部自己跑代理，不需要另一个守护进程；没有图形界面就加 `-cli`（见 §8）。
+2026-10-29 之前还有一个 CGO_ENABLED=0 的静态命令行版 `./wps_app`，
+它已经删除——面板与 `tun.helper` 从此是同一个文件，不会再有「两个产物各自重建」造成的错位。
+代价：root 那条提权路径现在要加载 146 个共享库（实测 helper 分支的 LD_DEBUG 计数），
+静态版是 0 个；helper 分支入口的 RSS 从 12.5 MB 变 51.9 MB、起进程 0.01s→0.04s。
+没有装 GTK/WebKit 的机器从此跑不了任何产物（`-cli` 也一样，动态链接期就要加载它们）。
 
 TUN 模式需要 `gvisor.dev/gvisor`（用户态协议栈）与 `github.com/xjasonlyu/tun2socks/v2`
-（TUN 设备 + netstack 接线），两个产物都会带上，只在 `tun.enable: true` 时才真正建网卡。
+（TUN 设备 + netstack 接线），只在 `tun.enable: true` 时才真正建网卡。
 
 
 ---
@@ -192,6 +639,7 @@ tun:
   hijack_dns: true                  # 用 iptables 把本机 :53 引到 tun.dns
   strict_route: false               # 进阶：连默认路由一起接管
   route_exclude: []
+  kill_switch: false                # 故障断网保护：自动切换放弃时只放行节点，默认关闭（需 strict_route）
 
 geoip:
   path: "./assets/geoip.mmdb"
@@ -258,7 +706,7 @@ block:
 所以规则↔全局来回切几乎零成本、不断流。命令行也能临时覆盖（不写回配置文件）：
 
 ```bash
-./wps_app config.yaml -mode global
+./wps_app-gui config.yaml -mode global
 ```
 
 日志与连接表会如实标出依据——`[PROXY | MODE,GLOBAL]` 是被模式压过的，
@@ -294,12 +742,12 @@ iface_split:
 网卡分流：直连走 wlp3s0f0，代理走 wlx001f0578cdff
 ```
 
-或用 `./wps_app -c config.yaml -diag` 单独查一节，它会把「没开 / 模式不对 /
+或用 `./wps_app-gui -c config.yaml -diag` 单独查一节，它会把「没开 / 模式不对 /
 只凑齐一张卡 / 内核不给绑」四种没生效的原因分别写出来。运行期可以在 `ss` 里直接看到：
 
 ```bash
-ss -uanp | grep wps_app     # 代理：UNCONN *%wlx001f0578cdff:49600
-ss -tanp  | grep wps_app    # 直连：ESTAB 10.180.56.140%wlp3s0f0:52738
+ss -uanp | grep wps_app-gui   # 代理：UNCONN *%wlx001f0578cdff:49600
+ss -tanp  | grep wps_app-gui  # 直连：ESTAB 10.180.56.140%wlp3s0f0:52738
 ```
 
 地址上的 `%网卡名` 就是钉住生效的证据。
@@ -444,7 +892,7 @@ root 进程连不上普通用户的会话总线（D-Bus 策略按 uid 放行）�
 ```yaml
 tun:
   enable: true
-  helper: ["sudo", "-n", "/home/chery/wps_app/wps_app", "--tun-helper"]
+  helper: ["sudo", "-n", "/home/chery/wps_app/wps_app-gui", "--tun-helper"]
 ```
 
 ```bash
@@ -469,7 +917,7 @@ tun:
   `iptables -m owner ! --uid-owner`，允许调用方随便填就等于任何本地用户都能借 root
   替别人改写 netfilter 规则。
 - **一个请求一个进程。** helper 不常驻，面板崩了也不会留下一个握着网卡的 root 进程；
-  残留的 iptables 规则由下次启动的清扫（或 `sudo ./wps_app -tun-reset`）负责，
+  残留的 iptables 规则由下次启动的清扫（或 `sudo ./wps_app-gui -tun-reset`）负责，
   后者配了 `helper` 时也会走同一条提权路径。
 
 `helper` **不是界面表单字段**：它只出现在 `config.yaml` 里，面板保存表单时原样保留
@@ -478,7 +926,10 @@ tun:
 
 ```
 # /etc/sudoers.d/wps_app-tun-helper
-chery ALL=(root) NOPASSWD: /home/chery/wps_app/wps_app --tun-helper --tun-helper-connect=*
+# 路径指着产物文件本身：单产物之后，面板与 helper 是同一个文件，
+# 所以这条规则放行的正是 ./wps_app-gui —— 换句话说，面板能以 root 起的
+# 只有那一次 helper 调用（参数被钉死成 --tun-helper）。
+chery ALL=(root) NOPASSWD: /home/chery/wps_app/wps_app-gui --tun-helper --tun-helper-connect=*
 ```
 
 > **为什么不给二进制 `setcap` 就完事**：配地址、加路由、挂 iptables 劫持都是 exec 出去的
@@ -505,7 +956,7 @@ chery ALL=(root) NOPASSWD: /home/chery/wps_app/wps_app --tun-helper --tun-helper
 
 劫持规则挂在自建的 `wps_app_dns` 链上，卸载时 `-F` + `-X` 一次清干净；SNAT 不在链里，
 逐条删。进程被 `kill -9` 可能留下残留（后果是本机解析超时），所以每次启动都会先无条件
-清一遍，也可以手动复位：`./wps_app -tun-reset`。
+清一遍，也可以手动复位：`./wps_app-gui -tun-reset`。
 
 `strict_route: true` 会把默认路由也交给 tun（裸 IP 流量一并接管）。这时直连出站
 必须靠 `route_exclude` 钉回物理网关，否则直连会自环，属于进阶用法，默认关闭。
@@ -1181,7 +1632,7 @@ DOMAIN-SUFFIX,example.cn,DIRECT
 命令行侧同样能热重载（面板进程也接了 `SIGHUP`，与命令行行为一致）：
 
 ```bash
-kill -HUP $(pgrep -x wps_app-gui)     # 或 pgrep -x wps_app
+kill -HUP $(pgrep -x wps_app-gui)
 ```
 
 ### 5.5 `DOMAIN-REGEX`：一条正则规则
@@ -1346,12 +1797,13 @@ IP-CIDR,10.9.0.0/16,DIRECT,no-resolve,off
 ## 6. 使用
 
 ```bash
-./wps_app -c config.yaml          # 正常启动
-./wps_app config.yaml             # 等价写法：配置文件可作位置参数
-./wps_app -c config.yaml -check   # 连通性自检：连上服务端并逐个拨号后退出
-./wps_app config.yaml -check      # 位置参数与选项可以任意顺序混用
-./wps_app -c config.yaml -check -check-host www.baidu.com:443
-./wps_app -c config.yaml -check-fetch https://www.gstatic.com/generate_204   # 真的取一个页面回来
+./wps_app-gui -c config.yaml          # 正常启动（带 gui 标签的产物默认出界面）
+./wps_app-gui config.yaml             # 等价写法：配置文件可作位置参数
+./wps_app-gui config.yaml -cli        # 不出界面、只跑代理服务（无桌面/服务器上用）
+./wps_app-gui -c config.yaml -check   # 连通性自检：连上服务端并逐个拨号后退出
+./wps_app-gui config.yaml -check      # 位置参数与选项可以任意顺序混用
+./wps_app-gui -c config.yaml -check -check-host www.baidu.com:443
+./wps_app-gui -c config.yaml -check-fetch https://www.gstatic.com/generate_204   # 真的取一个页面回来
 ```
 
 ### 多目标巡检
@@ -1359,7 +1811,7 @@ IP-CIDR,10.9.0.0/16,DIRECT,no-resolve,off
 `-check-host` 可以重复给，也可以逗号分隔（两种混用也行，顺序就是巡检顺序）：
 
 ```bash
-./wps_app config.yaml -check \
+./wps_app-gui config.yaml -check \
   -check-host no-such-host.invalid:443,www.gstatic.com:443,www.baidu.com:443
 # OK no-such-host.invalid:443 via PROXY matched=FINAL(dns-failed)
 # OK www.gstatic.com:443 via PROXY matched=DOMAIN-SUFFIX,gstatic.com,PROXY
@@ -1391,7 +1843,7 @@ IP-CIDR,10.9.0.0/16,DIRECT,no-resolve,off
 `-check-fetch` 于是经隧道真的做一次 HTTP(S) 请求：
 
 ```bash
-./wps_app config.yaml -check-fetch https://www.gstatic.com/generate_204,https://cloudflare.com/cdn-cgi/trace
+./wps_app-gui config.yaml -check-fetch https://www.gstatic.com/generate_204,https://cloudflare.com/cdn-cgi/trace
 # OK https://www.gstatic.com/generate_204 https 204 0 字节 via PROXY matched=DOMAIN-SUFFIX,gstatic.com,PROXY
 # OK https://cloudflare.com/cdn-cgi/trace https 200 server=cloudflare 220 字节 via PROXY matched=FINAL
 # FETCH-SUMMARY ok=2 fail=0 total=2
@@ -1410,6 +1862,12 @@ IP-CIDR,10.9.0.0/16,DIRECT,no-resolve,off
 |---|---|---|
 | `phaethon-hy2` | `OK via PROXY` | `http 200 server=cloudflare 199 字节`、`http 200 server=cloudflare 589 字节` |
 | `JP`（trojan） | **`OK via PROXY`**，两个目标都是 | `HTTP 400（nginx/1.28.3 (Ubuntu)）——电路是通的，但这一跳没把页面取回来`，两个不同站点回同一张页面；443 上则是 `TLS 握手失败: tls: first record does not look like a TLS handshake` |
+
+> **2026-10-29 更正这一行的结论**：`JP` 不是"兼底型节点"。节点侧 trojan 1.16 在跑、
+> 证书是真 Let's Encrypt、同一时刻别的客户端正常在传数据。上表那两种读数各有别的原因：
+> 我们的 trojan 头部摘要用错了算法（SHA-1，服务端只认 SHA-224 + 裸字节第二行），
+> 而 `443` 那一句"不像 TLS 握手"来自**本机公司网出口上的设备替我们终止 TLS**。
+> 取证命令与三处判据的改法见 §10.19。
 
 判据与措辞，逐条都有对应用例：
 
@@ -1431,7 +1889,7 @@ IP-CIDR,10.9.0.0/16,DIRECT,no-resolve,off
   指向完全不同的根因。拨号本身就没成功时不硬编一个出站名。
 
 选项与位置参数不区分先后：标准库 `flag` 遇到第一个非 flag 参数就停止解析，
-本程序先手工分离两者再交给 `flag`，所以 `wps_app config.yaml -check` 不会把
+本程序先手工分离两者再交给 `flag`，所以 `wps_app-gui config.yaml -check` 不会把
 `-check` 误判成多余的参数。`-h` 退出码 0，用法错误退出码 2。
 
 `-check` 输出形如：
@@ -1491,7 +1949,7 @@ CLI 只有显式 `-log-file` 才写；`-pprof` 只接受回环地址，堆快照
 `resolv.conf` 五六处。`-diag` 把它们收成一段文本：
 
 ```bash
-./wps_app config.yaml -diag
+./wps_app-gui config.yaml -diag
 ## 运行身份        可执行文件 / exe 路径、PID、uid、配置文件绝对路径、构建（版本/源码指纹/时间）
 ## 入站            每个监听地址：在听 / 没人听 / 未测（非回环）
 ## 出站节点        协议、地址、SNI、auth=已设置（不印值）
@@ -1504,7 +1962,7 @@ CLI 只有显式 `-log-file` 才写；`-pprof` 只接受回环地址，堆快照
                   **引擎真的读过哪几份文件**（含每一层 #include，带大小与改动时间——
                   "改了不生效"的第一步永远是确认它到底读了没）、订阅地址的主机与缓存新鲜度
 ## DNS             配置的上游 + /etc/resolv.conf 现在的 nameserver
-## TUN             网卡在不在、helper 配置、假 IP 段、劫持与严格路由
+## TUN             网卡在不在、helper 配置、假 IP 段、劫持与严格路由、默认路由此刻归谁
 ## 系统代理        桌面读数 + 记账那五种状态（见 §4.5）
 ```
 
@@ -1601,7 +2059,7 @@ export https_proxy="http://127.0.0.1:7892"
 ## 7. 热重载
 
 ```bash
-kill -HUP $(pgrep -x wps_app)        # 面板进程用 pgrep -x wps_app-gui
+kill -HUP $(pgrep -x wps_app-gui)     # 进程名就是产物名 wps_app-gui
 ```
 
 重新加载 `assets/geoip.mmdb` 与 `rules.txt`（含其 `#include` 的文件，包括 `user-rules.txt`）。
@@ -1613,7 +2071,7 @@ kill -HUP $(pgrep -x wps_app)        # 面板进程用 pgrep -x wps_app-gui
 
 ```bash
 ./scripts/fetch-assets.sh --seed
-kill -HUP $(pgrep -x wps_app)
+kill -HUP $(pgrep -x wps_app-gui)
 ```
 
 ### 7.1 改完文件就生效，不用点按钮
@@ -1696,7 +2154,7 @@ kill -HUP $(pgrep -x wps_app)
 ```bash
 sudo install -d /etc/wps_app
 sudo install -d /usr/local/bin
-sudo install -m 755 wps_app /usr/local/bin/wps_app
+sudo install -m 755 wps_app-gui /usr/local/bin/wps_app-gui
 sudo install -m 600 config.yaml /etc/wps_app/config.yaml
 sudo install -d /etc/wps_app/assets
 sudo install -m 644 assets/geoip.mmdb /etc/wps_app/assets/geoip.mmdb
@@ -1705,11 +2163,11 @@ sudo install -m 644 assets/rules.txt /etc/wps_app/assets/rules.txt
 sudo install -m 644 assets/gfw-proxy.txt /etc/wps_app/assets/gfw-proxy.txt
 ```
 
-`/etc/wps_app/wps_app.service`：
+`/etc/wps_app/wps_app-gui.service`：
 
 ```ini
 [Unit]
-Description=wps_app - hysteria2 / trojan 代理客户端
+Description=wps_app-gui - hysteria2 / trojan 代理客户端
 Documentation=file:/etc/wps_app/README.md
 After=network-online.target
 Wants=network-online.target
@@ -1718,7 +2176,9 @@ Wants=network-online.target
 Type=simple
 User=wps
 Group=wps
-ExecStart=/usr/local/bin/wps_app /etc/wps_app/config.yaml
+# -cli 是必须的：服务器上没有桌面会话，不加它这份产物会去找显示与托盘。
+# 但它仍然是动态链接 GTK/WebKit 的那一份——那几套运行库得装在服务器上。
+ExecStart=/usr/local/bin/wps_app-gui -cli /etc/wps_app/config.yaml
 Restart=on-failure
 RestartSec=5s
 
@@ -1744,16 +2204,16 @@ WantedBy=multi-user.target
 ```
 
 > `ExecStart` 用的是位置参数而非 `-c`，与示例保持一致；`-c` 形式同样可用：
-> `ExecStart=/usr/local/bin/wps_app -c /etc/wps_app/config.yaml`
+> `ExecStart=/usr/local/bin/wps_app-gui -cli -c /etc/wps_app/config.yaml`
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now wps_app
-sudo systemctl status wps_app
-journalctl -u wps_app -f
+sudo systemctl enable --now wps_app-gui
+sudo systemctl status wps_app-gui
+journalctl -u wps_app-gui -f
 
 # 热重载
-sudo systemctl reload wps_app    # 需在 unit 里配 ExecReload=/bin/kill -HUP $MAINPID
+sudo systemctl reload wps_app-gui    # 需在 unit 里配 ExecReload=/bin/kill -HUP $MAINPID
 ```
 
 给 unit 加上热重载：
@@ -1782,6 +2242,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 ```bash
 go test ./...                  # 单元测试
 make test-offline              # 断网跑：只留回环的网络命名空间，见 §9.1
+make test-netns-fw             # 真跑 iptables：保护与劫持装进内核并读计数器，见 §9.1b
 make frontend-test             # 前端纯函数（vitest）+ 覆盖率闸门
 make acceptance                # A6 协议 16 项 + A8 信号，离线、隔离端口
 make acceptance-tun            # B3 TUN，显式启用（root + 真实节点）
@@ -1819,7 +2280,7 @@ WPS_TEST_LOG=1 go test ./internal/inbound/ -run SOCKS5 -v
 `make acceptance` 的脚本在 `scripts/acceptance/`；A6/A8 在 2026-10-27 实跑 16/16、3/3。
 它们固定用 17891/17892，不碰线上 7891/7892，也不碰外网；B3 需要 root 与真实节点，
 未在本机重跑。前端测试只守纯函数（`format` / `ageclock` / `nodetests` / `probes`，
-32 个用例，目标模块行覆盖 100%），组件交互仍按 §10 的清单人工点。
+36 个用例，目标模块行覆盖 100%），组件交互仍按 §10 的清单人工点。
 
 ### 9.1 断网跑：`make test-offline`
 
@@ -1949,6 +2410,96 @@ unshare -rn bash -c 'ip link set lo up && GOFLAGS=-mod=vendor GOPROXY=off go tes
 ```bash
 WPS_APP_GEOIP=./assets/Country.mmdb go test ./internal/rules/ -run FullDatabase -v
 ```
+
+### 9.1b 真跑 iptables：`make test-netns-fw`
+
+这一组存在的原因很具体：**过去我们相信「netns 里验不了 iptables」**。
+iptables 起来第一句就要打开 `/run/xtables.lock`，而那个文件属于宿主里的 root，
+非特权用户命名空间对它没有写权限——于是所有涉及 nat/filter 的断言都只能停在
+「Down 列表里有这几条命令」，删没删干净、装上的语法内核认不认，全都没验过。
+
+出路不在 root，在挂载命名空间：
+
+```bash
+unshare -rnm bash -c 'mount -t tmpfs tmpfs /run && ip link set lo up && WPS_NETNS=1 WPS_FW=1 go test ./internal/tunx'
+```
+
+`-m` 之后 `/run` 可以换成一份自己的 tmpfs，锁文件就有了，而规则仍然只挂在
+那个**私有网络命名空间**的表上——宿主的 iptables 一条不动（每轮都核对过）。
+
+于是这几件事第一次有了实核证据：
+
+- 我们自己生成的挂保护命令**内核收不收**（`-I OUTPUT 1`、`-p ipv6-icmp`、`--dport 67:68` 全部原样装进 filter）；
+- 白名单外的 SYN 被 DROP **计数**，白名单内的被 ACCEPT **计数**——两个目标地址走同一张网卡、
+  同一份静态邻居，唯一的差别就是它在不在名单里。邻居条目是这套判据的要害：
+  没有它，放行的那个会卡在地址解析上，"命中哪条规则"就再也不是唯一的变量；
+- DNS 劫持装上后，真的发一个查询出去：目标是 8.8.8.8 时它**落到我们的解析地址上**
+  （UDP 与 TCP 各自验一次），而目标是我们的上游（223.5.5.5）或 resolved 的 stub
+  （127.0.0.53）时**不落到我们这里**——「自己的解析被自己劫持」这个坑第一次有了反向证据；
+- 按 Down 列表拆完之后，nat 表里再也找不到链名、DNAT 或那条 SNAT；
+  以及模拟异常退出留下的残表被 `CleanupStale` 真的清空。
+
+踩到的两个坑都记在这里，因为它们都长得像"产品坏了"：
+
+1. `connect()` 在**有包之前**就做路由查询，DNAT 发生在 LOCAL_OUT，
+   所以一个连出去的 UDP 套接字在没默认路由的 netns 里直接 `network unreachable`，
+   看着像"劫持没生效"。改成不 connect 的套接字 + 给 netns 一条指向 dummy 的默认路由，
+   才有"改写前能路由、改写后投递到本机"的可判别状态。
+2. `ip -6 route add <段> dev wps-tun` 在**没 up 的网卡**上被内核拒绝
+   （`Nexthop device is not up`）。生产里 `Plan()` 第一组命令就把它 up 了，
+   单独跑 `PlanV6()` 的用例必须自己补那一步——红的是脚手架，不是产品。
+
+同一套脚手架还顺手把「数据面」接上了真网卡：真 socket 的包落进真 tun、
+被真协议栈收下来、按规则判定再从物理侧发出去（TCP、UDP 各一条，含回程），
+见 §9.6 那张表。这一组第一次让「面板显示已启用但什么都打不开」那类故障
+有了一个能自动重跑的判据。
+
+**它红出来两个真 bug**，都不是评审时想到的：
+
+1. `Stop` 每次都背着三条 `Cannot find device "wps-tun"`。根因是拆除有两条路：
+   helper 那条尊重 `Optional`，本进程这条只看「有没有报错」，
+   而协议栈销毁链路时网卡就已经没了。修法是**先把容忍判据收成一个函数**
+   （`tolerates`：`TolerateMissingDevice` / `TolerateExists` / `Optional`），
+   三个执行点共用——各写一遍就是这次事故的成因。
+   配套的脱机守卫是 `TestReleaseSystemTreatsGoneDeviceAsSuccess`
+   与 `TestReleaseSystemStillReportsRealTeardownFailures`
+   （后者保证"容忍"不会退化成"拆除这一步全都不算数"）。
+2. `fdDevice.Close()` 会对同一个 fd 关两次：`stack.Close()` 销毁链路时已经调过
+   一次，我们那次是兜底。fd 号在单线程下看起来无害，一旦被别的线程复用，
+   关掉的就是别人的 socket。现在 `closeOnce` 兜住。
+
+第 1 条在**生产路径上一直没被发现**，是因为线上走的是 helper 那条——
+普通用户身份的面板恰好是唯一尊重 `Optional` 的那条路。
+"两条拆除路径的判据不一样"这种不对称，只有在两条都被真跑过一次时才看得见。
+
+**2026-10-29 增量：把「升级重启」这一格补成实核证据（`restart_netns_test.go`，A34/A35）**。
+「老进程装完一切就没了 → 新进程起来」这一档以前只有间接证据：
+`TestNetnsRepeatedStartStop` 走的是正常 Stop 之后再 Start（表里根本没残留），
+`TestNetnsStaleCleanupRemovesRealResidue` 验到「规则被删掉了」就收工，没接着把新进程跑完。
+现在用生产的 `Start()` 把整出戏演完，断的是**终态**：网卡随 fd 消失之后
+（`ip link show` 要轮询等——最后一个 fd 关闭时 netdev 的注销是异步的），
+新进程装完必须做到「每条劫持规则不多不少各一份、`ip route get <上游>` 落在物理网卡、
+指向 tun 的默认路由恰好一条、真发的一个 DNS 查询仍然落进重启后的解析器」。
+这一条又红出两个真的：
+
+1. **清残留不收敛**。`-D` 一次只摘一份 OUTPUT 跳转，重复装载留下的第二份让 `-X`
+   永远失败（链还有引用），于是 nat 表里永久挂着一个指向不存在地址的劫持链——
+   症状还是「整机解析超时」。修法是 `sweepOutputJumps`：按内容扫 `-S OUTPUT`，
+   挂着我们的链的每一行都摘掉，v4/v6 两条清理路径都走它。
+   守卫分两层：`TestNetnsRestartCleanupConverges`（真内核，1 份 → 2 份 → 0 份且链没了）
+   与 `TestCleanupStaleSweepsEveryDuplicatedJump`（脱机，突变验证过：把扫描摘掉就红）。
+   反过来那条用例也是给判据自己兜底的——先把「装两遍确实能数出 2 份」演出来，
+   上面那句「各一份」才不是空话。
+2. **一条早就该红的预算**。`TestNetnsForwardsUDPThroughRealTUN` 在整套一起跑时翻了：
+   它等的是「收尾之后 `TotalConns` 会涨」，而收尾时刻是算得出来的——替身的读截止 3 秒
+   + pump 等另一方向再收 2 秒 = 约 5 秒整，而它的预算正好是 5 秒。
+   单跑侥幸赶上，一起跑就输。改成 15 秒（三倍余量），并把这笔账写进注释：
+   **断异步落账的预算必须明显大于被测对象自己的收敛时间**，贴着边界写出来的绿
+   只是一次没抽中而已。
+
+顺带一条踩坑记录：`Bypass`（自己的出站要绕开 tun 的那些地址）与 `Upstreams` 是两个入口，
+`service` 那边把「节点 IP + DNS 上游」交给 `Bypass`。测试脚手架只填 `Upstreams` 的话，
+`ip route get` 会指着 tun——看起来像产品少了绕行路由，其实是脚手架漏了那一格。
 
 ### 9.2 模糊测试：`make fuzz-smoke`
 
@@ -2773,7 +3324,7 @@ curl -x socks5h://127.0.0.1:7891 -o /dev/null \
      'https://speed.cloudflare.com/__down?bytes=52428800'
 
 # 4. 热重载
-kill -HUP $(pgrep -x wps_app)  # 日志应出现「规则已重载」
+kill -HUP $(pgrep -x wps_app-gui)  # 日志应出现「规则已重载」
 
 # 5. DNS 不泄漏（debug 级别）
 # 日志中 dns 行里的上游只应出现 config.yaml 里配置的那几个
@@ -2789,7 +3340,7 @@ grep -c '已连接' <日志文件>
 #    起一个只监听 127.0.0.1 的 trojan 服务端 + 一个 HTTP 源站，
 #    节点 addr 写字面量 IP、目标写 localhost：
 #    /etc/hosts 直接给 127.0.0.1，全程不产生 DNS 查询，环路就没有形成的机会。
-./wps_app -c /tmp/trojan-test/config.yaml -check -check-host localhost:18080
+./wps_app-gui -c /tmp/trojan-test/config.yaml -check -check-host localhost:18080
 curl -sS --socks5-hostname 127.0.0.1:17891 http://localhost:18080/socks5-trojan
 curl -sS -x http://127.0.0.1:17892 http://localhost:18080/http-trojan
 #    同一份配置里再放一个 auth 写错的节点，测速应当报
@@ -2806,14 +3357,14 @@ dig +quic @1.1.1.1 example.com
 #    而不是安静地什么也不发生（那会让应用一直重试到超时）
 
 # 10. 多目标巡检（一次看完分流 + 电路，见 §6「多目标巡检」）
-./wps_app config.yaml -check \
+./wps_app-gui config.yaml -check \
   -check-host no-such-host.invalid:443,www.gstatic.com:443,www.baidu.com:443
 #    期望三行都跑完（顺序与给定一致），末行 SUMMARY ok=3 fail=0 total=3；
 #    gstatic 那行应是 via PROXY，baidu 那行应是 via DIRECT
 #    注意：PROXY 目标的 OK 只代表电路建好，不代表源站可达（关闭端口也报 OK）
 
 # 10a. 取真页面巡检（见 §6「取真页面巡检」）——那类"电路通、页面没有"的节点只有这条抓得住
-./wps_app config.yaml -check-fetch https://www.gstatic.com/generate_204,http://cloudflare.com/cdn-cgi/trace
+./wps_app-gui config.yaml -check-fetch https://www.gstatic.com/generate_204,http://cloudflare.com/cdn-cgi/trace
 #    期望每个目标一行 OK，带状态码 + Server + 字节数 + via，末行 FETCH-SUMMARY ok=2 fail=0 total=2；
 #    面板在跑时会被实例锁拒掉，用一份端口挪开的侧配置跑（§9 的办法）。
 #    反向确认：换成已知会兼底的节点，-check 照样全报 OK，
@@ -2832,7 +3383,7 @@ dig +quic @1.1.1.1 example.com
 #    没有时间戳就是把十分钟前的数当刚测的报。删掉一个节点，它的读数也应跟着消失。
 
 # 11. 拦截名单（见 §5.1）
-./wps_app config.yaml -check \
+./wps_app-gui config.yaml -check \
   -check-host "ads.example.com:443,www.baidu.com:443,x.ads.example.com:443"
 #    期望两条 FAIL 写着「命中拦截名单: …(block)」、一条 OK，退出码 1；
 #    子域和大小写都该被同一项名单盖住
@@ -3206,10 +3757,31 @@ proxies:
 
 「拒绝」而不是「退回 TCP」是有意的：QUIC 的连接迁移是它自己的语义，
 代理单方面把 QUIC 降成 TCP 会让对端看到一次凭空的中断，效果比直接失败还难查。
-日志里那条 `未转发：… 承载不了 UDP` 就是给这种情况留的唯一线索。
+
+日志里那条 `未转发：… 承载不了 UDP` 以前是**唯一**线索，这不合规：
+UDP 传不回错误给应用，连接表再没有这一行，用户手上就什么都没有
+（QUIC 站点打不开，而流量页一片干净）。现在它和拨不通的 TCP 一样走
+`Registry.Refuse`，留下一行带原因、零字节、计入「拨不通」的记录。
 
 界面上每个节点带一个徽标（`UDP` / `无 UDP`），鼠标悬停能看见原因，
 免得等到 QUIC 应用超时时才知道节点选错了。
+
+### 证据到哪一层（2026-10-28）
+
+`make test-netns-fw` 里现在有穿过**真的 tun 网卡与真的 gVisor 协议栈**的三条：
+
+| 用例 | 证明了什么 |
+| --- | --- |
+| `TestNetnsForwardsTCPThroughRealTUN` | 真 socket → 内核路由 → tun fd → 栈 → 出站 → 回程，字节同时进了连接账 |
+| `TestNetnsForwardsUDPThroughRealTUN` | 同上，UDP；且连接行记的是反查出来的域名而不是假 IP |
+| `TestNetnsUDPOnDirectEgressReportsWhy` | 判成直连的 UDP 被明确拒掉时：应用侧什么都收不到，本机 2 秒内在流量页留下一行原因 |
+
+前两条填的是以前没人跑过的那一段——数据面用例（`udp_test.go`、`block_relay_test.go`）
+用普通 socket 顶替了栈那一端，「包真能穿过网卡与栈的接缝」从来没被验证过。
+UDP 用 hysteria2 替身出站而不是真节点：这一段要量的是接缝，隧道协议另有对应用例，
+真节点的端到端仍是 `make acceptance-tun` 的活（见 §0.4 与 ACCEPTANCE A23–A27）。
+
+第三条红过一次，红了才发现缺的是产品不是测试：见上面的 `Refuse`。
 
 ### 判定与 SOCKS5 CONNECT 完全同一套
 
@@ -3468,7 +4040,7 @@ Xvfb 里开一个 WebKitGTK 窗，`hardware-acceleration-policy` 设成 `NEVER`�
 - 总览的**隧道**一行显示出站给的一句话摘要（已解析地址、SNI、是否已握手）。
   刚启动还没跑过流量时这里是空的，那是真的还没建链，不是界面坏了。
 - 认证口令永不过界面边界：读出来是 `********`，回写时仍是掩码就沿用磁盘原值。
-- TUN 卡片显示网卡名、假 DNS、假 IP 段、在册假 IP 数、已应答 DNS 次数、特权路径，
+- TUN 卡片显示网卡名、假 DNS、假 IP 段、在册假 IP 数、已应答 DNS 次数与解析失败次数、特权路径，
   IPv6 假 IP 的三态（未启用 / 已接管 / 已启用但没装上，见 §4.3），
   以及实际执行过的 `ip` / `iptables` / `ip -6` / `ip6tables` 步骤——出问题时能对着日志查，
   而不是只有一个"没开"。
@@ -3511,8 +4083,8 @@ Xvfb 里开一个 WebKitGTK 窗，`hardware-acceleration-policy` 设成 `NEVER`�
 被拦的连接反而是看得见的（`internal/inbound/block.go` 专门记了），
 于是这一页的形状很误导：**拦下的有记录，拨不通的没记录**。
 
-现在四个入口的拨号失败都会走 `metrics.Registry.Refuse`
-（SOCKS5 CONNECT、HTTP CONNECT、HTTP 明文转发、TUN TCP），产出一条：
+现在六个入口的拨号失败都会走 `metrics.Registry.Refuse`
+（SOCKS5 CONNECT、SOCKS5 UDP ASSOCIATE、HTTP CONNECT、HTTP 明文转发、TUN TCP、TUN UDP），产出一条：
 
 - 零字节、时长 0，所以它不进速率曲线、不给任何节点添用量；
 - **但保留路由判定**——命中哪条规则、本来打算走哪个去处、哪个节点。
@@ -3915,7 +4487,7 @@ rule，剩下的 DIRECT 失败是那次切换之前**已经在拨**的连接，1
   桌面此刻是 `manual`。于是旧实例退出时按记账还原成 `none`，**并且把记账消费掉**——
   日志那句 `已按记账把桌面系统代理还原回原样，流量改为直连` 就是它。
   **后果**：浏览器现在是直连，要用户在面板里把「系统代理」拨一次（关→开）才恢复，
-  而且只有走这条路记账才归新实例自己持有。**别用 `./wps_app -sysproxy on` 补**（那会把宿主记成 CLI）。
+  而且只有走这条路记账才归新实例自己持有。**别用 `./wps_app-gui -sysproxy on` 补**（那会把宿主记成 CLI）。
 
 时间线：13:53:15 新实例起 → 13:53:16 `检测到旧实例 PID 272553…已发 SIGTERM` → 同一秒 `已接管` →
 13:53:22 `hysteria: 已连接`（**隧道断了 6 秒**）→ 期间真实流量已经在过（`http CONNECT play.googleapis.com [PROXY | DOMAIN-SUFFIX,googleapis.com,PROXY]`）。
@@ -4378,7 +4950,7 @@ INFO 会被级别门掉，钩子一条也收不到——不先 `logx.SetLevel(Le
 
 ### 10.17 三个全局开关里，有两个不会说"我开着但不生效"（2026-10-20）
 
-这一格不是想出来的，是**从真实现场倒推出来的**：18:38 跑了一次 `./wps_app config.yaml -diag`
+这一格不是想出来的，是**从真实现场倒推出来的**：18:38 跑了一次 `./wps_app-gui config.yaml -diag`
 （离线、不抢锁，随时能跑），读数里两件事同时成立——
 
 - 系统代理：`mode=manual`，指着 `127.0.0.1:7892`，记账宿主就是面板进程（用户 18:25 自己拨回来的）；
@@ -4480,6 +5052,202 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 所以面板落在软件光栅里是环境的必然，`gui.go` 里那行 `Never` 不是可回收的杠杆，
 唯一能做的就是让软件光栅下的绘制便宜，也就是上面这两处。
 
+### 10.19 wbthinks 这个节点到底坏在哪：三处判据的更正（2026-10-29）
+
+这一节存在的唯一目的，是终结一句错话。10-18 那次把 `JP`（trojan，`wbthinks.space:8443`）
+记成**兼底型节点**（§「-check-fetch」那张对照表里"两个目标都是 HTTP 400"那一行），
+意思是"节点自己坏了、只能扔"。今天两端同时取证：**节点是好的，坏的是我们自己的三处判据**，
+而每一处被修正前都能自洽地把人往错的方向带。
+
+取证是可重跑的，命令都记在这里：
+
+- 服务端（`Desktop/backup/login_vps.sh`，那台 VPS 就是 `43.153.148.175`）：
+  `trojan -h` 回 `Welcome to trojan 1.16.0`；
+  `openssl x509 -in /etc/letsencrypt/live/wbthinks.space/fullchain.pem -noout -issuer -dates`
+  回真 Let's Encrypt 证书（有效到 2027-01-03）；`journalctl -u trojan -o cat` 里此刻别的客户端
+  正常 `authenticated as …` 并传了几 KB 数据；`config.json` 是 `remote_addr 127.0.0.1 / remote_port 80`
+  的兼底形状——**任何**它认不出的流都会被交给 nginx，于是回一张 400。
+- 本机对照：`ip route get 43.153.148.175` 显示内置卡（公司网，公网 114.94.217.132）；
+  `sudo curl --interface wlx001f0578cdff -sv https://wbthinks.space/` 从 USB 卡出去拿回的是**真 LE 证书**；
+  而从内置卡打同一台机器的 80 / 443 / 8443、**换任何 SNI**，回的都是同一张
+  `VeriSign Class 1 Extended Validation CA` 自签证书（2019→2118）。
+  VPS 的 80 端口本地验证**不说 TLS**，且那一刻 VPS 日志一条连接都没有 →
+  那张证书是链路上的设备替我们终止 TLS 时给的，不是节点的。
+  走面板隧道取同一站点（`curl -x http://127.0.0.1:7892 https://wbthinks.space/`）拿回的又是真 LE 证书：
+  **同一目标、两种答案，差别只在出口**。
+
+### 改的三处
+
+**① trojan 的头部（`internal/outbound/trojan.go`）**。原来发的是
+`0x04 CRLF hex(SHA-1(口令)) CRLF <ATYP><地址><端口> CRLF`，注释还写着"别顺手修正成规范值，
+会把这个节点打死"——依据是 10-16 那次"对 wbthinks.space:8443 自检通过"。**那次是假通过**：
+`probeAccept` 只要能读到 1 个字节就算通，而兼底页恰好一定会回字节。
+今天在这台 1.16 上按 ALPN × 摘要 × 第二行布局逐条发、逐条对 `journalctl` 的
+`not trojan request` / `requested connection` 看，结论是：
+
+- 被接受的只有一种：`hex(SHA-224(口令)) CRLF` + **裸字节**的 `CMD(0x01) ATYP 地址 端口` + `CRLF`
+  （公开规范把第二行写成 hex，这里写成 hex 反而被拒；摘要用 SHA-1/MD5/SHA-256 全部被拒）。
+- 接受之后服务端**一个应答字节都不发**：把隧道打到它自己的 nginx，请求前收到 0 字节，
+  请求后第一个字节已经是 `HTTP/1.1 301`。所以拨号这一步不许等规范说的那 10 字节应答头——
+  等就等于把每条连接卡到超时，而症状长得像"节点沉默"。
+  （真遇到会回应答头的节点，得按 profile 加开关再来读，不要在没证据时先加。）
+
+改完之后的实测：`-check-fetch https://www.gstatic.com/generate_204` 回
+`OK … https 204 0 字节 via PROXY`，服务端同一秒记 `authenticated as …` +
+`requested connection to www.gstatic.com:443`，4101 字节进、1705 字节出。
+
+**② 分流"已生效"这句假话（`ProbeDeviceEgress` + `egressBlockedWhy`）**。
+`SO_BINDTODEVICE` 在这台机器上对普通用户**返回成功**，包却一个都上不了线：
+uid 1000 绑 wlx、绑 wlp 都超时，加上 ambient `CAP_NET_RAW` 仍然超时，只有 uid 0 连得上。
+以前只问"绑得上吗"（`ProbeDeviceBind`），于是界面上写着「代理钉在 wlx001f0578cdff」，
+代价是全部代理连接一起超时——10-20 那次 612 条「拨不通」就是这个形状。
+现在装配时会拿**当前选中节点的地址**真拨一次：钉上拨不通、不钉能通，才算这张卡钉不住。
+判出之后有**两种处置**，选哪一种取决于这台机器上有没有那条提权通道：
+
+- **有提权 helper（`tun.helper` 配着）**：不退缩。点名照旧，只是"造 socket"这一步
+  交给 helper——它以 root 造一条**钉在该网卡上、且已连通**的 socket，用 SCM_RIGHTS
+  把 fd 交回面板（与 TUN 交回 tun fd 同一条内核机制，协议版本因此从 3 抬到 4）。
+  面板全程不碰 root，托盘与桌面代理控制都还在。
+- **没有 helper**：只松开**被判钉不上的那一侧**，另一侧留着，并把原因写进 note
+  （这里原来写的是"只松开代理那一侧，直连真的在干活，不陪着退"——**那句是假的**，见下面 ⑥）；
+  两条都拨不通就不提分流——那是节点或链路的事，别抢走界面里那一格。
+
+Start 这条路（`service.go`）与运行期的 `applyPlan` 共用同一个判据，
+因为"启动那次不走 applyPlan"正是这条判据原来漏掉它的原因。
+**而且两边必须看同一份配置**：第一次上线时判据读的是 `s.cfg`，而 Start 那一刻它还没落定，
+于是被判成"没有 helper"、把本该走 helper 的机器退回了默认路由（10-30 11:00 那次）。
+
+**实测（2026-10-30 11:01，线上面板 uid 1000）**：手工加的那条 /32 主机路由已删干净
+（`ip route get 43.153.148.175` 回到公司网默认路由），而面板到节点的连接是
+`192.168.0.104%wlx001f0578cdff → 43.153.148.175:8443`——源地址是 USB 卡那张、
+`%` 后面是它钉住的设备名；经面板取 `generate_204` 仍 `HTTP=204`。
+**这就是"内置=直连、USB=代理"第一次真的按用户点的名生效**：拓扑没退，流量也没退。
+
+**④ 那条通道后来又做成了"常驻"（2026-10-30 11:2x）**。一次性的 helper 每条流都要付一次
+`sudo` + 进程起落（实测 0.08~0.11s，其中 sudo 自己 0.04s），一分钟几十条就是几十次起落。
+于是 helper 改成**常驻子进程**（`wps_app-gui --dial-helper`，新增 `--dial-helper-connect`
+与 `--dial-helper-owner`）：面板保持一条 unix 连接，按需要"钉住的 socket"，一次都不再起进程。
+三条边界照旧：**root 只造 socket，不终结 TLS**（面板与节点之间仍是端到端 TLS，root 看不到明文）；
+**目标必须是已解析的 ip:port 且在名单里**；**helper 盯着父进程**，面板一走它就收工
+（实测侧跑结束后 6 秒内自行退出，机器上不留 root 进程）。
+真机：一次侧跑里**只拉起一个** helper 进程，两次拨号（测速 + 取页面）都走它，
+`OK … https 204 0 字节 via PROXY`。
+
+**这条探针差点把面板自己点着，两次都是现场日志抓出来的，记在这里免得再犯：**
+① 判成降级 → 重建隧道 → `commitProxy` 在 strict_route 下回头再走一遍装配 → 装配又探一次
+→ 又判降级，**自激循环**。断法是两条：同一个「网卡|目标」只探一次（`egressVerdict`，
+用户拨开关或换卡才清），以及"自己判出来的降级"不再触发重建。
+② 落地不幂等：网卡监视每 10 秒问一次，每次都要写一遍状态、念一遍同一句「发不出包」
+（实测 60 秒 12 条）。断法是 `applyPlan` 先看现状是否已经就是这个样子，是就到此为止。
+**判据一条没改，改的是"同一个事实只说一次"**——这也是为什么证据看的是现场日志而不是单测：
+循环要有时序才暴露得出来。
+
+**③ 测速那一格要能分得开（`ProfileTest.SplitNote` + `ProfileTest.HopAddr` + `annotateNodeFault`）**。
+除了"发生了什么"，还要说"这一跳实际从哪儿出去"：`HopAddr` 是从**已建立的那条连接**上
+读回来的源地址，不是我们对自己的意图——主机路由、策略路由、helper 代劳钉卡，
+各种情形下它都说得对（`ss` 里那条 `%wlx001f0578cdff` 就是它）。
+「不通」和「页面取不回」各有两种完全不同的成因，而此前只报一句话：
+
+- `x509: certificate signed by unknown authority` 既可能是节点自签证书没放信任库，
+  也可能是链路上的设备在替换证书；
+- `tls: first record does not look like a TLS handshake` 既可能是节点把流交给了兼底页，
+  也可能是链路设备代答明文。
+
+所以后端在原文后面补一句可核对的来源，并在分流没真的生效时带上 note
+（界面上另起一行「没钉到点名的网卡，代理走的是系统默认路由」）。
+**判据没变、原文没改**——补的只是"还有另一种可能，先去看哪一格"。
+
+**那一句话只有一个出处（`bindViaHelperNote`，10-30 13:0x）**。「换了个人钉卡」这件事会同时
+出现在状态 note 与测速那一格，各写一份就会各说各话，而「发不出包」很容易被读成"那张卡坏了"
+——实际坏的是**普通进程去钉**这一层。`TestBindViaHelperNoteIsTheOnlyWording` 钉的是这句话的形状，
+改措辞要过它。线上面板 13:03 那次启动的日志就是它产出的原文，两边不再有两套说法。
+
+**⑤ 「那干脆让面板以 root 跑」——三条判据复测（2026-10-30 13:3x）**。这个提议值得量，因为 root
+确实一举消灭「普通进程钉不上」这件事（A53 实测：root 跑同一份侧配置钉住成功、取回 204），
+连 helper 都不用起。但三条判据里只有一条站得住、一条推翻了我此前的说法：
+
+| 事项 | root 面板 | 这一轮怎么量的 |
+|---|---|---|
+| 钉网卡 | 原生就行，不需要 helper | A53 的 root 侧跑 |
+| 系统代理 | **仍然生效** | `sudo -n -u chery … gsettings get org.gnome.system.proxy mode` 读得到值——`desktopPrefix()` 早就按 `$SUDO_USER` 落回桌面用户再写（`gnome.go` 顶上那段注释就是这个理由）。**"root 写不进 dconf"是错的**，此前把它当成了不转 root 的理由 |
+| 托盘 | **会没有** | `sudo -n env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus gdbus call --session …` → `Error connecting: The connection is closed`（两次同果）。会话总线按 EXTERNAL 认 uid，root 不是例外；托盘走的是 SNI，要的就是这条总线 |
+
+再加一条不在表里的：面板是 WebKitGTK 进程，转 root 之后「root 只造 socket、不终结 TLS」这条边界
+就没了——用户浏览的明文对 root 可见，而这台机器上还跑着别人的第二个写入者共用的仓库产物。
+所以结论是**保持 uid 1000 + 常驻 helper**（用户 10-30 明确选的这一项）：现方案已经拿到了 root
+唯一真正的好处（钉得住），代价只是那两句解释，而它正是"为什么这一跳换了个人做"的证据。
+
+**但 25 分钟后用户推翻了这个选择，面板现在是 root（10-30 14:31）**——「我不是让 wps_app-gui 变 root 权限的吗？」
+是他在上一轮那个三选一被误读之后追回来的指令，所以这里记的是**他的机器替他定的答案**，判据一条没变。
+起法（状态文件按他要求落在仓库目录里，`.cache/` `.local/` 因此进了 `.gitignore`）：
+
+```
+sudo -n setsid nohup env HOME=/home/chery/wps_app DISPLAY=:0 \
+  XAUTHORITY=/run/user/1000/gdm/Xauthority XDG_RUNTIME_DIR=/run/user/1000 \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+  /home/chery/wps_app/wps_app-gui /home/chery/wps_app/config.yaml
+```
+
+三条预言都兑现了，各自都有读数：
+
+- **那两句解释消失**：root 原生钉得住，`egressBlockedWhy` 判不出降级，界面上不再有「面板自己（普通权限）
+  钉在…发不出包」；剩下的「这一跳实际从 192.168.0.104 出去」仍是内核回读的真源地址——8 条隧道全是
+  `192.168.0.104%wlx001f0578cdff`，经面板取页 `204 / 0.52s`。
+- **dial helper 一个都不起**（`ps` 里既无 `--dial-helper` 也无 `--tun-helper`）。换身份这一步本身又验了
+  第二条链：普通权限实例优雅退出后 **4 秒内 helper 自收、`/tmp/wps_app-dial-helper-*` 清空**，机器上不留 root 进程。
+- **托盘按预测没了**：`14:31:15 systray error: failed to connect to DBus: dbus: connection closed by user`，
+  `busctl --user` 里 wps 的 `StatusNotifierItem` 归零。窗口本身在（`xdotool search --pid` 找到 2160×1440
+  `IsViewable` 那个），但应用是 `HideWindowOnClose`——**托盘没了，关掉窗口就没有任何东西能把它叫回来**，
+  只能杀进程重启。这条必须在用户面前说足。
+- 还有一条不在预测里、只有切换时才撞得上：**接管方向反了**——普通用户起的实例 kill 不动 root 面板，
+  要回到 uid 1000 必须先 `sudo` 停掉这一个。
+
+**「分流到底生效没有」这四条命令可以重跑**（别凭界面看着绿就下结论，A59 就是这四条凑出来的）：
+
+```
+sudo ss -tnpH state established | grep wps_app-gui   # 归属到进程：出站应当每条都带 %<点名的卡>
+ip route get <节点 IP>                                # 反向对照：不钉卡时内核本来走哪张卡
+grep -c '网卡分流' <面板日志>                          # 幂等：只有启动那一次，监视周期不该重写
+grep -c '发不出包' <面板日志>                          # root 下应当是 0；非 root 走 helper 时才是 1
+```
+
+`ss` 里那个 `%wlx001f0578cdff` 是内核报出来的绑定设备，不是我们自己的意图；
+`ip route get` 用来堵住"其实是默认路由顺带做到的"这种假象——两条凑在一起才算数。
+
+**⑥ 探针只问了一半，于是"直连真的在干活"那句是假的（10-30 14:4x）**。把面板转成 root 之后
+顺手做了个对照，数字很难看：普通权限那两台面板 `via DIRECT` 失败 **363 / 1244 条、成功建连 0 条**，
+root 这台失败 **0 条、成功 17 条**。也就是说**内置卡上的钉卡同样被静默丢包**，
+而 `egressBlockedWhy` 在装配时只被拿代理卡调用过一次——那句写在 note 与 `-diag` 里的
+"直连钉在内置卡上是真的在干活，不陪着退"，是**拿一次没做过的测量替另一侧背书**。
+
+改法是把那一问做成按侧的一层（`settleEgress`）：两侧各问一次，谁钉不上松谁；
+有特权通道则两侧各自交给它（`SetBindNeeded(direct, proxy)`、`BoundDialFor(policy, …)`，
+直连侧的落点在 `Direct.dial`），`-diag` 那份报告也改成两侧各问、各说一句。
+配套用例：`TestSettleEgressProbesBothSides`（一侧退、一侧留，note 点名是哪一侧）、
+`TestSettleEgressKeepsBothPinsViaBindChannel`（两侧都维持点名、两句话各自点名）、
+`TestBindGateIsPerSide` 与 `TestBoundDialForPicksTheSideDevice`（通道按侧开、卡不许交错）、
+`TestDirectUsesBoundChannelForResolvedTargets`（**域名不许交给 root 解析**，helper 的硬规矩在
+直连这一层同样守住）。幂等早退也补了一格：特权开关换了必须重新落地，
+否则"helper 中途才出现"这一转会因为两张卡名字没变而被吞掉（`splitBind`）。
+
+**读时间戳之前先看这台机器的 zone 有没有被人动过（10-30 14:0x 差点因此误判两次）**。
+`/etc/localtime` 在 14:08 被重新指向 `Asia/Tokyo`（之前是 Shanghai），而 **Go 只在进程启动时读一次
+`time.Local`**——于是 14:03 起来的那个面板此后所有日志行都按 +0800 打戳，比 `ls`/`date` 慢整整一小时。
+我因此先把「日志停在 13:16」读成写入器卡住、又把 helper 的 `lstart 14:09:30` 读成"起了一小时就换了"，
+两边都不对：真正的答案是同一个事件在两个 zone 里的两个名字。
+**判据**：现场对时序，先把面板日志的时间戳和 `/proc/<pid>/stat` 的起点、`/etc/localtime` 的 mtime
+放在同一个 zone 里再比；对不上先怀疑 zone，不要先怀疑程序。
+同一轮里 helper 确实换过一次（`sudo → --dial-helper` 只有这一对，`/tmp` 里也只有它那个套接字目录，
+没有孤儿 root 进程），换的时刻正对着 `13:09:29 hysteria: 隧道故障` 那一簇——**但日志对"换了 helper"
+一个字都没有**，这是一个还没补的诚实性缺口：通道重建本身就该留一行，否则下一次现场又要靠 `ps` 猜。
+
+### 于是这一节的结论
+
+`wbthinks.space` 现在能用，但要同时满足两件事：**代理流量真的从 USB 卡出去**
+（当前只有特权进程做得到），以及**头部按上面①那一种发**。
+公司网那条出口对这台 VPS 做 TLS 中间人这件事不是我们的程序能修的；
+能修的是别再让它冒充成"节点坏了"。
+
 ---
 
 ## 11. 故障排查
@@ -4491,10 +5259,10 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 | QUIC/H3/DTLS 应用卡住不动 | UDP 不通。选 trojan 节点时 UDP **一定**不通（§9.6）：日志里搜 `承载不了 UDP` 能直接看到原因。换 hysteria2 节点，或把该应用的协议降成 TCP |
 | 日志说「开了 512 条 UDP 会话的限额」 | hysteria2 的库不给会话数设上限，这条上限是本客户端兜的（§9.6）。正常浏览不该撞到它；撞到了说明有程序在拿大量 UDP 四元组打洞 |
 | **trojan**：测速显示正常，但一站都连不上 | 口令不对时服务端只把连接关掉、不回错误码，TLS 握手阶段完全看不出来（协议就这么定的）。现在测速在建链后会再探一次读，报的是「服务端在读完请求头后断开了连接（口令不对或目标不可达）」——看到这句先核对 `auth` |
-| **测速正常、延迟也好看，但浏览器一站都打不开**（上面那条是关掉连接，这条是**兼底**） | 隧道正常建立，节点那边把流量交给一个兼底的 web 服务器：任何站点回来的都是同一张 400 页面，或者干脆不回 TLS。现在测速在延迟下面另有一行应用层判定（`电路通了，页面取不回` + 原文），命令行也能直接验：`-check-fetch https://www.gstatic.com/generate_204`（见 §6）。这一类的 `Server:` 头会当场说漏嘴——两个不同站点回同一个服务标识 |
+| **测速正常、延迟也好看，但浏览器一站都打不开**（上面那条是关掉连接，这条是**兼底**） | 隧道正常建立，节点那边把流量交给一个兼底的 web 服务器：任何站点回来的都是同一张 400 页面，或者干脆不回 TLS。现在测速在延迟下面另有一行应用层判定（`电路通了，页面取不回` + 原文），命令行也能直接验：`-check-fetch https://www.gstatic.com/generate_204`（见 §6）。这一类的 `Server:` 头会当场说漏嘴——两个不同站点回同一个服务标识。**但 2026-10-29 推翻过一次归因**：`wbthinks.space` 这一条既不是节点坏也不是口令抄错，而是①我们的 trojan 头部摘要算法不对（服务端只认 SHA-224 + 裸字节第二行）、②本机那条出口链路上有设备在替我们终止 TLS。先按 §10.19 取证，再决定是不是节点的锅 |
 | **trojan**：hy2 能连、trojan 连不上 | trojan 走 **TCP**：确认 `addr` 填的是服务端的 TCP 端口（hy2 是 UDP 同号端口），`nc -vz <ip> <port>` 先验通 |
-| **trojan**：握手报证书相关错误 | 自签节点要 `tls.insecure: true`；要真校验就把 CA 放进系统信任库并填对 `tls.sni`（SNI 与证书里的名字必须一致） |
-| 接管重启之后隧道一直连不上、`handshake timeout after 10s`，但节点其实是活的 | 先怀疑**被钉住的那张网卡**，不是节点：拿一份侧配置跑 `./wps_app 侧配置 -check`，一次 `iface_split.enable: true`（照抄线上那张卡）、一次 `enable: false`（走默认路由）。只有钉卡的那次红，就是那张网/那张卡的问题（2026-10-20 16:49 这次实测：钉 USB 超时，关掉分流当场 `已连接`）。**别用 `dig -b <源地址>` 当钉网卡的测试**——源地址不决定出口，包可能从另一张卡出去，于是"没回话"是测量自己的假象；要钉设备得 `SO_BINDTODEVICE`（见 §10.7）|
+| **trojan**：握手报证书相关错误 | 自签节点要 `tls.insecure: true`；要真校验就把 CA 放进系统信任库并填对 `tls.sni`（SNI 与证书里的名字必须一致）。**还有第三种：那句错跟节点无关**——链路上的设备（公司网关或终端安全软件）在替我们终止 TLS，服务端本地 `openssl x509` 看是真 Let's Encrypt、从本机出去却拿到一张不受信的自签证书。测速那一格现在会把这句话直接补在原文后面，并说明这次代理流量有没有真的钉在点名的网卡上（§10.19）|
+| 接管重启之后隧道一直连不上、`handshake timeout after 10s`，但节点其实是活的 | 先怀疑**被钉住的那张网卡**，不是节点：拿一份侧配置跑 `./wps_app-gui 侧配置 -check`，一次 `iface_split.enable: true`（照抄线上那张卡）、一次 `enable: false`（走默认路由）。只有钉卡的那次红，就是那张网/那张卡的问题（2026-10-20 16:49 这次实测：钉 USB 超时，关掉分流当场 `已连接`）。**别用 `dig -b <源地址>` 当钉网卡的测试**——源地址不决定出口，包可能从另一张卡出去，于是"没回话"是测量自己的假象；要钉设备得 `SO_BINDTODEVICE`（见 §10.7）。**2026-10-29 起这一步不用手工做了**：装配分流时会拿当前选中节点真拨一次，"钉上拨不通、不钉能通"就自己松开代理侧并把原因写进 note。**为什么必须真拨**：这台机器上 `SO_BINDTODEVICE` 对普通用户是返回成功的，包却一个都上不了线（加 `CAP_NET_RAW` 也一样，只有 uid 0 出得去）——所以"绑得上"根本不能当"钉得住"的证据（§10.19）|
 | 「拨不通」这一格忽然涨了一大截 | 先按**时刻**分组再看域名：`awk '/ 失败: /' 日志 \| cut -c1-16 \| uniq -c`。同一天 287 条里有 232 条挤在隧道死亡的 2 分钟里，另有 26 条的判定行直接写着 `MODE,DIRECT`（面板按 `mode: direct` 启动，切换之前已在拨的连接要 15s 才落进日志）。**"全是同一批域名"不是线索**，它只会把人引向"名单缺项"这个假结论——见 §10.7 那次被推翻的前提 |
 | 国外站点走了 DIRECT | 该域名不在 `gfw-proxy.txt` 里且被 DNS 污染。手动往 `assets/rules.txt` 加 `DOMAIN-SUFFIX,<域名>,PROXY`，再 `kill -HUP` |
 | 国内站点走了 PROXY | 检查该域名是否被误加进代理列表；确认 GeoIP 库已更新（`./scripts/fetch-assets.sh`） |
@@ -4508,13 +5276,15 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 | 切换模式后部分站点仍按旧路由走，或某个被污染过的域名一直连不上 | **systemd-resolved 的缓存在作怪**：它可能还留着劫持生效前拿到的伪造 IP（例如 `www.google.com → 104.244.42.197` / `2001::1`），命中缓存就不会向上游发查询，我们也就没有机会改判它。`sudo resolvectl flush-caches` 后立刻恢复成假 IP。假 IP 本身 TTL 只有 60s，浏览器自己的 DNS 缓存要另算 |
 | TUN 起不来，日志说缺权限 | 两条路：`sudo ./wps_app-gui`（但托盘会没，见 §4.3），或普通用户起面板 + 配 `tun.helper` 提权命令（推荐）。面板 TUN 卡片的「最近错误」与原样显示原因，「特权路径」一行告诉你当前走的是哪条 |
 | 明明配了免密 sudo，`tun.helper` 还是起不来 | 看**启动面板的那个 shell** 有没有 `NoNewPrivs: 1`（`grep NoNewPrivs /proc/self/status`）。带这个标志的进程（受限 shell、沙箱、部分 CI）fork 出来的子进程一律继承，setuid 的 `sudo` 直接失效，且**清不掉**。改在普通终端里起面板，或交给 `systemd-run --user` 起（用户服务不继承该标志） |
+| 日志/面板说 `helper 协议版本 N 不被支持（本程序是 M）`，TUN 怎么点都开不起来 | 这是**面板与 helper 不是同一个构建**（`make build-gui` 覆盖了 `tun.helper` 指着的那个文件，而老面板还在跑；或反过来）。面板那行现在直接说该动哪一边：M 比面板新就**用那个文件重启面板**，比面板旧就**用当前构建刷新那个文件**。重启之前 TUN 一定开不了，SOCKS5/HTTP 不受影响；见 §0.5 的 A41 与 ACCEPTANCE A41 |
+| 日志/面板说「没有去叫 root：…」 | A43 的预检在动 root 之前就拦下了：`tun.helper` 那个文件自报的提权协议与本程序不同，叫了也是白叫。同一句话会指出该重启面板还是该重新构建那个文件；想自己确认一眼就跑 `<那个文件> -version`，看它第二行报的协议号 |
 | 点了窗口 X 号，界面没了、又找不到托盘图标 | 十有八九是面板以 root 跑：root 连不上用户会话总线，`systray` 注册失败（日志第一行 `systray error: failed to connect to DBus`）。代理其实还在跑，`pgrep -x wps_app-gui` 能看到。改用 `tun.helper` 并以普通用户启动即可（§4.3） |
 | 起新实例报「锁被 PID xxx 占着…无法确认它是谁」 | 旧实例是 root 起的，普通用户既读不到它的 `/proc/<pid>/exe` 也 kill 不动它。用 sudo 启动新的，或先 `sudo kill <pid>`。同一用户起的实例会自动接管 |
-| 上次异常退出后本机 DNS 全超时 | nat 表里残留了劫持规则而网卡已消失。`sudo ./wps_app -tun-reset`（正常启动时也会自动先清一遍） |
+| 上次异常退出后本机 DNS 全超时 | nat 表里残留了劫持规则而网卡已消失。`sudo ./wps_app-gui -tun-reset`（正常启动时也会自动先清一遍） |
 | 端口被占用 | `ss -tlnp \| grep 7891` 看占用方，改 `inbounds` 里的 `listen` |
 | 每次请求都重连（`已连接` 日志刷屏）| 先 `grep 隧道故障`，那行带着原始错误，能直接指出是谁在拆隧道。正常情况整个进程只握手一次；反复出现说明有流级/目标级错误被误判成连接故障（判据是错误类型，见 §9.4）。若一条 `隧道故障` 都没有却持续重连，那是换节点或整块重启在动出站，不是分级判错 |
 | 点「选用」/「删除」后界面卡住好几秒 | 已修复（改为只换出站，见 §4.1）。若仍卡：`strict_route` 开着时换节点必须整块重启，这是唯一保留的慢路径；另外 TUN 的拆建要过 sudo + 二十来条 iptables，本身就慢，别把它当常态 |
-| 刚重启面板后，TUN 下部分域名连不上、日志刷 `落在假 IP 段但反查不到域名` | systemd-resolved 的缓存里还留着**上一个进程**分配的假 IP，新进程的映射表是空的。`sudo resolvectl flush-caches` 立刻恢复；这也是为什么重启后面板会自己清一遍劫持残留 |
+| 刚重启面板后，TUN 下部分域名连不上、日志刷 `落在假 IP 段但反查不到域名` | 已缓解（2026-10-29，A49）：装好劫持后与拆掉劫持后都会自动 `resolvectl flush-caches`；还遇到就手动 `sudo resolvectl flush-caches`。原由：systemd-resolved 的缓存里还留着**上一个进程**分配的假 IP，新进程的映射表是空的。`sudo resolvectl flush-caches` 立刻恢复；这也是为什么重启后面板会自己清一遍劫持残留 |
 | 断网后代理不通但直连正常 | 这是预期行为：DIRECT 不走隧道。隧道恢复后第一个请求会自动重连，无需重启进程 |
 
 ---
@@ -4577,8 +5347,38 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 - **trojan 在 TUN 模式下没有做过同机实链验证**：规则/全局/直连三种模式与 trojan 的组合
   已用本地服务端跑通（SOCKS5 与 HTTP 入站都验过），TUN 路径与它们共用同一个
   `outbound.Conn`，但开 TUN 需要 root 且会改动本机 DNS 与路由，不适合随手验。
-- 假 IP 现在 v4/v6 都有（见 §4.3），但 **v6 那条路没有做过实链验证**：开发机上没有全局 IPv6
-  地址也没有 IPv6 默认路由，`ip6table_nat` 模块也没加载，真跑一遍 v6 流量无从谈起。
+- 假 IP 现在 v4/v6 都有（见 §4.3）。**v6 那条路 2026-10-29 第一次跑通了实链**（不是路由表证据，是真流量）：
+  那张 USB 网卡带回全局 v6（`2409:8d1e:…`）之后，`dig AAAA www.google.com` 拿到假 v6 `fc00::e`，
+  内核把 `fc00::e` 送进 `wps-tun`（`ip -6 route get` 的答案），**带 SNI 直连这个假地址拿到 204**
+  （`curl --resolve www.google.com:443:[fc00::e]` → `http=204 连接目标=fc00::e`），
+  面板日志同一秒记下了 `tun tcp [fd00::1]:45454 -> www.google.com:443 [PROXY | MODE,GLOBAL]`——
+  也就是说 v6 的去向、路径、节点在连接表里同样看得见（A48）。
+  **前提**：本机的物理网卡得有全局 v6（这里靠那张 USB 网卡）；没有 v6 出口时下面这一条说了算。
+- **没有 v6 出口时，假 v6 一律不发**（2026-10-29 修，A47）：假地址只解决「应用连到哪」，
+  真送出去还得本机有一条 v6 默认路由。此前这台机器在 USB 网卡掉线的那段时间里照样回假 v6，
+  而启动日志在承诺「路由装不上时降级为 NODATA（不声称可用）」——承诺与行为相反。
+  现在 `PlanV6` 的可用性判据带上「有 v6 出口」这一条（本进程与 helper 两条路共用），
+  AAAA 回 NODATA，应用退回 A 记录；netns 里也断言了：只有 v4 出口的机器，`v6Ready` 必须是 false。
+- **接管范围只在 TCP/UDP 上**：TUN 转发的是 TCP 与 UDP，
+  ICMP（ping）与其它协议不进隧道——所以「全局接管」不等于「整机所有流量都在隧道里」。
+  2026-10-29 实测补一句，而且它是更容易骗人的一半：echo request 确实被默认路由吸进了 tun，
+  而协议栈（tun2socks 注册了 gVisor 的 ICMP 与默认 ICMP forwarder）**会就地应答**，
+  于是接管状态下 `ping 任何地址` 都通、亚毫秒、ttl 64——包括一个不存在的 TEST-NET 地址（A37）。
+  这条不是「ping 不通」那种无害的限制：ping 正是人和脚本判断「网络好了没有」的默认信号，
+  所以设置页的能力边界那一行明写了「ping 得通不代表对端可达」。
+  **v6 同一件事也量了**（不假定协议栈按地址族继承行为）：接管后 `ping6 2001:4860:4860::8888`
+  与 `ping6 2001:db8::1` 都在本地得到应答，连接与 DNS 四本账一动不动。
+  v6 这里多一个必须问清的问题——邻居发现和路由通告都跑在 ICMPv6 上，
+  把它们吸进隧道等于把本机自己的链路问断，症状是整个 v6 网络瘫而面板只显示「已接管」。
+  内核的答案是**不会**：接管装的只有默认路由，而 `ip -6 route get fe80::5` 回的是
+  `dev fwphys0`（直连路由 metric 256，永远排在默认路由前面），
+  `ip -6 route get ff02::1` 回的是 `dev fwphys0 table local`——
+  链路本地与组播这两类压根不参与默认路由的选择，只有全局可达地址的 ICMPv6 才被吸走。
+  组播（`224.0.0.0/4`、`ff00::/8`）刻意留在物理网卡：它是链路本地流量，出了那张卡没有意义。
+  回环与广播走内核自己的本地路由，不受默认路由被接管的影响。
+- **DoH 或直接用 IP 的流量即使进了 tun，也可能没有域名信息**：
+  规则引擎认的是域名/IP 两套 key，域名规则命中不了 IP 规则之外的语义。
+  这不是缺陷而是协议事实，所以面板的「能力边界」里明写了一条。
   已验证的只有三样：`PlanV6()` 生成的命令形状、`applyV6` 的整组回滚、以及
   "路由没装上就回 NODATA" 这条降级在 DNS 与 relay 层的实际行为（都在 `internal/tunx`
   的测试里）。**v6 流量能否真正通过本机隧道，尚无证据**——真要上线前先在有 v6 的机器上验一遍。
@@ -4600,6 +5400,10 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 - DNS 劫持按**上游地址**放行（见 §4.3），因此与面板以哪个 uid 运行无关：本机所有进程（含 root 的）
   除了直接发往这些上游的查询，都会被接管。开启 `hijack_dns` 时，`dns.servers` 必须至少有一个 IP 字面量，
   否则没有可放行的上游，TUN 启动会直接拒绝（不然就是自己吃自己）。
+- 故障断网保护（`tun.kill_switch`）只在 `strict_route` 下生效，且只在自动切换判定
+  「没有一个节点能用」之后才挂上；它筛的是**本机生成的出站**（filter OUTPUT），
+  不做转发流量的拦截，也不解密任何内容。白名单里没解析出来的那个节点在保护期间连不上，
+  所以下一次故障轮会带着新算的名单重挂——这条链路上的「包真的被丢弃」还没在真机上实测。
 - `strict_route` 会把默认路由交给 tun，直连目标需要靠 `route_exclude` 绕开，
   配错会造成直连环路，默认关闭；日常场景假 IP 方案已经够用。
 - **按网卡分流（见 §4.2.1）的证据分三档，别混着说**：
@@ -4619,9 +5423,48 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 |---|---|---|
 | TUN + hysteria2（v4） | ACCEPTANCE §B3 9/9（2026-10-16） | 支持 |
 | TUN + trojan | 未做同机实链 | 启动警告；不通先切 hysteria2 |
-| TUN IPv6 | 只有命令形状、回滚与降级测试 | 路由装不上时 DNS 回 NODATA；不声称可用 |
+| TUN IPv6 | 2026-10-29 假 IP + 真流量实链（A48）；内核路由/回滚/降级另有 netns 测试 | 支持；无 v6 出口时 DNS 回 NODATA |
 | UDP 远端 | 只到本地回环对端 | 不声称真实服务端互通 |
 | KDE / env 系统代理 | 假 HOME 全链路 | 真实会话未验；gnome 已实测 |
+| 连接归到哪个进程 | 只做了权限与兼容性评估（下一节），没做实现 | 不采集；它和上面的字节统计是两种能力 |
+
+### 进程归属：这一轮单独评估过（结论：先不做）
+
+目标里这条的要求是"先验证权限和兼容性，再考虑 eBPF"，所以这一节的交付物是**评估**，
+不是功能。评估必须在这台真机器上做——这三档实现的门槛全是机器的属性：
+换内核参数、装没装 EDR、Secure Boot 开没开，结论就会翻。
+所以判据写成了一个可重跑的只读探针：
+
+```bash
+make probe-attribution        # 全程只读：不装模块、不 attach、不改内核参数、不对外发包
+```
+
+本机（2026-10-28，Ubuntu 22.04 系、kernel 6.8.0-40）量到的事实：
+
+| 档 | 要什么 | 本机实测 | 结论 |
+| --- | --- | --- | --- |
+| **同 uid 的 /proc 反查**：`/proc/net/{tcp,tcp6,udp,udp6}` 的 inode ↔ `/proc/<pid>/fd` | 不要 root、不要 eBPF | 8 条本机监听**全部**归回了 pid（含面板自己 7891/7892 → `wps_app-gui` 的 fd 63/64）；扫 5172 个 fd 条目 **30 ms** | 可行，且便宜到能每秒采一次 |
+| netlink `INET_DIAG`（`ss -tp` 那条路） | 同上（只覆盖自己 uid）；跨 uid 要 `CAP_NET_ADMIN` | 未单独实现验证——它与上一档覆盖范围相同，只是省掉扫描 | 上一档够用时无需引入 |
+| **eBPF**（`cgroup_skb` / `sock_ops` / kprobe） | `CAP_BPF`+`CAP_PERFMON`（等于 root） | `unprivileged_bpf_disabled=2`（**这一档是单向的，运行时改不回来**）、`perf_event_paranoid=4`、面板进程 `CapEff=0`；但 BTF 在、`lockdown=[none]` → 以 root 装 CO-RE 程序技术上可行 | 非 root 完全用不了；要做得常驻一个 root 组件 |
+
+还有一条兼容性风险是量出来的：这台机器上挂着第三方内核模块 `qax_tq_base`（EDR）。
+往 socket 层再挂探针属于**同一层的竞争者**，出事的表现是整机网络异常且没人能归因。
+顺序不能反：先在装着它的机器上证明网络不受影响，再谈 attach。
+
+**为什么评估完还是不做**（不是"做不到"）：
+
+1. 唯一不需要 root 的那一档给的是**采样时刻的猜测**。socket inode 会被内核回收复用，
+   "读 `/proc/net/tcp`" 与 "扫 fd" 之间任何一条连接断开并新建，都可能把某个 inode
+   归到另一个进程上——它不说自己可能错的时候，界面就会把它当事实读。
+   一个可能错、又不标注可能错的"哪个程序在用"，比空白更有害（这条是本项目自己的规矩，
+   见 §0.3 与「假 IP 大于 0」那句批注的来源）。
+2. 目标要的"连接去向 / 流量 / 故障"这一层，不依赖归属就已经成立。
+3. 跨 uid 那一档要常驻 root 组件 + 与 EDR 共处的实测，那是另一件事，不该夹在这里做。
+
+**将来要做，先满足这三条**（否则宁可不加）：归属字段必须是三态
+（有值 / 明确"看不见" / 明确"这一条我可能归错"，不许用空串当"没有"）；
+竞态要用**同一采样时刻的 inode 快照**消除，并给一个可测的错判率上限；
+只有需要覆盖别的 uid 时才动 eBPF，且必须先在装了 EDR 的机器上验过网络无恙。
 
 ---
 
@@ -4630,7 +5473,6 @@ WebKitGTK 2.50 在这台机器上自己降级（GPU 进程起不来，退回软�
 ```bash
 make package                        # 等价于 ./scripts/package.sh
 ./scripts/package.sh --no-src       # 只出运行包
-./scripts/package.sh --no-gui       # 明确不要 GUI（缺 WebKit 开发包时用）
 ./scripts/package.sh --frontend     # 顺手用 npm 重构建前端（默认复用已有 frontend/dist）
 ```
 
@@ -4638,11 +5480,12 @@ make package                        # 等价于 ./scripts/package.sh
 
 | 包 | 里面有什么 | 对方需要什么 |
 |---|---|---|
-| `wps_app-<ver>-linux-amd64.tar.gz` | `wps_app`(静态) + `wps_app-gui` + `assets/rules.txt` + `config.example.yaml` + `BUILD-INFO.txt` + `INSTALL.md` / `NOTICE.md` + `check-deps.sh` + `fetch-assets.sh` | 命令行版**零依赖**；图形版要 `libgtk-3-0 libwebkit2gtk-4.0-37 libepoxy0` |
+| `wps_app-<ver>-linux-amd64.tar.gz` | `wps_app-gui` + `assets/rules.txt` + `config.example.yaml` + `BUILD-INFO.txt` + `INSTALL.md` / `NOTICE.md` + `check-deps.sh` + `fetch-assets.sh` | `libgtk-3-0 libwebkit2gtk-4.0-37 libepoxy0`（图形与 `-cli` 无头模式都要） |
 | `wps_app-<ver>-src.tar.gz` | 源码 + **`vendor/`** + `frontend/dist` + `frontend/tests` + `scripts/acceptance` + `packaging/systemd` | Go 工具链；出图形版还要 `-dev` 头文件。只构建不需要 node，也不需要网络；跑前端测试要 `npm install` |
 
 两个包旁边有 `dist/SHA256SUMS`，接收端跑 `cd dist && sha256sum -c SHA256SUMS`。
-缺 WebKit 开发包时脚本默认 `exit 1`，不再悄悄产出没有 GUI 的"运行包"；确实只要命令行版用 `--no-gui`。
+缺 WebKit 开发包时脚本默认 `exit 1`：单产物之后没有"只出命令行版"这个选项了，
+打包不出来就是打包不出来，不产出一个装了也跑不起来的包。
 包里的 `BUILD-INFO.txt` 记录 `-version` 的版本、源码指纹与构建时间。
 
 编译一律走 vendor（`GOFLAGS=-mod=vendor GOPROXY=off`），产物加 `-trimpath`：
@@ -4685,8 +5528,8 @@ make package                        # 等价于 ./scripts/package.sh
 
 ### 接收端的体检
 
-包里带了 `check-deps.sh`（只读、不改系统）：架构是否匹配、两个产物在不在、
-图形版动态依赖齐不齐（用 `ldd` 直接问产物，不用 `ldconfig`——它在 `/usr/sbin`，
+包里带了 `check-deps.sh`（只读、不改系统）：架构是否匹配、产物在不在、
+动态依赖齐不齐（用 `ldd` 直接问产物，不用 `ldconfig`——它在 `/usr/sbin`，
 普通用户 PATH 里没有，用它检查会在装好 GTK 的机器上报"全都缺"）、
 `/dev/net/tun` 与 `ip`/`iptables`、免密 sudo、端口占用、有没有托盘宿主。
 缺项直接给出对应的 `apt`/`dnf` 命令，退出码非 0。
@@ -4694,11 +5537,12 @@ make package                        # 等价于 ./scripts/package.sh
 ### 换 CPU 架构
 
 ```bash
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 make build     # 命令行版可以这样交叉编译
+GOOS=linux GOARCH=arm64 make build-gui   # 需要目标架构的 GTK/WebKit 头文件与库
 ```
-图形版**不能**这样出：CGO + 目标机的 GTK/WebKit 头文件与库必须在目标架构上，
+交叉编译现在**只能**这样走：CGO + 目标机的 GTK/WebKit 开发包必须在目标架构上，
 要么在那台机器上 `make build-gui`，要么用交叉 sysroot。
-README 其余部分（规则、模式、TUN、helper）对两个产物完全一致。
+（2026-10-29 之前有个 CGO_ENABLED=0 的静态命令行版可以纯交叉编译，
+它已经删除——单产物的代价之一就是没有"零依赖纯交叉"这条路了。）
 
 ---
 
@@ -4870,7 +5714,12 @@ make gate        # 一条命令跑全套离线门禁，约 2 分钟
 
 > **注意**：`make gate` 的最后一步是 `gate-gui`，产物固定写到
 > `dist/gate/wps_app-gui`，**不会覆盖 `./wps_app-gui`**（正在跑的面板用的那份）。
-> 发布/手工重建仍用 `make build-gui`，那个目标会覆盖 `./wps_app-gui`。
+> `make check` / `make acceptance` / `make acceptance-tun` 也一样走 `gate-gui` 那条路——
+> 单产物之后 `./wps_app-gui` 同时是面板和 `tun.helper` 指着的那个文件，
+> 覆盖它会同时踩到「跑着的进程与磁盘上的文件分属两个构建」和「进程持着被删掉的 inode」
+> 两个坑（2026-10-29 实测踩过）。
+> 只有**发布/手工重建**才用 `make build-gui`（或等价的 `make build`），那个目标会覆盖
+> `./wps_app-gui`——覆盖完要按接管式重启面板，见 §11 那条。
 > 另外前面任何一步红，gate 会当场退出，`frontend` / `gate-gui` 根本不会跑：
 > 没看到它们的报错不等于它们通过了。
 
@@ -4883,7 +5732,7 @@ make gate        # 一条命令跑全套离线门禁，约 2 分钟
 | 命令 | 实际做的事 | 什么时候用 |
 |---|---|---|
 | `make gate` | 只验证代码：格式、编译、测试、竞态、离线、模糊、前端类型与纯函数测试 | 改完东西、提交前 |
-| `make check` | `./wps_app config.yaml -check`——拿**你自己的**配置做真机自检 | 部署前自己看一眼通不通 |
+| `make check` | `dist/gate/wps_app-gui config.yaml -check`——拿**你自己的**配置做真机自检 | 部署前自己看一眼通不通。**默认目标 `www.gstatic.com:443` 在本机直连也拨不通**（实测：不经代理同样超时），它红是目标站不通；换目标用 `make check CHECK_HOSTS=cp.cloudflare.com:443` |
 
 **这套门禁的一次真交付**（2026-10-19，给「查走向」补节点那一格，见 §5）。
 新写的 `Router.Preview` 第一版直接复用 `pick`——"与拨号同源"听着是最稳的选法，
@@ -4906,6 +5755,28 @@ make gate        # 一条命令跑全套离线门禁，约 2 分钟
 它验证的是"这份配置能不能用"，不是"代码有没有坏"——所以它既不是门禁的替代，
 也不该进 CI。（另有一条 `fmt`：它只把没格式化的文件**列出来**、退出码仍是 0，
 挂在门禁里等于没有这道门，所以门禁用的是 `fmt-check`。）
+
+**`make check` 红了先分清是哪一种红（2026-10-29 实测）。** 这一条命令会同时碰三样东西：
+目标站、节点、以及**正在跑的面板**。红的原因不止一个，混在一起看就会修错地方：
+
+| 红的样子 | 是谁的锅 | 怎么确认 |
+|---|---|---|
+| `dial <目标> via PROXY: handshake timeout after 10s` | **节点**那一刻抖了 | 面板日志同一时刻有 `hysteria: 隧道故障…timeout: no recent network activity`。连着跑三次自检，只要节点在抖就会时好时坏——**这跟程序没关系** |
+| 目标站本身拨不通 | 目标站 | 同一个目标**不经代理**也拨不通就是它。本机 `www.gstatic.com:443` 直连也是超时的，所以 `make check` 默认目标在这台机器上必然红 |
+| 端口被占 / 锁被占 | 有另一个实例在跑 | 日志里 `锁被 PID … 占着` |
+
+**默认目标 `www.gstatic.com:443` 在本机直连也拨不通**（实测不经代理同样超时），
+所以默认跑法在这台机器上必然红——那是目标站不通，不是程序坏了。
+想问「程序通不通」就换目标：`make check CHECK_HOSTS=cp.cloudflare.com:443`。
+实测在面板运行的情况下连跑三次都是 `ok=1 fail=0`，面板同期也照常 204。
+
+**`make check` / `make acceptance` / `make acceptance-tun` 不再覆盖 `./wps_app-gui`。**
+单产物之后 `./wps_app-gui` 同时是正在跑的面板和 `tun.helper` 指着的那个文件：
+覆盖它等于让跑着的进程与磁盘上的文件分属两个构建（协议号对不上时 TUN 直接开不了），
+而且跑着的那个进程会持着被删掉的 inode（`/proc/<pid>/exe` 显示 `(deleted)`）。
+2026-10-29 实测踩过：`make check` 覆盖之后跑着的面板 exe 就变成 `(deleted)` 了。
+现在这三个目标走 `gate-gui` 那条路，产物进 `dist/gate/`，发布产物一个字都不动
+（实测：跑完 `make acceptance` 之后 `md5sum -c` 仍然 OK）。
 
 守卫用例都是普通测试，`make gate` 会跑到。新增枚举时**先加注册表再改代码**，
 让守卫先红一次——那一次红就是它在替你记"还有 N 处没决定"。

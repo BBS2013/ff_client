@@ -26,18 +26,13 @@ case "$(uname -s)/$(uname -m)" in
 esac
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for b in wps_app wps_app-gui; do
-  if [[ -x "$here/$b" ]]; then
-    # 静态与否决定「能不能扔到别的机器直接跑」，用 file 判最稳（不依赖 ldd 的行为差异）
-    if file "$here/$b" | grep -q "statically linked"; then
-      ok "$b 是静态二进制，不依赖系统库"
-    else
-      ok "$b 存在（动态链接，见下面的系统库检查）"
-    fi
-  else
-    note "没找到 $b（只有另一个产物也够用）"
-  fi
-done
+# 只有一个产物：面板、代理、提权 helper 都是 ./wps_app-gui 这一个文件
+# （历史上的静态命令行版 ./wps_app 已于 2026-10-29 删除，见 Makefile 文件头）。
+if [[ -x "$here/wps_app-gui" ]]; then
+  ok "找到产物 wps_app-gui（动态链接 GTK/WebKit，依赖核对见下面）"
+else
+  no "没找到产物 wps_app-gui：这一份包是空的，用源码包 make build-gui 自己编"
+fi
 
 if [[ $want_gui -eq 1 || -x "$here/wps_app-gui" ]]; then
   echo "== 图形面板需要的系统库 =="
@@ -58,7 +53,8 @@ if [[ $want_gui -eq 1 || -x "$here/wps_app-gui" ]]; then
       no "缺：$(echo "$missing" | tr '\n' ' ')"
       echo "         Ubuntu/Debian: sudo apt install libgtk-3-0 libwebkit2gtk-4.0-37 libepoxy0"
       echo "         Fedora:        sudo dnf install gtk3 webkit2gtk4 libepoxy"
-      echo "         装不上就用命令行的 wps_app（静态、零依赖），功能只差一个图形界面。"
+      echo "         这几套库现在是硬依赖：产物只剩 wps_app-gui，连无头模式（-cli）"
+      echo "         也要在动态链接期加载它们，装不上就没有能跑的产物。"
     fi
   fi
 fi
@@ -83,13 +79,13 @@ done
 if sudo -n true 2>/dev/null; then
   ok "免密 sudo 可用，可以直接跑面板或用 tun.helper"
 else
-  note "免密 sudo 不可用：想用 TUN 就 sudo ./wps_app config.yaml，或者只用系统代理模式"
+  note "免密 sudo 不可用：想用 TUN 就 sudo ./wps_app-gui config.yaml，或者只用系统代理模式"
 fi
 
 echo "== 端口占用 =="
 for p in 7891 7892; do
   if ss -tln 2>/dev/null | grep -q "127.0.0.1:$p "; then
-    note "127.0.0.1:$p 已被占用——多半是已经有一个 wps_app 在跑（pgrep -x wps_app 看得到）"
+    note "127.0.0.1:$p 已被占用——多半是已经有一个面板在跑（pgrep -x wps_app-gui 看得到）"
   else
     ok "127.0.0.1:$p 空闲"
   fi

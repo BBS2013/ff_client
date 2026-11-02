@@ -6,7 +6,7 @@
 不碰线上端口（7891/7892）、不碰外网、不碰正在跑的面板。
 
 用法：
-    python3 scripts/acceptance/proto_test.py --binary ./wps_app
+    python3 scripts/acceptance/proto_test.py --binary ./wps_app-gui
 
 退出码：0 = 全部通过（IPv6 不可用时记 SKIP，不算失败）；1 = 有 FAIL 或起不来。
 """
@@ -341,7 +341,7 @@ def check(name, fn):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default="./wps_app")
+    ap.add_argument("--binary", default="./wps_app-gui")
     args = ap.parse_args()
     binary = os.path.abspath(args.binary)
     if not os.path.isfile(binary):

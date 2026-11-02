@@ -1,14 +1,22 @@
-# Makefile 管四类事：两种构建（命令行 / 桌面面板）、前端产物、测试（含断网跑）、打包与自检。
+# Makefile 管四类事：构建（只有一个产物）、前端产物、测试（含断网跑）、打包与自检。
 #
-# 两种产物靠构建标签 gui 分开，这是刻意设计：
-#   make build       -> 静态 stripped 二进制，无 CGO、无 GTK 依赖，给 systemd 部署
-#   make build-gui   -> 带 GTK3/WebKit2GTK 的桌面面板，需要图形环境
-# 两者都是单进程，GUI 进程内部自己跑着代理，不依赖另一个守护进程。
+# 只有一个产物：
+#   make build / make build-gui -> 带 GTK3/WebKit2GTK 的桌面面板 ./wps_app-gui
+#
+# 2026-10-29 删掉了第二个产物 ./wps_app（CGO_ENABLED=0 的静态命令行版）。理由：
+# 面板与 `tun.helper` 从此是同一个文件，不再有「重建了其中一个、另一个还是旧的」
+# 这种漂移——2026-10-29 那次 TUN 开不起来就是它（面板协议 1 vs 磁盘 helper 协议 3）。
+# 代价写在这里，别只写在 README 里：
+#   1) root 那条提权路径现在要加载 146 个共享库（实测 helper 分支 LD_DEBUG 计数），
+#      静态版是 0 个；helper 分支入口的 RSS 从 12.5 MB 变 51.9 MB，起进程 0.01s→0.04s。
+#   2) 没装 libgtk-3 / libwebkit2gtk-4.0 的机器从此跑不了任何产物：无头/systemd 部署
+#      要 `./wps_app-gui config.yaml -cli`，而 -cli 也躲不过动态链接期加载这些库。
+#   3) 交叉编译产物只能在那台机器上 `make build-gui`（GTK 需要目标机的 sysroot）。
+# 不带 gui 标签的那份编译仍由 vet/test/race 覆盖（它们在没有标签的目录下构建整个包）。
 
-BIN      := wps_app
 GUI_BIN  := wps_app-gui
-# 版本/源码指纹/构建时刻由同一个脚本注入，避免三份产物口径漂移。
-LDFLAGS  := $(shell ./scripts/build-ldflags.sh)
+# 版本/源码指纹/构建时刻由 scripts/build-ldflags.sh 一处生成：build-gui 与 package 都调它，
+# 所以产物的自报口径不会分叉。
 # gui 把 GTK/WebKit 运行时限制在 GUI 产物里；production 是 Wails 自己的标签。
 GUI_TAGS := gui production
 # gate 的 GUI 产物单独放：它验证的是"能不能链接、能不能跑"，不该覆盖
@@ -16,16 +24,18 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once
+.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution
 
 all: build
 
-## 默认构建：静态、无 CGO、systemd 可直接部署。
-build:
-	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BIN) .
+## 默认构建 = 面板构建。保留这个名字是为了旧习惯与脚本里那句 `make build`；
+## 它不再有第二个产物。
+build: build-gui
 
-## GUI 构建：先出前端产物再编 Go。完整逻辑见 scripts/build-gui.sh。
-## 这是发布/手工重建用的目标：它会覆盖 ./wps_app-gui。
+## 唯一的产物：先出前端产物再编 Go。完整逻辑见 scripts/build-gui.sh。
+## 这是发布/手工重建用的目标：它会覆盖 ./wps_app-gui——而这个文件现在同时是
+## tun.helper 指着的那个文件，所以**面板在跑时重建它会让 helper 与面板分属两个构建**
+## （协议号对不上时预检会直接拒绝起 root 并点名该动哪一边）。刷新产物后重启面板。
 build-gui:
 	./scripts/build-gui.sh
 
@@ -38,6 +48,13 @@ gate-gui: frontend
 ## 只重建前端产物，供本地调样式时快速迭代。
 frontend:
 	cd frontend && npm run build
+	./scripts/check-dist.sh
+
+## 单独验一次“index.html 引用的哈希资源真的在磁盘上”。
+## 2026-11-02 的教训：只提交 tracked 文件时，index.html 会指向未跟踪的新 assets，
+## go:embed 进二进制的页面直接白屏；这个检查已挂在上面的 frontend 目标里。
+dist-check:
+	@./scripts/check-dist.sh
 
 ## 前端纯函数测试 + 覆盖率闸门（format/ageclock/nodetests/probes）。
 ## 组件交互仍靠人工点验；这里守的是"算得对不对"。
@@ -56,8 +73,22 @@ test:
 ## 任何一条用例只要还偷偷依赖真实 DNS / 外网 / 本机路由，这里就会红。
 ## 平时 `make test` 在开发机上跑是绿的，因为机器什么都有——那种绿说明不了"离线也能跑"。
 ## 需要非特权用户命名空间（unshare -rn）；内核关掉它时这条会直接报错，不要改成 skip。
+## WPS_NETNS=1 打开「会真改路由」的用例（internal/tunx/netns_linux_test.go、
+## internal/diag/netns_test.go）：它们在私有 netns 里建网卡、装默认路由，绝不能跑在宿主 netns 上。
+## -p 1 是必需的，不是保守：整个 `go test ./...` 共享同那一个 netns，而默认路由全表只有一条——
+## 两个包并行装各自的接管就会互相踩（谁先装上都算"现状"），断言就成了掷硬币。
+## 串行只慢几十秒，换来的是这两组证据每次都对着同一份内核状态说话。
 test-offline:
-	unshare -rn bash -c 'ip link set lo up && GOFLAGS=-mod=vendor GOPROXY=off go test ./... -count=1 -timeout 240s'
+	unshare -rn bash -c 'ip link set lo up && WPS_NETNS=1 GOFLAGS=-mod=vendor GOPROXY=off go test ./... -count=1 -p 1 -timeout 300s'
+
+## test-netns-fw 在私有 netns 里跑「真 iptables」那一组（internal/tunx/killswitch_netns_test.go）。
+## 为什么要多一个挂载命名空间：iptables 起来第一句就要打开 /run/xtables.lock，
+## 那个文件属于宿主里的 root，非特权 userns 打不开——过去「netns 里验不了防火墙规则」
+## 就是这么来的。把 /run 换成 tmpfs 之后链装得上、包计数读得到，
+## 而所有规则只活在这个私有 netns 里，宿主的表一条不动。
+## 开关是显式的 WPS_FW=1：开着却建不了链会判失败而不是 skip——那是脚手架坏了。
+test-netns-fw:
+	unshare -rnm bash -c 'mount -t tmpfs tmpfs /run && ip link set lo up && WPS_NETNS=1 WPS_FW=1 GOFLAGS=-mod=vendor GOPROXY=off go test ./internal/tunx -count=1 -timeout 180s'
 
 ## fuzz-smoke 给每个模糊目标跑 FUZZTIME（默认 10s）。输入全是"本机任何进程都能发过来"
 ## 或"远端订阅能写过来"的字节，所以断网也能跑；它查的是同一条底线：不许 panic、
@@ -136,8 +167,19 @@ fmt-check:
 ## 不是回归门禁。gate 只验证代码，断网的机器上、CI 上都能跑。
 ## 里面刻意含 gate-gui：只有它会把 `//go:build gui` 下的文件真链接一遍，
 ## vet 能查语法、查不出链接期的缺失符号。产物固定写到 dist/gate/，
-## 所以 gate 跑完后 ./wps_app-gui（正在跑的面板）的字节与 mtime 都不变。
-gate: fmt-check build vet test race test-offline fuzz-smoke frontend frontend-test gate-gui
+## 所以 gate 跑完后 ./wps_app-gui（正在跑的面板，也是 tun.helper 指着的那个文件）
+## 的字节与 mtime 都不变。
+## gate 的依赖里刻意**没有** build：单产物之后 `make build` 覆盖的就是 helper 那个文件，
+## 面板在跑时跑一次门禁就会自己造出「面板 vs helper 两个构建」的漂移。
+## 不带 gui 标签的那份编译由 vet/test/race 覆盖（它们在没有标签的目录下构建整个包），
+## 链接验证由 gate-gui 覆盖，所以少一个 build 不会漏掉什么。
+## 跑门禁前先确认**没有**在跑的面板：全局模式（mode: global）下系统解析器对任何域名都回
+## 198.18.x 假 IP，`internal/service` 与 `internal/diag` 里那几条「拨一个必然失败的地址」
+## 会因此真的拨通（2026-10-29 实际踩过一次，停了面板三条全绿）。
+## 现在这几条都带上了前提检查：解析器在编答案时它们会**带原因地跳过**而不是红
+## （`switch_test.go::fakeDNSActive`、`diag_test.go::TestReportNormalResolvConfIsQuiet` 已收窄判据）；
+## 但跳过等于这一格没验，所以门禁轮次仍应在面板停着的时候跑。
+gate: fmt-check vet test race test-offline test-netns-fw fuzz-smoke frontend frontend-test gate-gui
 	@echo "全套门禁通过（GUI 产物: $(GATE_GUI_BIN)，未触碰 ./$(GUI_BIN)）"
 
 ## package 出两个包：给使用者的运行包（预编译产物）与含 vendor 的源码包。
@@ -145,20 +187,43 @@ gate: fmt-check build vet test race test-offline fuzz-smoke frontend frontend-te
 package:
 	./scripts/package.sh
 
+## 这三个目标都跑「当前这份产物」，但**绝不覆盖 ./$(GUI_BIN)**。
+## 单产物之后 ./$(GUI_BIN) 同时是正在跑的面板和 tun.helper 指着的那个文件：
+## 覆盖它等于让跑着的进程与磁盘上的文件分属两个构建（协议号对不上时 TUN 直接开不了），
+## 而且正在跑的那个进程会持着被删掉的 inode（/proc/<pid>/exe 显示 deleted）。
+## 所以它们用 gate-gui 那条路：产物进 dist/gate/，发布产物一个字都不动。
+## 为什么不是 build：build 现在就是 build-gui，它覆盖的正是 ./$(GUI_BIN)。
+## （2026-10-29 实测踩过：`make check` 覆盖之后跑着的面板 exe 变成 "(deleted)"。）
+
 ## check 是程序自带的配置与链路自检，与 go test 互补。
-check: build
-	./$(BIN) config.yaml -check
+## 面板二进制默认开界面，这里必须带 -cli：只跑代理服务、不起窗口也不起托盘。
+##
+## CHECK_HOSTS 用来换自检目标（逗号分隔，格式 host:port）。为什么要有这个出口：
+## 默认目标是 www.gstatic.com:443，而本机**直连**它也拨不通（实测不经代理同样超时），
+## 于是默认跑法在某些网络下必然红——那是目标站不通，不是程序坏了。
+## 换成一个真能拨到的目标才问得出「程序通不通」这个问题。
+## 例：make check CHECK_HOSTS=cp.cloudflare.com:443
+CHECK_HOSTS ?=
+check: gate-gui
+ifeq ($(CHECK_HOSTS),)
+	./$(GATE_GUI_BIN) config.yaml -check
+else
+	./$(GATE_GUI_BIN) config.yaml -check -check-host $(CHECK_HOSTS)
+endif
 
 ## acceptance 是仓库内可离线跑的验收：A6 协议 16 项 + A8 信号。
 ## 自己起隔离实例（17891/17892），不碰线上 7891/7892、不碰外网。
-acceptance: build
-	python3 scripts/acceptance/proto_test.py --binary ./$(BIN)
-	bash scripts/acceptance/signals_test.sh ./$(BIN)
+acceptance: gate-gui
+	python3 scripts/acceptance/proto_test.py --binary ./$(GATE_GUI_BIN)
+	bash scripts/acceptance/signals_test.sh ./$(GATE_GUI_BIN)
 
 ## acceptance-tun 是 B3 根权限实链（会改本机路由/DNS）。默认不跑：
 ## 没有 WPS_ACCEPT_TUN=1 或专用配置时脚本会打印 SKIP 并以 2 退出。
-acceptance-tun: build
-	bash scripts/acceptance/tun_test.sh ./$(BIN)
+## 被测二进制与 tun.helper 现在都是 ./$(GUI_BIN)：2026-10-29 实测 10/10。
+## 注意：它默认起的是 dist/gate/ 那份，所以专用配置里的 tun.helper 必须指着同一份，
+## 否则验的是「产物 A + helper B」——那不是本机线上的形状。
+acceptance-tun: gate-gui
+	bash scripts/acceptance/tun_test.sh ./$(GATE_GUI_BIN)
 
 ## soak 被动采样正在跑的面板（不重启、不发信号），默认每 5 分钟一条。
 ## CSV 在 dist/ 下；--summary 汇总已有 CSV。
@@ -169,6 +234,17 @@ soak:
 soak-once:
 	./scripts/panel-soak.sh --once
 
+## probe-attribution 只读地量一遍「连接归到哪个进程」在这台机器上给到哪一步：
+## 内核 BTF / lockdown / 两个 sysctl / 本进程 capabilities / 第三方内核模块，
+## 外加同 uid 的 socket→pid 反查能不能真做出来（含耗时）。
+## 为什么值得一个目标：这三档实现的门槛是**机器的属性**，换机器就要重量一遍；
+## 而 README 里那条"先评估再考虑 eBPF"的结论只有能被重跑，才不是空话。
+probe-attribution:
+	./scripts/probe-socket-attribution.sh
+
 clean:
-	rm -f $(BIN) $(GUI_BIN)
+	rm -f $(GUI_BIN)
+	# wps_app 这个名字已经不是产物了（见文件头），但它可能还躺在旧检出的仓库根目录里，
+	# 而且 tun.helper 可能还指着它——顺手清掉，免得下次起面板去叫一个没人维护的文件。
+	rm -f wps_app
 	rm -rf frontend/dist
