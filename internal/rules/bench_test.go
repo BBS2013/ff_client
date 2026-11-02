@@ -25,7 +25,7 @@ func realRules(t testing.TB) (string, string) {
 	for _, p := range []string{rulesFile, geoFile} {
 		if _, err := os.Stat(p); err != nil {
 			cwd, _ := os.Getwd()
-			t.Fatalf("找不到 %s：先运行 ./scripts/fetch-assets.sh（cwd=%s）", p, cwd)
+			t.Fatalf("找不到 %s：先运行 ./scripts/fetch-assets.sh --seed（cwd=%s）", p, cwd)
 		}
 	}
 	return rulesFile, geoFile
@@ -133,7 +133,7 @@ func firstDomainRuleHost(t testing.TB, e *Engine) string {
 			return r.value
 		}
 	}
-	t.Fatal("规则集里一条域名规则都没有，这组基准没法量")
+	t.Fatal("规则集里一条域名规则都没有，这组基准没法量；先运行 ./scripts/fetch-assets.sh --seed")
 	return ""
 }
 
@@ -146,6 +146,6 @@ func TestRealRulesAreBigEnoughToMatter(t *testing.T) {
 	e := loadReal(t)
 	dom, ip := e.Stats()
 	if dom < 1000 || ip < 1 {
-		t.Fatalf("真规则集只有 域名 %d / IP %d 条，这组基准的前提不成立", dom, ip)
+		t.Fatalf("真规则集只有 域名 %d / IP %d 条，这组基准的前提不成立；先运行 ./scripts/fetch-assets.sh --seed", dom, ip)
 	}
 }
