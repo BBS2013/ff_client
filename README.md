@@ -551,9 +551,10 @@ GOFLAGS=-mod=vendor GOPROXY=off go build ./...                        # 离线
 GOFLAGS=-mod=vendor GOPROXY=off go test ./...                         # 测试同理
 ```
 
-> `assets/geoip.mmdb` 因许可不能入库。干净检出跑 `go test` 前先按 §3 执行
-> `./scripts/fetch-assets.sh`；缺它时性能闸会按设计失败并提示这条命令。
-> `config.yaml` 是本机运行期文件，测试只在它存在时才顺带验一遍。
+> `assets/geoip.mmdb` 与 `assets/gfw-proxy.txt` 因许可不能入库。干净检出跑
+> `go test` 前先按 §3 执行 `./scripts/fetch-assets.sh --seed`；缺它们时性能闸会
+> 按设计失败并提示补文件，不会静默跳过。`config.yaml` 是本机运行期文件，
+> 测试只在它存在时才顺带验一遍。
 
 **只有一个产物 `./wps_app-gui`**：依赖系统 `libgtk-3` 与 `libwebkit2gtk-4.0`，
 进程内部自己跑代理，不需要另一个守护进程；没有图形界面就加 `-cli`（见 §8）。
