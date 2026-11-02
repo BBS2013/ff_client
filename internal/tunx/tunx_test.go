@@ -373,6 +373,34 @@ func TestUpstreamCIDRForms(t *testing.T) {
 	}
 }
 
+// TestRoutePlanNonStrictCleansStaleDefault 守住 2026-11-02 那个现场：
+// 上一次 strict_route 留下的 `default dev wps-tun` 没撤干净，非 strict 启动
+// 又没有清理，于是所有 IPv4（包括本进程发往 dns.servers 的查询）都进了 tun，
+// DNS 一个上游都答不上、直连域名全部退成 FINAL(dns-failed)。
+func TestRoutePlanNonStrictCleansStaleDefault(t *testing.T) {
+	p := RoutePlan{Device: "wps-tun", Address: "172.19.0.1/30", StrictRoute: false}
+	up, _, err := p.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := ""
+	for _, c := range up {
+		text += c.String() + "\n"
+	}
+	for _, want := range []string{
+		"ip route del default dev wps-tun",
+		"ip -6 route del default dev wps-tun",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("非 strict 启动没清理残留默认路由 %q:\n%s", want, text)
+		}
+	}
+	// 清理可以，重新装默认路由不行：选择性 TUN 的直连流量不该进 tun。
+	if strings.Contains(text, "route add default") {
+		t.Errorf("非 strict 启动不该安装默认路由:\n%s", text)
+	}
+}
+
 func TestRoutePlanStrictRoute(t *testing.T) {
 	p := RoutePlan{
 		Device: "wps-tun", Address: "172.19.0.1/30", FakeIPRange: "198.18.0.0/15",

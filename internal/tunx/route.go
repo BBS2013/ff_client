@@ -108,6 +108,20 @@ func (p RoutePlan) Plan() (up, down []Cmd, err error) {
 			Desc: "设置 MTU",
 		})
 	}
+	// 非 strict_route 不该有默认路由指向 tun；但上一次 strict_route 的进程
+	// 如果没退干净（崩溃、改配置、网卡先消失），`default dev wps-tun` 会留着。
+	// 它不会只影响“全局接管”这一件事：所有 IPv4 都会进 tun，连本进程发往
+	// dns.servers 的查询也走 tun，于是 DNS 一个上游都答不上。
+	// 这里先删一次；Optional 保证正常机器上没有这条路由时静默通过。
+	// 2026-11-02 现场：-diag 明确报出“没撤销干净的残留”，而 DNS 失败
+	// 147 次、直连域名全部 FINAL(dns-failed)。
+	if !p.StrictRoute {
+		up = append(up,
+			Cmd{Bin: "ip", Args: []string{"route", "del", "default", "dev", p.Device}, Desc: "清理上次严格路由残留（IPv4）", Optional: true},
+			Cmd{Bin: "ip", Args: []string{"-6", "route", "del", "default", "dev", p.Device}, Desc: "清理上次严格路由残留（IPv6）", Optional: true},
+		)
+	}
+
 	if p.FakeIPRange != "" {
 		up = append(up, Cmd{
 			Bin:            "ip",
