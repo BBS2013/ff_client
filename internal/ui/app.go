@@ -54,9 +54,9 @@ type App struct {
 	// sysProxyMu 护着下面那个标志：「停止」与「启动」两条路都会碰它，
 	// 而绑定方法跑在 Wails 的其它 goroutine 上。
 	sysProxyMu sync.Mutex
-	// sysProxyPaused 记的是「桌面上这根指向本程序的指针，是刚才那次停止替用户拔掉的」。
-	// 只有为这个原因关掉的，启动时才该原样放回去；用户自己关的、或原来就不是我们的，
-	// 都不该由启动来替他改桌面。
+	// sysProxyPaused 记的是「桌面上这根指向本程序的指针，是刚才那次停止/总开关替用户拔掉的」。
+	// 总开关关闭会连带停服务，所以下一次启动要把指针放回去；服务本来就没跑、
+	// 用户只关了桌面那一路不置位，启动时也不该替他改桌面。
 	sysProxyPaused bool
 }
 
@@ -554,34 +554,61 @@ func (a *App) sysProxyEnableConfig() sysproxy.Config {
 	}
 }
 
-// SetSystemProxy 把桌面代理指向本客户端的入站。关闭即还原成改动前的样子。
+// SetSystemProxy 是「系统代理」总开关：开 = 启动代理 + 接管桌面，关 = 收回桌面 + 停止代理。
+//
+// 为什么把两件事绑在一起（2026-11-02 用户选择）：面板的核心用法是桌面系统代理，
+// 用户看到「系统代理已关闭」而顶栏还写「运行中」会以为开关坏了。现在这个开关
+// 就是总开关；TUN 与手动 SOCKS/HTTP 客户端会随它一起停——这是选择硬联动的代价，
+// 已在 README/界面提示里写明。
 func (a *App) SetSystemProxy(enable bool) error {
-	statePath := sysproxy.StatePath(a.svc.ConfigPath())
-	backend := a.sysProxyBackend()
 	if !enable {
+		// 服务在跑：Stop 会先拔桌面指针（按记账还原），再关端口。
+		// 服务没跑：只恢复桌面，不能因为总开关反向去启动一个本来没跑的服务。
+		if a.svc.Snapshot().Running {
+			if err := a.Stop(); err != nil {
+				return err
+			}
+			logx.Infof("系统代理总开关关闭：代理已停止")
+			return nil
+		}
+		statePath := sysproxy.StatePath(a.svc.ConfigPath())
 		err := withTimeout(func(ctx context.Context) error {
-			return sysproxy.Disable(ctx, sysxRunner, statePath, backend)
+			return sysproxy.Disable(ctx, sysxRunner, statePath, a.sysProxyBackend())
 		})
 		if err == nil {
-			// 用户亲手关的，就不该由下一次「启动」替他打开。
+			// 服务本来就没跑：用户只关了桌面，下一次「启动」不该替他打开。
 			a.setSysProxyPaused(false)
-			// 开关这条路原来不留日志：桌面上谁改的、什么时候改的，
-			// 日志里一个字都没有。等哪天要查「桌面怎么指着我们的」，
-			// 这一句就是唯一的目击证人。
 			logx.Infof("已按界面操作把桌面系统代理切回关闭")
 		}
 		return err
 	}
-	c := a.sysProxyEnableConfig()
-	err := withTimeout(func(ctx context.Context) error {
-		return sysproxy.Enable(ctx, sysxRunner, statePath, c)
-	})
-	if err == nil {
-		a.setSysProxyPaused(false) // 现在这根指针是用户要的了，停止时该由停止拔掉它
-		logx.Infof("已按界面操作把桌面系统代理指向本客户端入站（http %s / socks %s），记账 %s",
-			c.HTTPAddr, c.SOCKSAddr, statePath)
+
+	// 开：先保证服务在跑，再写桌面指针。反过来会出现一小段「桌面指着一个
+	// 还没监听的端口」的窗口，那正是这台机器上所有应用报代理连接拒绝的时刻。
+	wasRunning := a.svc.Snapshot().Running
+	if !wasRunning {
+		if err := a.svc.Start(); err != nil {
+			return fmt.Errorf("系统代理总开关：启动代理失败，桌面代理未改动: %w", err)
+		}
 	}
-	return err
+	statePath := sysproxy.StatePath(a.svc.ConfigPath())
+	c := a.sysProxyEnableConfig()
+	if err := withTimeout(func(ctx context.Context) error {
+		return sysproxy.Enable(ctx, sysxRunner, statePath, c)
+	}); err != nil {
+		// 服务是这次开关拉起来的、桌面却写失败：回滚到「没启动」，
+		// 否则界面会出现「系统代理关着、代理却在跑」的分裂状态。
+		if !wasRunning {
+			if stopErr := a.svc.Stop(); stopErr != nil {
+				logx.Warnf("系统代理开启失败后回滚停止代理也失败: %v", stopErr)
+			}
+		}
+		return err
+	}
+	a.setSysProxyPaused(false) // 现在这根指针是用户要的了，停止时该由停止拔掉它
+	logx.Infof("系统代理总开关开启：代理已启动并指向本客户端入站（http %s / socks %s），记账 %s",
+		c.HTTPAddr, c.SOCKSAddr, statePath)
+	return nil
 }
 
 // releaseSystemProxy 在释放入站端口之前收掉桌面上指着它们的那根指针。

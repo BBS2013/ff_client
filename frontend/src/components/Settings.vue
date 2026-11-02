@@ -490,7 +490,10 @@ onMounted(load)
       <h2>
         系统代理
         <span class="act">
-          <label class="switch">
+          <label
+            class="switch"
+            title="总开关：打开会启动代理并接管桌面；关闭会恢复桌面指针并停止代理（监听、隧道、TUN 一起停）"
+          >
             <input
               type="checkbox"
               :checked="sysChecked"
@@ -538,12 +541,12 @@ onMounted(load)
         系统代理开关不可用。可以改用 TUN 模式，或手动设置环境变量。
       </p>
       <p v-else-if="sys?.note" class="hint tail">{{ sys.note }}</p>
-      <p v-else-if="sys && !status.running" class="alert warn tail">
-        代理目前<b>没在运行</b>：现在打开这个开关，桌面会指向一组没人监听的端口，
-        表现是浏览器全线连不上。先启动代理再开。
+      <p v-else-if="sys && !status.running" class="hint tail">
+        代理目前没在运行；打开这个总开关会自动启动它。启动失败时桌面指针不会被改动。
       </p>
       <p v-else class="hint tail">
-        指向本客户端当前实际监听的 HTTP / SOCKS5 入站；关闭即恢复系统原状（按改动前的读数还原，不是无脑置空）。
+        这是总开关：打开会启动代理并把桌面指向它；关闭会恢复桌面原状并停止代理
+        （监听、隧道、TUN 一起停）。按改动前的读数还原，不是无脑置空。
       </p>
     </section>
 

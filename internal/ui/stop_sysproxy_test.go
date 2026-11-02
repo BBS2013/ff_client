@@ -417,3 +417,41 @@ func TestRestartKeepsPointerAndPutsItOnRealPorts(t *testing.T) {
 		t.Fatalf("重启后指针应指向实际入站 %s，实际 %s", httpAddr, got)
 	}
 }
+
+// TestSystemProxySwitchStartsAndStopsService 钉住 2026-11-02 的硬联动：
+// 系统代理开关是总开关——开要先把服务拉起来，关要把服务一起停掉。
+// 否则用户点「系统代理关闭」后顶栏还写着「运行中」，看起来像开关坏了。
+func TestSystemProxySwitchStartsAndStopsService(t *testing.T) {
+	path, httpAddr, socksAddr := stopTestCfg(t)
+	f := useDesktop(t, "none", httpAddr, socksAddr)
+
+	app := New(path)
+	defer func() { _ = app.Close() }()
+	requireGnomeFake(t, app)
+	if app.Status().Running {
+		t.Fatal("刚建的 App 不该已经在跑")
+	}
+
+	if err := app.SetSystemProxy(true); err != nil {
+		t.Fatalf("打开总开关: %v", err)
+	}
+	if !app.Status().Running {
+		t.Fatal("打开系统代理后代理服务没有启动")
+	}
+	if got := f.modeNow(); got != "manual" {
+		t.Fatalf("打开总开关后桌面应是 manual，实际 %q", got)
+	}
+	if got := f.addrNow(schemaHTTP); got != httpAddr {
+		t.Fatalf("桌面 HTTP 指针 = %s, want %s", got, httpAddr)
+	}
+
+	if err := app.SetSystemProxy(false); err != nil {
+		t.Fatalf("关闭总开关: %v", err)
+	}
+	if app.Status().Running {
+		t.Fatal("关闭系统代理后代理服务还在跑：这就是用户报的“上面的还没停止”")
+	}
+	if got := f.modeNow(); got != "none" {
+		t.Fatalf("关闭总开关后桌面应恢复 none，实际 %q", got)
+	}
+}

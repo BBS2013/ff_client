@@ -600,7 +600,10 @@ const split = computed(() => {
             </span>
           </label>
 
-          <label class="switch-item">
+          <label
+            class="switch-item"
+            title="总开关：打开会启动代理并接管桌面；关闭会恢复桌面指针并停止代理（监听、隧道、TUN 一起停）"
+          >
             <span class="si-text">
               <span class="si-title">系统代理</span>
               <span class="si-note mono">{{ sysNote }}</span>
