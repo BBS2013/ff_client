@@ -38,6 +38,10 @@ function barWidth(bytes: number): string {
  * 顺带把表滚进视野：不滚的话，点完这屏看上去什么都没变，
  * 而这一行存在的意义就是"这 3GB 是谁用掉的、都花在哪些连接上"。
  */
+function focusRule(rule: string): void {
+  connTable.value?.filterByRule(rule)
+}
+
 function focusNode(node: string): void {
   connTable.value?.filterByNode(node)
   ;(connTable.value?.$el as HTMLElement | undefined)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
@@ -179,9 +183,58 @@ const emit = defineEmits<{
       这一格、下面的连接表和日志是本机唯一的凭据。点「清空统计」或重启面板都会把它归零。
     </p>
 
+    <!-- 这几个数字的口径。不写清楚的话，「总流量」会被读成「这台机器上了多少网」，
+         而它其实是「本进程搬了多少字节」。 -->
+    <p class="hint">
+      这几格是<b>本进程经手的载荷</b>：从 SOCKS5 / HTTP / TUN 进来的连接搬了多少字节
+      （本次会话；下面「各节点用量」那一档的「累计」另含上一次进程落盘留下的账）。
+      它<b>不是</b>「这台机器的上网流量」——选择性 TUN 下判成直连的真 IP 流量根本不进 tun，不计入；
+      全局接管下进了 tun 的 TCP/UDP 才算，ICMP 等其它协议不走隧道，也不计入。
+      系统网卡总流量与进程级归属本面板都不采集：前者要读网卡计数（含协议头与重传），
+      后者要 socket 归属、权限与兼容性另议——两者都不与这里的字节统计混为一谈。
+    </p>
+
     <section class="card">
       <h2>实时速率 · 最近 15 分钟</h2>
       <RateChart :series="traffic.series" />
+    </section>
+
+    <section class="card">
+      <h2>
+        按规则汇总
+        <span class="count">本次会话 · 谁在搬流量</span>
+      </h2>
+      <!-- 节点那张表答"量记在哪个去处"，这张答"是哪条规则放行的"。
+           两者不能互相替代：节点会随故障切换而变，规则不会。 -->
+      <p v-if="traffic.byRule.length === 0" class="mut">
+        还没有按规则归类的流量。跑起来之后这里按命中依据分行，最后一行可能是若干条规则的合并。
+      </p>
+      <ul v-else class="nodes">
+        <li v-for="row in traffic.byRule" :key="row.rule">
+          <button
+            v-if="!row.folded"
+            type="button"
+            class="name mono node-link"
+            :title="`只看命中 ${row.rule} 的连接（再点一次取消）`"
+            @click="focusRule(row.rule)"
+          >
+            {{ row.rule }}
+          </button>
+          <!-- 合并行不接筛选：它不是一条规则，点下去筛不出任何东西。 -->
+          <span v-else class="name mono mut">{{ row.rule }}</span>
+          <span class="bar" :style="{ width: barWidth(row.up + row.down) }" aria-hidden="true"></span>
+          <span class="amt"><Amount :text="formatBytes(row.up + row.down)" /></span>
+          <span class="mut detail">
+            ↑{{ formatBytes(row.up) }} · ↓{{ formatBytes(row.down) }} · {{ row.conns }} 条
+            <template v-if="row.folded">· 由 {{ row.folded }} 条规则合并</template>
+          </span>
+        </li>
+      </ul>
+      <p class="hint">
+        口径提醒：这张表只数**真的搬过字节**的连接，与规则页那一栏「命中次数」不是一件事——
+        被拦下与拨不通的都算命中，却一个字节也没有。
+        直连真 IP 或 DoH 那类拿不到域名的流量只会命中 IP/端口类规则，域名规则对它不生效。
+      </p>
     </section>
 
     <section class="card">

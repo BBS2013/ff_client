@@ -300,11 +300,14 @@ const demoProfiles = [
     name: 'demo-sg', type: 'hysteria2', addr: 'demo.example.com:443', sni: 'demo.example.com',
     // 11GB 是台小 VPS 的真配额数量级，而它让"已用 67%"这种有用的读数出现在演示里
     // （写 1000GB 的话永远显示 0%，那一行的排版就等于没被看过）。
-    authSet: true, udp: true, active: true, quotaText: '11GB', quotaBytes: demoSizeToBytes('11GB')
+    authSet: true, udp: true, active: true, quotaText: '11GB', quotaBytes: demoSizeToBytes('11GB'),
+    coolingUntil: 0
   },
   {
     name: 'demo-us', type: 'trojan', addr: 'us.demo.example.com:8443', sni: 'us.demo.example.com',
-    authSet: true, udp: false, active: false, quotaText: '', quotaBytes: 0
+    authSet: true, udp: false, active: false, quotaText: '', quotaBytes: 0,
+    // 给演示数据一条真冷却：不让那一档读数只在出问题时才被人看到。
+    coolingUntil: Date.now() + 5 * 60_000
   }
 ]
 
@@ -467,6 +470,7 @@ function demoBridge(): AppBridge {
         profiles: demoProfiles.map((p) => ({ ...p, active: p.name === demoActive })),
         activeProfile: demoActive,
         autoSwitched: false,
+        autoSwitchedAt: 0,
         ifaceSplit: {
           enabled: demoIfaceSplit,
           active: demoSplitActive(),
@@ -487,15 +491,27 @@ function demoBridge(): AppBridge {
           fakeIps: demoTUN ? 12 : 0,
           active: demoTUN ? 2 : 0,
           dnsServed: demoTUN ? 137 : 0,
+          dnsFailed: demoTUN ? 4 : 0,
+          dnsFailedAt: demoTUN ? Date.now() - 30_000 : 0,
           startedAt: demoTUN ? Date.now() - 60_000 : 0,
           lastError: '',
           applied: demoTUN
             ? ['配置网卡地址', '启用网卡', '把假 IP 网段路由进 tun', '挂载 UDP DNS 劫持', '给网卡加 v6 地址']
             : [],
           privilege: 'helper',
-          helperCmd: ['sudo', '-n', '/home/chery/wps_app/wps_app', '--tun-helper'],
+          helperCmd: ['sudo', '-n', './wps_app-gui', '--tun-helper'],
           ipv6: demoTUN,
-          v6Ready: demoTUN
+          v6Ready: demoTUN,
+          takeoverV4: false,
+          takeoverV6: false,
+          takeoverFrom: demoTUN ? 'kernel' : 'not-running',
+          routeFixes: 0,
+          lastRouteFix: 0,
+          killEnabled: false,
+          killArmed: false,
+          killV4: false,
+          killV6: false,
+          killReason: ''
         },
         startedAt: running ? started : 0,
         uptimeMs: running ? Date.now() - started : 0,
@@ -617,6 +633,26 @@ function demoBridge(): AppBridge {
           down: 0
         })
       }
+      // 按规则汇总从上面那两份读数现算：这张表与连接表共用 matched 这一个字符串，
+      // 面板上「点一行去看命中它的连接」全靠它们说同一句话。
+      // 抄几个像样的假规则名看着更热闹，但筛出来是空表——byNode 那边记过同一个错
+      // （demo-hk），这里不再犯第二次。零字节的那几条照样占行：
+      // 「这条规则拦了/拨不通了，一个字节也没走」正是这张表要能回答的问题之一。
+      const byRule: TrafficSnapshot['byRule'] = []
+      {
+        const acc = new Map<string, TrafficSnapshot['byRule'][number]>()
+        for (const c of [...active, ...history]) {
+          if (c.matched === '') {
+            continue
+          }
+          const row = acc.get(c.matched) ?? { rule: c.matched, up: 0, down: 0, conns: 0 }
+          row.up += c.up
+          row.down += c.down
+          row.conns += 1
+          acc.set(c.matched, row)
+        }
+        byRule.push(...[...acc.values()].sort((a, b) => b.up + b.down - (a.up + a.down)))
+      }
       const series: TrafficSnapshot['series'] = []
       for (let i = 0; i < 90; i++) {
         series.push({
@@ -645,6 +681,7 @@ function demoBridge(): AppBridge {
               { node: 'demo-us', up: 210000000, down: 90000000, conns: 58, prior: demoPriorOn ? 900000000 : 0 }
             ]
           : [],
+        byRule,
         // 累计的两个时刻也要有：界面拿它们说"自 X 起累计 / 上次落盘 Y 前"。
         // 「累计也清零」之后一起归零，那一整句要从界面上消失——
         // 不是显示成"自 1970-01-01 起"，那比没有更难看。
@@ -755,7 +792,8 @@ function demoBridge(): AppBridge {
           fakeIpRange: '198.18.0.0/15',
           hijackDns: true,
           strictRoute: false,
-          routeExclude: []
+          routeExclude: [],
+          killSwitch: false
         }
       }
     },
@@ -789,7 +827,8 @@ function demoBridge(): AppBridge {
         udp: type === 'hysteria2',
         active: false,
         quotaText: p.quota || '',
-        quotaBytes: demoSizeToBytes(p.quota || '')
+        quotaBytes: demoSizeToBytes(p.quota || ''),
+        coolingUntil: 0
       })
     },
     async UpdateProfile(name: string, p: ProfileSpec) {
@@ -834,13 +873,24 @@ function demoBridge(): AppBridge {
       if (name === 'demo-us') {
         return {
           name, ok: true, latencyMs: 214, remote, error: '',
-          pageChecked: true, page: '',
-          pageErr: 'TLS 握手失败: tls: first record does not look like a TLS handshake'
+          pageChecked: true,
+          page: '',
+          // 与后端 annotateNodeFault 同一句形状：这一类的红有两种来源，
+          // 界面上不许只留一种读法。
+          pageErr: 'TLS 握手失败: tls: first record does not look like a TLS handshake' +
+            '（对端回的是明文：可能是链路设备代答，也可能是节点把这条流交给了兼底页' +
+            '；而这次代理流量没有真的钉在点名的网卡上）',
+          splitNote: '面板自己（普通权限）钉在 wlx001f0578cdff 上发不出包：'
+            + '这台机器上普通进程的绑定返回成功却发不出线，所以这一跳交给提权 helper 代劳，代理仍然钉在这张卡',
+          hopAddr: '192.168.0.104',
+          hopDev: 'wlx001f0578cdff'
         }
       }
       return {
         name, ok: true, latencyMs: 87, remote, error: '',
-        pageChecked: true, page: 'https 204 0 字节', pageErr: ''
+        pageChecked: true, page: 'https 204 0 字节', pageErr: '', splitNote: '',
+        // 两个一起给才是 trojan 现在的形状：设备名随源地址一起显示，便于跟 ss 对账。
+        hopAddr: '192.168.0.104', hopDev: 'wlx001f0578cdff'
       }
     },
     async SetTUNEnabled(enable: boolean) {
@@ -880,13 +930,25 @@ function demoBridge(): AppBridge {
         fakeIps: demoTUN ? 12 : 0,
         active: demoTUN ? 2 : 0,
         dnsServed: demoTUN ? 137 : 0,
+        dnsFailed: demoTUN ? 4 : 0,
+        dnsFailedAt: demoTUN ? Date.now() - 30_000 : 0,
         startedAt: demoTUN ? Date.now() - 60_000 : 0,
         lastError: '',
         applied: [],
         privilege: 'self',
         helperCmd: [],
         ipv6: false,
-        v6Ready: false
+        v6Ready: false,
+        takeoverV4: false,
+        takeoverV6: false,
+        takeoverFrom: 'not-running',
+        routeFixes: 0,
+        lastRouteFix: 0,
+        killEnabled: false,
+        killArmed: false,
+        killV4: false,
+        killV6: false,
+        killReason: ''
       }
     },
     async SetSystemProxy() {
@@ -1623,6 +1685,7 @@ function scenarioBridge(base: AppBridge): AppBridge {
         active: [],
         history: [],
         byNode: [],
+        byRule: [],
         series: [],
         recentBlocked: [],
         activeCount: 0,
@@ -1722,6 +1785,7 @@ function scenarioBridge(base: AppBridge): AppBridge {
         return {
           ...s,
           autoSwitched: true,
+          autoSwitchedAt: Date.now() - 90_000,
           switchReason: '配置里的节点 demo-sg 在 30s 内有 4 次节点级失败（涉及 3 个不同目标）'
         }
       }

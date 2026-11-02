@@ -16,7 +16,7 @@ import {
   testProfile,
   updateProfile
 } from '../api'
-import { formatBytes } from '../format'
+import { formatBytes, formatDuration } from '../format'
 import { nodeTests, pruneTests, rememberTest } from '../nodetests'
 import { agoText } from '../ageclock'
 
@@ -176,6 +176,18 @@ function latencyClass(ms: number): string {
 
 function latencyWidth(ms: number): string {
   return `${Math.max(6, Math.min(100, Math.round((ms / 300) * 100)))}%`
+}
+
+/**
+ * 这一格要能跟 `ss -tnp` 直接对账，所以设备名照 ss 的记号用 % 跟在源地址后面：
+ * `192.168.0.104%wlx001f0578cdff`。只写一个 IP 回答不了"走的是不是那张卡"，
+ * 读者还得自己 `ip addr` 反查一遍——而这一格存在的理由就是别再去查。
+ *
+ * 设备名读不到（这条 socket 没绑卡、或拿不到 fd）就只写地址：后端不许拿配置里的
+ * "打算绑哪张卡"顶替，这里也就不会写出误导人的后缀。
+ */
+function hopLabel(t: ProfileTest): string {
+  return t.hopDev ? `${t.hopAddr}%${t.hopDev}` : t.hopAddr
 }
 
 async function load(): Promise<void> {
@@ -385,6 +397,14 @@ onMounted(load)
                     ? '这个节点能转发 UDP：QUIC / 游戏 / 语音都走得通'
                     : '这个节点不转发 UDP：QUIC 流量会被明确拒绝，表现为应用超时'"
                 >{{ p.udp ? 'UDP' : '无 UDP' }}</span>
+                <!-- 冷却只约束自动切换，不约束用户手动选。
+                     不说清的话：手动选回一个还在冷却的节点，下一轮自动切换又把它切走，
+                     看起来就像「程序不听我的」。 -->
+                <span
+                  v-if="p.coolingUntil > Date.now()"
+                  class="pill warn"
+                  :title="`故障自动切换刚把它换下来，${formatDuration(p.coolingUntil - Date.now())}之内不会再自动切上去。手动选它永远有效，只是下一次自动切换会再挪走`"
+                >冷却 {{ formatDuration(p.coolingUntil - Date.now()) }}</span>
               </td>
               <td class="mono">{{ p.addr || '—' }}</td>
               <td class="mono">{{ p.sni || '跟随地址' }}</td>
@@ -428,6 +448,29 @@ onMounted(load)
                     v-if="tests[p.name].pageChecked && tests[p.name].pageErr"
                     class="why"
                   >{{ tests[p.name].pageErr }}</small>
+                  <!-- 同样是红，决定的地方完全不同：节点不通要换节点，
+                       而"根本没钉到点名的网卡"要修的是这台机器上的分流/权限。
+                       没有这一行，后者会被当成前者处理。 -->
+                  <!-- 分流那句要说清"钉卡这一步发生了什么"。两种情形是两句话：
+                       退回了默认路由，或者普通进程钉不上、由提权 helper 代劳——
+                       后者分流其实是在生效的，写成"没钉到"就是冤枉它。 -->
+                  <small
+                    v-if="tests[p.name].splitNote"
+                    class="why"
+                    :title="tests[p.name].splitNote"
+                  >{{ tests[p.name].splitNote }}</small>
+                  <!-- 这一跳的出网证据，两种协议给的东西不一样：
+                       trojan 是 TCP，能读到内核给的源地址，**并且**能从 socket 上回读到
+                       钉住的设备名（SO_BINDTODEVICE 的现值，与 ss 的 %dev 后缀同源），两者拼成
+                       `源地址%设备`；
+                       hysteria2 是 QUIC 隧道，流的 LocalAddr 是伪地址（会被写成服务器 IP），
+                       只有"钉在哪张设备上"说得对，所以那一族只给设备不给地址。 -->
+                  <small v-if="tests[p.name].hopAddr" class="mut hop">
+                    这一跳实际从 {{ hopLabel(tests[p.name]) }} 出去
+                  </small>
+                  <small v-else-if="tests[p.name].hopDev" class="mut hop">
+                    QUIC socket 钉在 {{ tests[p.name].hopDev }} 上
+                  </small>
                 </template>
                 <span v-else class="mut">未测</span>
               </td>

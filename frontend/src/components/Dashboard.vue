@@ -8,7 +8,7 @@ import { computed } from 'vue'
 import Amount from './Amount.vue'
 import RateChart from './RateChart.vue'
 import type { Pending, ProfileTest, Status, SysProxyLedger, SystemProxyStatus, TrafficSnapshot } from '../types'
-import { formatAgo, formatBytes, formatClock, formatRate, geoipText, policyClass, policyText, TUN_PHASE_TEXT, tunPhase } from '../format'
+import { formatAgo, formatBytes, formatClock, formatRate, geoipText, policyClass, policyText, recentlyFailed, TUN_PHASE_TEXT, tunPhase } from '../format'
 
 const props = defineProps<{
   status: Status
@@ -30,6 +30,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'restart'): void
   (e: 'reload'): void
+  /** 应急出口：解除代理（收回桌面指针 + 关端口），让机器立刻回到直连。 */
+  (e: 'unbind'): void
+  /** 解绑之后回到接管状态。 */
+  (e: 'rebind'): void
   (e: 'tun', enable: boolean): void
   (e: 'sysproxy', enable: boolean): void
   (e: 'ifaceSplit', enable: boolean): void
@@ -74,6 +78,13 @@ const lastFailureText = computed(() => {
   return props.traffic.totalFailed > 0 ? '最近一次已被历史缓冲挤出' : '本次还没有'
 })
 const tun = computed(() => props.status.tun)
+/**
+ * 「现在还在解析失败吗」——用最近一次失败的时刻判，不用累计数（理由见 recentlyFailed）。
+ * 窗口 2 分钟：够长，不会跟着轮询闪；够短，上游真挂着的时候它一定亮着。
+ */
+const dnsFailing = computed(
+  () => tun.value.running && recentlyFailed(tun.value.dnsFailedAt, 120_000, Date.now()),
+)
 const sys = computed(() => props.sys)
 const ifaceSplit = computed(() => props.status.ifaceSplit)
 const phase = computed(() => tunPhase(props.status.tun, props.pending.tun))
@@ -345,7 +356,10 @@ const split = computed(() => {
         <b>{{ stale ? '—' : traffic.activeCount }}</b>
         <span>活跃连接</span>
       </div>
-      <div class="stat">
+      <div
+        class="stat"
+        title="本进程经手搬过的字节：从 SOCKS5 / HTTP / TUN 进来的连接。选择性 TUN 下没进 tun 的直连流量不计入；它也不是系统网卡总流量。"
+      >
         <b><Amount :text="formatBytes(total)" /></b>
         <span>本次累计流量</span>
       </div>
@@ -369,6 +383,45 @@ const split = computed(() => {
         <span class="when">{{ lastFailureText }}</span>
       </button>
     </div>
+
+    <!-- 应急出口，刻意放在总览最上面：上不了网的人不会去翻卡片找开关。
+         "解绑"只解两样东西——桌面那根指向本程序的指针、以及入站端口；
+         节点、规则、配置文件一个字都不改。这句说明必须写清，
+         否则读的人会以为点一下把自己的配置清了，关键时刻反而不敢按。 -->
+    <section class="card">
+      <h2>
+        一键解绑
+        <span class="act">
+          <button
+            v-if="status.running"
+            type="button"
+            class="btn danger"
+            :disabled="idle"
+            title="收回桌面系统代理指针并关闭入站端口，流量立刻回到直连；节点与规则不动"
+            @click="emit('unbind')"
+          >
+            {{ busy === 'stop' ? '处理中…' : '解除代理' }}
+          </button>
+          <button
+            v-else
+            type="button"
+            class="btn primary"
+            :disabled="idle"
+            title="启动代理，并把桌面系统代理指针放回本机入站"
+            @click="emit('rebind')"
+          >
+            {{ busy === 'start' ? '处理中…' : '重新接管' }}
+          </button>
+        </span>
+      </h2>
+      <p class="hint tail">
+        {{
+          status.running
+            ? '代理正在接管。上不了网点「解除代理」：桌面代理指针会被收回、入站端口关掉，流量立刻走直连——节点与规则一个字都不改。'
+            : '当前已解绑：代理没在跑，桌面代理指针也已收回，流量走直连。要恢复就点「重新接管」。'
+        }}
+      </p>
+    </section>
 
     <section class="card">
       <h2>
@@ -452,8 +505,29 @@ const split = computed(() => {
              触屏、键盘操作和截图反馈都读不到 title，而"节点怎么自己变了"正是最需要解释的事。 -->
         <p v-if="status.autoSwitched" class="alert warn tail">
           {{ status.switchReason || '当前生效的节点是故障自动切换选出来的，但后端没给出理由——把这条当成缺陷来看。' }}
+          <span v-if="status.autoSwitchedAt" class="mut">
+            （切换发生在 {{ formatAgo(status.autoSwitchedAt) }}）
+          </span>
         </p>
         <p v-if="status.lastError" class="alert tail">{{ status.lastError }}</p>
+        <!-- 断网保护改变了「能不能上网」这件事本身，所以摆在首页而不是设置页里。
+             两条都要：挂上了要喊，装不上更要喊——后者是用户以为有、实际没有。 -->
+        <p v-if="status.tun.killArmed" class="alert warn tail">
+          故障断网保护已挂上：本机出站只放行节点、DNS 上游与本地网段，其余丢弃。
+          <span class="mut">节点恢复或你手动选点后会自动解除。</span>
+        </p>
+        <p v-else-if="status.tun.killEnabled && status.tun.killReason" class="alert warn tail">
+          故障断网保护未生效：{{ status.tun.killReason }}
+        </p>
+        <!-- 解析失败喊在版面上，而不是只留在设置页：它是"某些站打不开"最常见的原因，
+             又不会出现在连接表里（DNS 查询不是被转发的连接）。
+             不写清"只影响判成直连的域名"，用户会把"代理域名照常能开"当成代理坏了的证据。 -->
+        <p v-if="dnsFailing" class="alert warn tail">
+          本机 DNS 解析失败 {{ status.tun.dnsFailed }} 次：一个上游都没答上。
+          <span class="mut">
+            只影响判成直连的域名（代理域名领假 IP，本来就不做解析）；上游恢复后自己就好，不需要重启。
+          </span>
+        </p>
       </section>
 
       <section class="card">

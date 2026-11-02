@@ -165,12 +165,18 @@ const way = ref<Way | 'all'>('all')
 // 会把 tokyo.example.com 这种恰好带同名域名的直连也捞进来——
 // 用户点的是「各节点用量」那一行，他要的是**这个节点**名下的连接，一个不多。
 const onlyNode = ref('')
+// 「只看命中某条规则的连接」同一条理由：把规则原文塞进 kw 那个文本框，
+// 会连 host 里恰好带这段字的行一起捞出来，而点的人要的是"这条规则放行的那些"。
+const onlyRule = ref('')
 
 function matches(c: ConnView): boolean {
   if (way.value !== 'all' && wayOf(c) !== way.value) {
     return false
   }
   if (onlyNode.value !== '' && c.node !== onlyNode.value) {
+    return false
+  }
+  if (onlyRule.value !== '' && c.matched !== onlyRule.value) {
     return false
   }
   const k = kw.value.trim().toLowerCase()
@@ -208,7 +214,7 @@ const hiddenHistory = computed(() => Math.max(0, historyRows.value.length - hist
 
 // 筛选条件一变就把窗口收回去。留着"上一次点过全部画出"的状态，
 // 下一次进这一页又要整表重建，窗口等于白加。
-watch([kw, way, onlyNode], () => {
+watch([kw, way, onlyNode, onlyRule], () => {
   histWindow.value = HIST_WINDOW
 })
 
@@ -232,12 +238,15 @@ const tally = computed(() => {
   return t
 })
 
-const filtering = computed(() => kw.value.trim() !== '' || way.value !== 'all' || onlyNode.value !== '')
+const filtering = computed(
+  () => kw.value.trim() !== '' || way.value !== 'all' || onlyNode.value !== '' || onlyRule.value !== '',
+)
 
 function resetFilter(): void {
   kw.value = ''
   way.value = 'all'
   onlyNode.value = ''
+  onlyRule.value = ''
 }
 
 /**
@@ -247,6 +256,14 @@ function resetFilter(): void {
  */
 function filterByNode(node: string): void {
   onlyNode.value = onlyNode.value === node ? '' : node
+}
+
+/**
+ * 「按规则汇总」那一行的入口：点一行 = 只看命中这条规则的连接，再点一次取消。
+ * 合并行（folded）不接这个入口——它不是一条规则，点它筛不出任何东西。
+ */
+function filterByRule(rule: string): void {
+  onlyRule.value = onlyRule.value === rule ? '' : rule
 }
 
 /**
@@ -270,7 +287,7 @@ watch(
   { immediate: true }
 )
 
-defineExpose({ filterByNode })
+defineExpose({ filterByNode, filterByRule })
 </script>
 
 <template>
@@ -308,6 +325,15 @@ defineExpose({ filterByNode })
         @click="onlyNode = ''"
       >
         只看节点 {{ onlyNode }}（取消）
+      </button>
+      <button
+        v-if="onlyRule !== ''"
+        type="button"
+        class="btn sm ghost"
+        title="取消「只看命中这条规则」"
+        @click="onlyRule = ''"
+      >
+        只看命中 {{ onlyRule }}（取消）
       </button>
       <button v-if="filtering" type="button" class="btn sm ghost" @click="resetFilter">清除过滤</button>
     </div>

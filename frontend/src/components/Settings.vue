@@ -7,7 +7,7 @@
 import { computed, onMounted, ref } from 'vue'
 import type { BuildInfo, ConfigForm, InboundForm, Pending, Status, SysProxyLedger, SystemProxyStatus } from '../types'
 import { buildInfo, errorText, exportDiagnostics, exportLogs, readConfig, saveConfig } from '../api'
-import { TUN_PHASE_TEXT, tunPhase } from '../format'
+import { TUN_PHASE_TEXT, formatClock, tunPhase } from '../format'
 
 const props = defineProps<{
   status: Status
@@ -349,6 +349,11 @@ onMounted(load)
             <span class="track" aria-hidden="true"></span>
             <span>接管默认路由（进阶，需 route_exclude 配合）</span>
           </label>
+          <label class="switch">
+            <input v-model="form.tun.killSwitch" type="checkbox" />
+            <span class="track" aria-hidden="true"></span>
+            <span>故障断网保护（切换放弃时只放行节点，其余丢弃）</span>
+          </label>
           <span class="grow"></span>
           <label class="switch">
             <input
@@ -376,6 +381,11 @@ onMounted(load)
           <dd>
             在册 {{ tun.fakeIps }} 条 · 已应答 DNS {{ tun.dnsServed }} 次 · 活跃 {{ tun.active }} 条
             <span class="mut">（假 IP 大于 0 说明 DNS 劫持确实在工作）</span>
+            <div v-if="tun.dnsFailed > 0" class="mut">
+              另有 {{ tun.dnsFailed }} 次回了 SERVFAIL：一个上游都没答上。
+              只有判成直连的域名才会真去解析，所以这些失败对应的是直连域名——
+              代理域名领假 IP，本来就不做解析，也不会算进这两个数
+            </div>
           </dd>
           <dt>已执行</dt>
           <dd class="mono">{{ (tun.applied ?? []).join(' → ') || '—' }}</dd>
@@ -390,10 +400,72 @@ onMounted(load)
             已启用但没装上
             <span class="mut">（多半是内核未加载 ip6table_nat；AAAA 回 NODATA，应用退回 A 记录）</span>
           </dd>
+          <dt>接管范围</dt>
+          <dd v-if="!tun.strictRoute">
+            未接管默认路由
+            <span class="mut">（只接管判成走代理的假 IP；直连真 IP 的流量绕开 tun）</span>
+          </dd>
+          <dd v-else-if="!tun.running">
+            计划接管默认路由<span class="mut">（TUN 未运行，尚未生效）</span>
+          </dd>
+          <dd v-else>
+            IPv4 {{ tun.takeoverV4 ? '已接管' : '未接管' }} · IPv6 {{ tun.takeoverV6 ? '已接管' : '未接管' }}
+            <span class="mut">
+              （跟着网络监视器每 5 秒问一次内核：默认路由此刻到底交给了谁；ICMP 等非 TCP/UDP 流量不走这条路）
+            </span>
+            <!-- 读不到路由表时那两格退回进程记忆——必须说出来，不能冒充实测：
+                 「我们装过」与「现在还在」在 DHCP 抢回路由的那一刻是两句话。 -->
+            <div v-if="tun.takeoverFrom === 'memory'" class="mut">
+              读不到本机路由表，以上两格是按本进程装过的东西推的，不是实测
+            </div>
+            <div v-if="tun.takeoverV4 && !tun.takeoverV6" class="mut">
+              IPv6 流量仍走物理出口，没有进隧道
+            </div>
+            <div v-if="tun.routeFixes > 0" class="mut">
+              网络变化后自动重钉过绕行路由 {{ tun.routeFixes }} 次（最近一次
+              {{ formatClock(tun.lastRouteFix) }}）
+            </div>
+          </dd>
+          <dt>故障断网保护</dt>
+          <dd v-if="!tun.killEnabled">
+            未启用
+            <span class="mut">（tun.kill_switch: false；自动切换放弃时出站不会被收窄）</span>
+          </dd>
+          <!-- 开了但注定装不上：这必须在设置时就看清，不能等故障那天才发现闸门根本没落下 -->
+          <dd v-else-if="!tun.strictRoute" class="warn">
+            已启用，但不会生效
+            <span class="mut">（只在接管默认路由时有意义：选择性 TUN 里直连本来就该出去）</span>
+          </dd>
+          <dd v-else-if="tun.killArmed" class="warn">
+            已挂上<span class="mut">（本机生成的出站只放行节点、DNS 上游与本地网段）</span>
+            <div class="mut">
+              IPv4 {{ tun.killV4 ? '已收住' : '未收住' }} · IPv6
+              {{ tun.killV6 ? '已收住' : '未收住' }}
+            </div>
+            <div v-if="tun.killReason" class="mut">{{ tun.killReason }}</div>
+          </dd>
+          <!-- 触发过又没装上：界面必须说「未生效」，不能显示成一道开着的保护 -->
+          <dd v-else-if="tun.killReason" class="warn">
+            未生效<span class="mut">（{{ tun.killReason }}）</span>
+          </dd>
+          <dd v-else>
+            已启用，等待故障触发
+            <span class="mut">（自动切换判定「没有一个节点能用」时才会挂上；节点通了或你手动换点即解除）</span>
+          </dd>
         </dl>
         <p class="hint">
           工作方式：判成走代理的域名，DNS 直接回一个假 IP，应用连假 IP 时才进 tun；
           判成直连的域名回真 IP，流量根本不进 tun——直连不绕路，也不会自环。
+        </p>
+        <p class="hint">
+          能力边界：只转发 TCP/UDP。ICMP（ping）等其它协议不进隧道，IPv4 与 IPv6 都一样，
+          而且全局接管下本机协议栈会替 echo request 应答——ping 得通不代表对端真的可达，
+          也别用它判断隧道状态；组播与链路本地的邻居发现仍走物理网卡（接管只改默认路由，
+          这类地址命中的是直连路由和本地表），回环与广播走内核本地路由，
+          route_exclude 里的网段钉回物理网关；
+          UDP 只有 hysteria2 节点带得动——trojan 是 TCP 协议，直连（DIRECT）也不发 UDP，
+          这两条路都会明确拒绝并在流量页留一行带原因的记录（UDP 传不回错误给应用，这是本机唯一的说明）；
+          DoH 或直接用 IP 的流量即使进了 tun 也可能没有域名信息，域名规则命中不了。
         </p>
       </section>
 

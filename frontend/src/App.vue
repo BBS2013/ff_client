@@ -65,6 +65,7 @@ const EMPTY_STATUS: Status = {
   profiles: [],
   activeProfile: '',
   autoSwitched: false,
+  autoSwitchedAt: 0,
   ifaceSplit: {
     enabled: false,
     active: false,
@@ -85,13 +86,25 @@ const EMPTY_STATUS: Status = {
     fakeIps: 0,
     active: 0,
     dnsServed: 0,
+    dnsFailed: 0,
+    dnsFailedAt: 0,
     startedAt: 0,
     lastError: '',
     applied: [],
     privilege: '',
     helperCmd: [],
     ipv6: false,
-    v6Ready: false
+    v6Ready: false,
+    takeoverV4: false,
+    takeoverV6: false,
+    takeoverFrom: '',
+    routeFixes: 0,
+    lastRouteFix: 0,
+    killEnabled: false,
+    killArmed: false,
+    killV4: false,
+    killV6: false,
+    killReason: ''
   },
   startedAt: 0,
   uptimeMs: 0,
@@ -121,6 +134,7 @@ const EMPTY_TRAFFIC: TrafficSnapshot = {
   active: [],
   history: [],
   byNode: [],
+  byRule: [],
   series: [],
   recentBlocked: [],
   priorSince: 0,
@@ -491,6 +505,16 @@ async function act(name: string, fn: () => Promise<void>, done: string, p: Parti
 
 const onStart = (): Promise<void> => act('start', startProxy, '已启动代理。')
 const onStop = (): Promise<void> => act('stop', stopProxy, '已停止代理，桌面代理指针已收回，流量走直连。')
+/**
+ * 应急出口（总览页「一键解绑」）：走的是与「停止代理」同一条后端路径，
+ * 差别只在提示语——上不了网的人正盯着"桌面指针收回没有"这件事，
+ * 所以这句要把它写出来，而不是只说"已停止"。
+ */
+const onUnbind = (): Promise<void> =>
+  act('stop', stopProxy, '已解绑：桌面代理指针已收回、入站端口已关闭，现在走直连；节点与规则没动。')
+/** 解绑之后回到接管状态：启动代理，并按需把桌面指针放回去。 */
+const onRebind = (): Promise<void> =>
+  act('start', startProxy, '已重新接管：代理已启动，桌面代理指针已放回。')
 const onRestart = (): Promise<void> => act('restart', restartProxy, '已重启代理。')
 const onReload = (): Promise<void> => act('reload', reloadRules, '已重载规则。')
 const onReset = (): Promise<void> =>
@@ -839,6 +863,8 @@ onBeforeUnmount(() => {
             :stale="staleAt !== ''"
             @restart="onRestart"
             @reload="onReload"
+            @unbind="onUnbind"
+            @rebind="onRebind"
             @tun="onTUN"
             @sysproxy="onSysProxy"
             @iface-split="onIfaceSplit"

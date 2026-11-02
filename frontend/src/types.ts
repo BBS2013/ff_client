@@ -26,6 +26,12 @@ export interface ProfileView {
   quotaBytes: number
   /** 人写下来的那句原文（"1.5TiB"）。界面用它说话，用 quotaBytes 算数 */
   quotaText: string
+  /**
+   * 自动切换给这个节点设的冷却到期时刻（Unix 毫秒），0 = 不在冷却里。
+   * 只约束自动切换：手动选它永远有效。不说清的话，用户手动选回一个还在冷却的节点，
+   * 下一次自动切换又把它切走，看起来像「程序不听我的」。
+   */
+  coolingUntil: number
 }
 
 /** 新增/修改节点时提交的表单。auth 留空表示沿用磁盘上的原值；type 留空同理。 */
@@ -63,6 +69,40 @@ export interface ProfileTest {
   page: string
   /** 没取到：失败原文。与 page 互斥，界面上靠它分出「通」和「电路通但页面取不回」。 */
   pageErr: string
+  /**
+   * 非空 = 这次测速的代理流量没有按普通方式钉在点名的网卡上，内容是分流给出的原因
+   * （普通进程钉不上、由提权 helper 代劳……）。「节点不通」和「我根本没走到那张卡上」
+   * 是两种要做不同决定的红。
+   */
+  splitNote: string
+  /**
+   * 到节点那一条连接实际用的源地址（如 192.168.0.104）。
+   * 只有 TCP 系（trojan）给得出：它是内核回读的事实，不是我们的意图——
+   * 主机路由、策略路由、helper 代劳钉卡，各种情形下它都说得对。
+   * hysteria2 给不出来（QUIC 流的 LocalAddr 是伪地址，会写成服务器 IP），
+   * 那一族走 hopDev。
+   */
+  hopAddr: string
+  /**
+   * 隧道 socket 实际钉住的设备名（如 wlx001f0578cdff）。
+   *
+   * trojan（TCP）这边它是从 socket 自己身上回读的（SO_BINDTODEVICE 的现值），
+   * 与 `ss` 里那个 %dev 后缀同源，所以会和 hopAddr 一起出现，拼成「源地址%设备」；
+   * hysteria2（QUIC）拿不到源地址（LocalAddr 是伪地址），只剩这一个说得出口。
+   * 都没有就留空，那一句整句不显示——没证据就闭嘴，别拿"打算绑哪张卡"顶替。
+   */
+  hopDev: string
+}
+
+export interface RuleTraffic {
+  /** 引擎写下的命中依据原文，与连接表「命中」那一列是同一个字符串 */
+  rule: string
+  up: number
+  down: number
+  /** 真的搬过字节的连接数。与规则页的「命中次数」不是一个口径：那个含被拦与拨不通的 */
+  conns: number
+  /** 非零表示这一行合了多少条规则（只出现在最后一行）；0 就是单独一条 */
+  folded?: number
 }
 
 export interface TUNStatus {
@@ -77,6 +117,14 @@ export interface TUNStatus {
   fakeIps: number
   active: number
   dnsServed: number
+  /**
+   * 回了 SERVFAIL 的查询数（一个上游都没答上）。
+   * 与 dnsServed 分开是有意的：以前失败也计进"已应答"，
+   * 上游全挂时那个数照样涨，而它的用途正是证明劫持在工作。
+   */
+  dnsFailed: number
+  /** 最近一次解析失败的时刻（Unix 毫秒），0 表示还没发生过。界面上"现在还在失败吗"靠它，不靠累计数。 */
+  dnsFailedAt: number
   startedAt: number
   lastError: string
   applied: string[]
@@ -88,6 +136,28 @@ export interface TUNStatus {
   ipv6: boolean
   /** v6 那一组命令是否真的装上了；ipv6 为 true 而它是 false 时 AAAA 回 NODATA */
   v6Ready: boolean
+  /** IPv4 默认路由是否真的交给了 tun（全局接管） */
+  takeoverV4: boolean
+  /** IPv6 默认路由是否真的交给了 tun。false 时 v6 流量绕开隧道，仍走物理出口 */
+  takeoverV6: boolean
+  /**
+   * 上面两格的来源：kernel 是刚问过路由表，memory 是问不到（只能按进程记忆推），
+   * not-running 是 TUN 根本没在跑。界面对 memory 这一档必须明说不是实测。
+   */
+  takeoverFrom: string
+  /** 网络变化后重钉绕行路由的次数；不为 0 说明「换网之后自己恢复了」 */
+  routeFixes: number
+  /** 上一次重钉的时刻（Unix 毫秒），0 表示还没发生过 */
+  lastRouteFix: number
+  /** 用户有没有开故障断网保护（tun.kill_switch）。它和 killArmed 是两件事 */
+  killEnabled: boolean
+  /** 保护此刻是否真的挂在网上 */
+  killArmed: boolean
+  /** 两族各自有没有被保护住：只护住一半是常态，必须分开报 */
+  killV4: boolean
+  killV6: boolean
+  /** 没挂上（或只挂上一族）的原因；killEnabled 为真而这里非空 = 用户以为有、实际没有 */
+  killReason: string
 }
 
 export interface SystemProxyStatus {
@@ -169,6 +239,12 @@ export interface Status {
   autoSwitched: boolean
   /** 自动切换的理由，未自动切换时为空 */
   switchReason?: string
+  /**
+   * 上一次自动切换发生的时刻（Unix 毫秒），0 = 本次运行没切过。
+   * 光有 autoSwitched 那个布尔值不够：用户要判断的是「刚才那下是不是它干的」，
+   * 那需要一个时间戳去和现象对齐。
+   */
+  autoSwitchedAt: number
   tun: TUNStatus
   ifaceSplit: IfaceSplitStatus
   /** Unix 毫秒，未运行时为 0 */
@@ -268,6 +344,8 @@ export interface TrafficSnapshot {
   totalDown: number
   /** 各去处本次用掉的字节，按**累计**降序；被拦的不占行（零字节只会稀释这张表） */
   byNode: NodeTraffic[]
+  /** 字节记在哪条命中依据名下，按量降序；行数有上限，超出部分折进最后一行（folded） */
+  byRule: RuleTraffic[]
   /**
    * 跨重启那份账的起点，Unix 毫秒；0 = 没有累计。
    * 「累计也清零」会把它拨到当下，于是这一栏读作"自 X 起累计"。
@@ -314,6 +392,8 @@ export interface TUNForm {
   hijackDns: boolean
   strictRoute: boolean
   routeExclude: string[]
+  /** 故障断网保护：默认关闭，只在 strictRoute 下有意义 */
+  killSwitch: boolean
 }
 
 export interface ConfigForm {

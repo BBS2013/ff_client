@@ -9,6 +9,7 @@ import {
   modeText,
   policyClass,
   policyText,
+  recentlyFailed,
   splitAmount,
   trimHost,
   tunPhase,
@@ -148,5 +149,40 @@ describe('policyText / modeText / policyClass', () => {
     expect(policyClass('REJECT')).toBe('warn')
     expect(policyClass('')).toBe('mut')
     expect(policyClass('FUTURE')).toBe('mut')
+  })
+})
+
+describe('recentlyFailed', () => {
+  const WINDOW = 120_000
+
+  it('窗口内算"还在失败"，窗外就不算', () => {
+    const now = 1_700_000_000_000
+    expect(recentlyFailed(now - 60_000, WINDOW, now)).toBe(true)
+    expect(recentlyFailed(now - 119_999, WINDOW, now)).toBe(true)
+    // 边界写成"不到"：正好满两分钟的那一刻，告警该撤
+    // （否则"最后一次失败"这个时刻会一直亮着，直到有人再看一眼时钟）。
+    expect(recentlyFailed(now - 120_000, WINDOW, now)).toBe(false)
+    expect(recentlyFailed(now - 600_000, WINDOW, now)).toBe(false)
+  })
+
+  it('没有这个时刻、非有限值都不亮红灯', () => {
+    // 0 是后端"本次还没失败过"的写法；把它当"1970 年失败过"来判就是假告警。
+    expect(recentlyFailed(0, WINDOW, 1_700_000_000_000)).toBe(false)
+    expect(recentlyFailed(-5, WINDOW, 1_700_000_000_000)).toBe(false)
+    expect(recentlyFailed(Number.NaN, WINDOW, 1_700_000_000_000)).toBe(false)
+    expect(recentlyFailed(1_700_000_000_000, WINDOW, Number.NaN)).toBe(false)
+  })
+
+  it('未来的时刻不算"刚刚失败"', () => {
+    // 手动改过系统时钟、或者两端取时刻的先后不一致时会出现。
+    // 一个还没发生的失败不该亮红灯——这条没有判据的话，用户会去查一个不存在的问题。
+    const now = 1_700_000_000_000
+    expect(recentlyFailed(now + 10_000, WINDOW, now)).toBe(false)
+  })
+
+  it('窗口本身不合法时按"不亮"处理', () => {
+    const now = 1_700_000_000_000
+    expect(recentlyFailed(now - 1, 0, now)).toBe(false)
+    expect(recentlyFailed(now - 1, -1, now)).toBe(false)
   })
 })

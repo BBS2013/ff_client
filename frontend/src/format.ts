@@ -98,6 +98,24 @@ export function formatAgo(ms: number): string {
   return `${Math.floor(s / 86400)} 天前`
 }
 
+/**
+ * 「这个失败时刻还算最近吗」——界面上那句"现在还在失败"的判据。
+ *
+ * 为什么不拿累计计数当告警条件：一次抖动留下的计数会一直亮到重启，
+ * 而那种告警教给用户的不是排查，是忽略它。
+ * now 由调用方传进来，是为了这条判据能在测试里对着一个假时钟反复演——
+ * 面板是软件光栅画的，不能靠"看上去对了"就当它已验过。
+ *
+ * 未来的时刻（时钟被改过）回 false：一个还没发生的失败不该亮红灯。
+ */
+export function recentlyFailed(at: number, withinMs: number, now: number): boolean {
+  if (!isFinite(at) || at <= 0 || !isFinite(now) || !isFinite(withinMs) || withinMs <= 0) {
+    return false
+  }
+  const age = now - at
+  return age >= 0 && age < withinMs
+}
+
 /** 去掉 IPv6 的方括号，让表格窄一点 */
 export function trimHost(host: string): string {
   if (!host) {
