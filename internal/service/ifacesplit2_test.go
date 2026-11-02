@@ -408,7 +408,7 @@ func TestEgressBlockedPrefersBindChannel(t *testing.T) {
 	s := &Service{cfg: &config.Config{
 		Active:  "n",
 		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
-		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Type: config.ProtocolTrojan, Addr: "example.com:8443"}}},
 	}}
 	why, useBind := s.egressBlockedWhy("wlx001f0578cdff", "example.com:8443", "代理", s.cfg)
 	if !useBind {
@@ -431,7 +431,7 @@ func TestApplyPlanKeepsPinWhenBindAvailable(t *testing.T) {
 	s := &Service{split: sp, ifaceSplit: IfaceSplitStatus{Note: "上一轮的说明"}, cfg: &config.Config{
 		Active:  "n",
 		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
-		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Type: config.ProtocolTrojan, Addr: "example.com:8443"}}},
 	}}
 	eff, err := s.applyPlan(splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, true, "example.com:8443")
 	if err != nil {
@@ -449,8 +449,8 @@ func TestApplyPlanKeepsPinWhenBindAvailable(t *testing.T) {
 // 而"发不出包"很容易被读成"那张卡坏了"——实际坏的是普通进程去钉这一层。
 // 这条用例盯住"同一个事实同一句话"。
 func TestBindViaHelperNoteIsTheOnlyWording(t *testing.T) {
-	note := bindViaHelperNote("代理", "wlx001f0578cdff", "钉在 wlx001f0578cdff 上拨 x 不通，不钉时却拨得通")
-	for _, want := range []string{"面板自己（普通权限）", "wlx001f0578cdff", "提权 helper 代劳", "代理仍然钉在这张卡"} {
+	note := bindViaHelperNote(config.ProtocolTrojan, "代理", "wlx001f0578cdff", "钉在 wlx001f0578cdff 上拨 x 不通，不钉时却拨得通")
+	for _, want := range []string{"分流没有退回默认路由", "面板自己（普通权限）", "wlx001f0578cdff", "提权 helper 代劳", "代理仍然钉在这张卡"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("这句话里少了 %q: %q", want, note)
 		}
@@ -459,9 +459,14 @@ func TestBindViaHelperNoteIsTheOnlyWording(t *testing.T) {
 		t.Fatalf("带上事实时也要留着它: %q", note)
 	}
 	// 不带事实时句子仍然完整（测速那格放得下短版）。
-	short := bindViaHelperNote("代理", "wlx001f0578cdff", "")
+	short := bindViaHelperNote(config.ProtocolTrojan, "代理", "wlx001f0578cdff", "")
 	if !strings.Contains(short, "提权 helper 代劳") || strings.Contains(short, "不通") {
 		t.Fatalf("短版也要说清谁代劳: %q", short)
+	}
+	// hysteria2 的 QUIC 在面板进程里自己钉，不能写成 helper 代劳。
+	hys := bindViaHelperNote(config.ProtocolHysteria2, "代理", "wlx001f0578cdff", "")
+	if !strings.Contains(hys, "QUIC socket") || strings.Contains(hys, "提权 helper") {
+		t.Fatalf("hysteria2 应当说 QUIC 自钉、不是 helper 代劳: %q", hys)
 	}
 }
 
@@ -497,7 +502,7 @@ func TestSettleEgressKeepsBothPinsViaBindChannel(t *testing.T) {
 	s := &Service{cfg: &config.Config{
 		Active:  "n",
 		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
-		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Type: config.ProtocolTrojan, Addr: "example.com:8443"}}},
 	}}
 	plan, bindDirect, bindProxy, notes := s.settleEgress(
 		splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, "example.com:8443", s.cfg)

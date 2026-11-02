@@ -460,7 +460,7 @@ type ProfileTest struct {
 // 以及给两类"看着像节点坏了"的读数加一句可核对的原因（见 annotateNodeFault）。
 func (s *Service) TestProfile(name, target string) ProfileTest {
 	res := s.testProfileCore(name, target)
-	note := s.splitCaveat()
+	note := s.splitCaveat(s.profileProtocol(name))
 	if !s.IfaceSplitStatus().Enabled && (res.Error != "" || res.PageErr != "") {
 		// 分流没开 + 这次不通 = 代理流量走的是系统默认路由。这两句要一起说，
 		// 因为"证书不受信"最常见的成因就是出口上有人替换证书（2026-10-30 实测）。
@@ -472,9 +472,29 @@ func (s *Service) TestProfile(name, target string) ProfileTest {
 	return res
 }
 
-// splitCaveat 是「这次测速的代理流量并没有真的从点名的网卡出去」那句话说；
-// 分流正常、没开或还没启动时给空串。
-func (s *Service) splitCaveat() string {
+// profileProtocol 返回这次测速的节点协议。测速不一定针对当前活动节点，
+// 所以不能拿 ActiveServer 的类型代替；配置读不到时给空串，走通用措辞。
+func (s *Service) profileProtocol(name string) string {
+	cfg := s.currentCfg()
+	if cfg == nil {
+		loaded, err := config.Load(s.cfgPath)
+		if err != nil {
+			return ""
+		}
+		cfg = loaded
+	}
+	for _, p := range cfg.Proxies {
+		if p.Name == name {
+			return p.Server.Protocol()
+		}
+	}
+	return ""
+}
+
+// splitCaveat 是「这次测速的代理流量怎么钉卡」那句话说；
+// 分流正常、没开或还没启动时给空串。proto 是这次被测节点的协议：
+// hysteria2 的 QUIC 由面板自己钉，trojan 的 TCP 才走提权 helper。
+func (s *Service) splitCaveat(proto string) string {
 	st := s.IfaceSplitStatus()
 	if !st.Enabled {
 		return ""
@@ -484,7 +504,7 @@ func (s *Service) splitCaveat() string {
 		// 这件事要说出来：否则界面上一句"已生效"会让人以为普通绑定是好的。
 		if dev := st.ProxyDev; dev != "" {
 			if s.bindChannel() != nil && s.egressBindNeeded(dev) {
-				return bindViaHelperNote("代理", dev, "")
+				return bindViaHelperNote(proto, "代理", dev, "")
 			}
 		}
 		return ""

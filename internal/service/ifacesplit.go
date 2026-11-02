@@ -126,7 +126,11 @@ func (s *Service) egressBlockedWhy(dev, addr, what string, cfg *config.Config) (
 		// 这句话必须把"谁绑不上"说清楚：钉不上的是**普通权限的那个进程**，
 		// 不是这张卡——同一张卡上 helper 造出来的 socket 跑得好好的。
 		// 写成"发不出包"会被读成"这张卡坏了"，而实际要处理的是权限那一层。
-		return bindViaHelperNote(what, dev, v.fact), true
+		proto := ""
+		if cfg != nil {
+			proto = cfg.ActiveServer().Protocol()
+		}
+		return bindViaHelperNote(proto, what, dev, v.fact), true
 	}
 	return fmt.Sprintf("开关已打开，但钉上发不出包（%s）——%s这一侧退回系统默认路由，没有真的换到这张卡", v.fact, what), false
 }
@@ -296,12 +300,20 @@ func (s *Service) currentCfg() *config.Config {
 // 去钉这一层。fact 是探针那句话（可空）：长句放得下的地方就带上。
 // what 是"代理"还是"直连"：两侧的病可以不一样（2026-10-30 实测直连那一侧同样被
 // 静默丢包，而探针以前只问代理侧），所以这句话必须说清是哪一侧换了人做。
-func bindViaHelperNote(what, dev, fact string) string {
-	out := fmt.Sprintf("面板自己（普通权限）钉在 %s 上发不出包", dev)
+//
+// proto 决定"谁代劳"：trojan/直连是 TCP，走提权 helper；hysteria2 的 QUIC
+// 由 ProxyConnFactory 在面板进程里自己钉，不能也写成 helper 代劳——那会让
+// 用户按 helper 去查一个根本没参与这条隧道的进程。
+func bindViaHelperNote(proto, what, dev, fact string) string {
+	out := fmt.Sprintf("分流没有退回默认路由：面板自己（普通权限）直接钉 %s 会被静默丢包", dev)
 	if fact != "" {
 		out += "（" + fact + "）"
 	}
-	return out + fmt.Sprintf("：这台机器上普通进程的绑定返回成功却发不出线，所以这一跳交给提权 helper 代劳，%s仍然钉在这张卡", what)
+	if proto == config.ProtocolHysteria2 && what == "代理" {
+		return out + fmt.Sprintf("；hysteria2 的 QUIC socket 由面板自己钉在这张卡上（可用 ss -unpa 核对），"+
+			"%s仍然走 %s", what, dev)
+	}
+	return out + fmt.Sprintf("；已交给提权 helper 代劳，%s仍然钉在这张卡", what)
 }
 
 // activeAddrOf 取当前选中节点的地址，作为分流探针的拨号目标。
