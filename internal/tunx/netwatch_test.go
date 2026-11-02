@@ -293,3 +293,22 @@ func TestRepinFailureKeepsOldPlan(t *testing.T) {
 		t.Errorf("失败后却把计划改成新的: %+v", tun.plan)
 	}
 }
+
+// TestRepinRoutesNonStrictDoesNothing 守住 2026-11-02 那个回归：
+// 非 strict 的 TUN 也会跑网络监视；第一轮拿到物理网关后，RepinRoutes
+// 会把 newPlan 当成“可用”，补一条 default dev wps-tun。结果所有 IPv4
+// 连同本进程发往 dns.servers 的查询都进 tun，DNS 全部超时。
+func TestRepinRoutesNonStrictDoesNothing(t *testing.T) {
+	old := RoutePlan{Device: "wps-tun", StrictRoute: false}
+	newer := old
+	newer.Gateway = "192.168.1.1"
+	newer.Interface = "wlp3s0f0"
+	newer.Gateway6 = "fe80::5"
+	newer.Interface6 = "wlp3s0f0"
+	newer.Exclude = []string{"192.168.5.1/32", "2001:db8::1/128"}
+
+	up, cleanup := newer.RepinRoutes(old)
+	if len(up) != 0 || len(cleanup) != 0 {
+		t.Fatalf("非 strict 不该重钉任何路由，got up=%v cleanup=%v", up, cleanup)
+	}
+}

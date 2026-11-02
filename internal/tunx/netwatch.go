@@ -173,6 +173,13 @@ func (p RoutePlan) usable6() bool { return p.Gateway6 != "" && p.Interface6 != "
 // 组播那条不用 replace：内核自己可能也有一条 224.0.0.0/4，
 // replace 会把内核那条一起顶掉——那是动别人的东西。
 func (p RoutePlan) RepinRoutes(old RoutePlan) (up, cleanup []Cmd) {
+	// 非严格模式没有接管默认路由，也就没有绕行路由可重钉。
+	// 这里必须同时看新旧两份：监视器拿到新网关后 newPlan 会“变得可用”，
+	// 只判 p.StrictRoute 仍可能漏；只判 old.StrictRoute 则配置从 strict 切到
+	// 非 strict 的那一轮会留下默认路由。两边都是 false 才算真正的选择性 TUN。
+	if !p.StrictRoute || !old.StrictRoute {
+		return nil, nil
+	}
 	exclude4, exclude6 := splitExclude(p.Exclude)
 
 	if p.usable4() {
@@ -256,7 +263,11 @@ func (t *TUN) initNetWatch(plan RoutePlan) {
 // 只在 strict_route 下起：没有接管默认路由就没有「钉在旧网关上的绕行路由」，
 // 也就没有需要重钉的东西。
 func (t *TUN) startNetWatchLocked() {
-	if t.watchCancel != nil {
+	// 选择性 TUN 不接管默认路由，没有绕行路由要跟；跑这条循环反而会在
+	// 第一轮把 newPlan.Gateway 填上、随后补一条 `default dev wps-tun`——
+	// 2026-11-02 现场：非 strict 启动 5 秒后默认路由自己长回来，DNS 上游
+	// 全部超时、直连域名退成 FINAL(dns-failed)。
+	if !t.conf.StrictRoute || t.watchCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
