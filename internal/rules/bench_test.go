@@ -19,11 +19,14 @@ func realRules(t testing.TB) (string, string) {
 	t.Helper()
 	rulesFile := filepath.Join("..", "..", "assets", "rules.txt")
 	geoFile := filepath.Join("..", "..", "assets", "geoip.mmdb")
-	if _, err := os.Stat(rulesFile); err != nil {
-		t.Fatalf("找不到 %s：这组基准量的是真规则集，缺文件时必须响（cwd=%s）", rulesFile, func() string {
+	// 两个文件都必须在场：rules.txt 随仓库走，geoip.mmdb 因许可不能入库（见 .gitignore）。
+	// 缺文件时仍然判失败——这组基准量的是真规则集，静默跳过等于把性能闸关掉；
+	// 但报错必须告诉人怎么补，而不是只给一句 open: no such file。
+	for _, p := range []string{rulesFile, geoFile} {
+		if _, err := os.Stat(p); err != nil {
 			cwd, _ := os.Getwd()
-			return cwd
-		}())
+			t.Fatalf("找不到 %s：先运行 ./scripts/fetch-assets.sh（cwd=%s）", p, cwd)
+		}
 	}
 	return rulesFile, geoFile
 }

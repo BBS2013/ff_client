@@ -375,12 +375,17 @@ func TestLoadRejectsUnknownNestedField(t *testing.T) {
 }
 
 // TestRealExampleConfigsStillLoad 开 KnownFields 的前提是它不误伤。
-// 仓库里的两个真实配置样例必须都能加载，否则等于把所有用户都挡在门外。
+//
+// config.example.yaml 是随仓库分发的样例，必须在任何检出的机器上都能加载；
+// config.yaml 是本机运行期文件（被 .gitignore 排除，干净检出里根本不存在），
+// 存在时顺手验一遍，不存在时不能把它当成“样例缺失”判红。
 func TestRealExampleConfigsStillLoad(t *testing.T) {
-	for _, p := range []string{
-		filepath.Join("..", "..", "config.example.yaml"),
-		filepath.Join("..", "..", "config.yaml"),
-	} {
+	paths := []string{filepath.Join("..", "..", "config.example.yaml")}
+	local := filepath.Join("..", "..", "config.yaml")
+	if _, err := os.Stat(local); err == nil {
+		paths = append(paths, local)
+	}
+	for _, p := range paths {
 		if _, err := Load(p); err != nil {
 			t.Errorf("%s 加载失败（KnownFields 误伤了合法键）: %v", p, err)
 		}
