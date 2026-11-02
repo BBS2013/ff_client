@@ -48,6 +48,20 @@ type Service struct {
 	// 各自 Save，后写的把前一个的改动连同 .bak 一起抹掉。
 	cfgMu sync.Mutex
 
+	// killMu 串行化故障断网保护的挂与摘。
+	// 一轮故障里每一次拨号失败都会想挂一次（成因见 roundCooldown），而每次挂载
+	// 都要付一趟 helper 往返；挂到一半被另一次挂载插进来，留下的就是半条链。
+	killMu sync.Mutex
+	// killOp 是故障断网保护的执行面。生产时它就是那块 TUN；测试里换成记账的假人：
+	// 服务层要验的是「什么时候该动闸门」，而 iptables 该长成什么样在 tunx 那层已经测过了。
+	// 与 s.tun 同生同灭（见 tun.go 的三处赋值），不留两份真相。
+	killOp killSwitch
+	// killAllowKey 是上一次真正挂上去的那份白名单。只在 killMu 下读写。
+	// 留着它是为了「名单变了才重挂」：白名单没变时重挂只是闪断一次放行，
+	// 而名单变了（多半是某个节点的域名终于解析出来了）就必须重挂——
+	// 否则那个节点会一直被自己的保护拦在外面，恢复无路。
+	killAllowKey string
+
 	// diskMu 只保护下面这三个磁盘配置缓存字段，与 mu 无关：
 	// Snapshot/Mode/TUNStatus 是面板每秒轮询的热点，它们读文件时不能占着 mu。
 	diskMu      sync.Mutex
@@ -110,6 +124,13 @@ type Service struct {
 	// switchedAt 是上一次自动切节点的时间，用于迟滞：
 	// 每次切换都会掐掉旧隧道上正在传的连接，绝不能来回切。
 	switchedAt time.Time
+	// switchReason 是切换当时就定稿的理由，写在 commitFailover 里。
+	//
+	// 不能等出快照时再数：失败流水只留 faultWindow（2 分钟），而界面读数的
+	// 典型时刻是切换之后好几分钟——那时窗口早滑过去了，再数必然是
+	// 「0 次节点级失败（涉及 0 个不同目标）」。这句话是界面上唯一能回答
+	// 「它为什么自己动了」的东西，填个 0 等于没答。
+	switchReason string
 	// cooling 里的节点在到期前不会被自动切上去（含刚被放弃的那一个）。
 	cooling map[string]time.Time
 	// failoverBusy 是「这一轮自动切换正在跑」的标记，理由见 tryFailover 头上的单飞说明。
@@ -135,8 +156,19 @@ type Service struct {
 	// ifaceSplit 记着「这台机器上两张无线各叫什么」，即使探测不到两张也要留着理由，
 	// 面板得能说清「开关是开的，但没生效，因为只有一张无线」。
 	ifaceSplit IfaceSplitStatus
+	// splitBind 记着上一次落地时**两侧各自**有没有走特权通道。它在幂等比较里：
+	// 少了它，"helper 中途才出现"这一转会因为两张卡名字没变而被早退吞掉，
+	// 于是界面说走了通道、实际还在自己绑（也就是还在被静默丢包）。
+	splitBind [2]bool
 	// ifaceSeen 是监视循环上一轮看到的解析结果，用来判断网卡的变化是否已经落定。
 	ifaceSeen splitPick
+	// dialHelper 是常驻提权 helper（造钉住网卡的 socket）；面板退出时要把它收掉。
+	dialHelper *tunx.PersistentHelper
+	// egressVerdict 记着每个「网卡|拨号目标」组合探出来的结论（空串=发得出包，
+	// 非空=降级理由）。同一个组合只探一次：判成降级会重建隧道，而 commitProxy 在
+	// strict_route 下会回头再走一遍装配，装配又探一次、又判降级——那是个循环。
+	// 想重新探：拨一次开关或改一次点名（见 clearEgressVerdict）。
+	egressVerdict map[string]egressVerdict
 	// ifaceCards 是最近一次探测到的全部无线卡，供界面的下拉列可选项。
 	ifaceCards []IfaceCardView
 	// ifaceWatchCancel 停掉网卡监视循环。见 ifacewatch.go。
@@ -171,6 +203,10 @@ type Snapshot struct {
 	// AutoSwitched 为真表示当前生效的节点是故障自动切换选出来的，
 	// 并不等于配置文件里写的那个。界面上必须区分这两件事。
 	AutoSwitched bool `json:"autoSwitched"`
+	// AutoSwitchedAt 是上一次自动切换发生的时刻（Unix 毫秒），0 = 本次运行没切过。
+	// 光有「切了」这一个布尔值不够：用户要判断的是"刚才那下是不是它干的"，
+	// 而那需要一个时间戳去和现象对齐。
+	AutoSwitchedAt int64 `json:"autoSwitchedAt"`
 	// SwitchReason 是给人看的自动切换理由，未自动切换时为空。
 	SwitchReason string `json:"switchReason,omitempty"`
 	// TUN 是 TUN 入站的完整状态；未启用时 Enabled/Running 都是 false。
@@ -307,7 +343,21 @@ func (s *Service) prepare() error {
 	// 而 hysteria2 在构造时就可能已经把 QUIC 那条 socket 建出来了——
 	// 那条 socket 一旦建成就钉死在卡上，两张卡必须先进去。
 	splitPlan := planForConfig(cfg.IfaceSplit)
+	// 钉上这张卡却发不出包，装配一次就要验一次：Start 这条路和运行期的 applyPlan
+	// 必须共用同一判据（启动不走 applyPlan，见 logSplitPlan 那段），而且**两侧各问一次**
+	// （settleEgress 里那层只有一处问句）。有提权 helper 就不必退——把 socket 交给
+	// helper 造，拓扑照用户点名的两张卡走；没有 helper 才退回系统默认路由，
+	// 因为留着那条"已生效"的记录会让那一侧全部连接一起超时。
+	splitPlan, bindDirect, bindProxy, bindNotes := s.settleEgress(splitPlan, srv.Addr, cfg)
+	for _, why := range bindNotes {
+		logx.Infof("网卡分流：%s", why)
+	}
+	if splitPlan.note != "" {
+		logx.Warnf("网卡分流未生效：%s", splitPlan.note)
+	}
 	split := outbound.NewSplit(splitPlan.pick.direct, splitPlan.pick.proxy)
+	split.SetBindSocket(s.bindChannelWith(cfg))
+	split.SetBindNeeded(bindDirect, bindProxy)
 	proxy, err := outbound.New(srv, s.handshakeTO, resolver, fakeRange(cfg), split)
 	if err != nil {
 		geoRef.Swap(nil)
@@ -331,6 +381,9 @@ func (s *Service) prepare() error {
 	// 挂上拨号失败的观察者：它是「节点是不是已经不行了」的唯一数据来源。
 	// 装配期就挂，第一条流量的失败才不会丢。
 	rt.SetFaultObserver(s.observeDialFault)
+	// 成功的那一侧也要挂：它是「节点又通了」唯一的信号，而故障断网保护
+	// 只有挂上的动作就会永远关着——闸门没人开，症状是「网络一直断着」。
+	rt.SetRecoverObserver(s.observeDialOK)
 	// 挂上网卡走向的查询器，连接表才说得出每条连接走了哪张卡。
 	// 捕获的是 split 本身而不是它的快照：开关在运行期还能拨，
 	// 快照会把后来的改动挡在门外。
@@ -603,6 +656,15 @@ func (s *Service) stop() error {
 	cancelIface := s.ifaceWatchCancel
 	s.ifaceWatchCancel = nil
 	s.mu.Unlock()
+	// 常驻提权 helper 是 root 进程，面板没了它就该收工。helper 自己也盯着父进程，
+	// 但主动收更干净——不必等到它下一次心跳才发现主人没了。
+	s.mu.Lock()
+	dialHelper := s.dialHelper
+	s.dialHelper = nil
+	s.mu.Unlock()
+	if dialHelper != nil {
+		dialHelper.Close()
+	}
 	if cancelWatch != nil {
 		cancelWatch()
 	}
@@ -783,7 +845,7 @@ func (s *Service) Snapshot() Snapshot {
 			snap.Congestion = srv.Congestion
 			snap.ProxyType = srv.Protocol()
 			snap.Mode = string(cfg.ModeValue())
-			snap.Profiles = profileViews(cfg, activeName)
+			snap.Profiles = profileViews(cfg, activeName, s.cooling)
 			snap.ActiveProfile = activeName
 			snap.TUN = tunStatusFromConfig(cfg.TUN)
 			snap.IfaceSplit = s.splitStatusLocked(cfg.IfaceSplit.Enable, false)
@@ -814,14 +876,25 @@ func (s *Service) Snapshot() Snapshot {
 	snap.BandwidthUp = srv.Bandwidth.Up
 	snap.BandwidthDn = srv.Bandwidth.Down
 	snap.Congestion = srv.Congestion
-	snap.Profiles = profileViews(rcfg, activeName)
+	snap.Profiles = profileViews(rcfg, activeName, s.cooling)
 	snap.ActiveProfile = activeName
 	snap.AutoSwitched = s.failoverOverride != "" && activeName == s.failoverOverride
+	if !s.switchedAt.IsZero() {
+		snap.AutoSwitchedAt = s.switchedAt.UnixMilli()
+	}
 	if snap.AutoSwitched {
 		// 界面上要能问出「它为什么自己动了」：这是自动切换唯一可解释的入口。
-		n, hosts := s.faultSummaryLocked(rcfg.Active)
-		snap.SwitchReason = fmt.Sprintf("配置里的节点 %s 在 %v 内有 %d 次节点级失败（涉及 %d 个不同目标）",
-			rcfg.Active, faultWindow, n, len(hosts))
+		//
+		// 理由在 commitFailover 那一刻就定稿了。这里绝不能重新数一遍流水：
+		// 窗口只有 faultWindow，切换过几分钟再数必然是空账，
+		// 面板于是打出「有 0 次节点级失败（涉及 0 个不同目标）」——一句自相矛盾的
+		// 告警，比不给他理由更让人怀疑这软件在乱动。
+		snap.SwitchReason = s.switchReason
+		if snap.SwitchReason == "" {
+			// 非正常路径（override 被别处直接置上，没走过 commitFailover）：
+			// 不编造失败次数，只说清楚发生了什么。
+			snap.SwitchReason = fmt.Sprintf("本次运行已自动切到 %s，切换时的失败明细没有留下", activeName)
+		}
 	}
 	if s.rt != nil {
 		snap.Mode = string(s.rt.Mode())

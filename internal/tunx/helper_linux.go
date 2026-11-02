@@ -71,6 +71,15 @@ func (h *HelperServer) runner() Runner {
 // 就不存在「root 进程常驻、面板崩了它还挂着网卡」这种状态。
 // 网卡的生命周期完全由面板手里那个 fd 决定，进程死了内核就把它收走。
 func (h *HelperServer) ServeConn(conn *net.UnixConn) error {
+	_, err := h.serveRequest(conn)
+	return err
+}
+
+// serveRequest 处理**一次**请求，返回 more=false 表示对端已经走了。
+//
+// 为什么要拆成"一次"：常驻 helper 的一条连接要能承载多次请求（见 ServeConnLoop），
+// 而 TUN 那条路仍然是一次请求一个进程——同一份代码两种用法，靠 more 这个返回区分。
+func (h *HelperServer) serveRequest(conn *net.UnixConn) (bool, error) {
 	timeout := h.Timeout
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -82,22 +91,25 @@ func (h *HelperServer) ServeConn(conn *net.UnixConn) error {
 
 	raw, err := readFrame(conn)
 	if err != nil {
-		return fmt.Errorf("读 helper 请求: %w", err)
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			return false, nil // 对端正常收工，不是错误
+		}
+		return false, fmt.Errorf("读 helper 请求: %w", err)
 	}
 	req, err := decodeRequest(raw)
 	if err != nil {
-		return h.reply(conn, HelperReply{Err: err.Error()}, nil)
+		return true, h.reply(conn, HelperReply{Err: err.Error()}, nil)
 	}
 	if verr := req.validate(); verr != nil {
-		return h.reply(conn, HelperReply{Err: verr.Error()}, nil)
+		return true, h.reply(conn, HelperReply{Err: verr.Error()}, nil)
 	}
 	// 请求里的 uid 会被写进 iptables 的 `-m owner ! --uid-owner`，
 	// 它必须是这条连接对面那个 uid——否则就是拿 root 替别人改排除规则。
 	if perr != nil {
-		return h.reply(conn, HelperReply{Err: fmt.Sprintf("取不到连接对端凭据: %v", perr)}, nil)
+		return true, h.reply(conn, HelperReply{Err: fmt.Sprintf("取不到连接对端凭据: %v", perr)}, nil)
 	}
 	if req.Plan.UID != int(peer) {
-		return h.reply(conn, HelperReply{Err: fmt.Sprintf(
+		return true, h.reply(conn, HelperReply{Err: fmt.Sprintf(
 			"请求里的 uid=%d 与连接对端 uid=%d 不一致，拒绝执行", req.Plan.UID, peer)}, nil)
 	}
 
@@ -111,9 +123,9 @@ func (h *HelperServer) ServeConn(conn *net.UnixConn) error {
 			reply.Err = err.Error()
 			reply.OK = false
 			reply.Device = ""
-			return h.reply(conn, reply, nil)
+			return true, h.reply(conn, reply, nil)
 		}
-		return h.reply(conn, reply, []int{fd})
+		return true, h.reply(conn, reply, []int{fd})
 	case ActionDown:
 		// down 走独立的 ctx：清理路径不能被一个已经花完的时间预算一起取消。
 		dctx, dcancel := context.WithTimeout(context.Background(), timeout)
@@ -122,17 +134,122 @@ func (h *HelperServer) ServeConn(conn *net.UnixConn) error {
 		if err != nil {
 			reply.Err = err.Error()
 		}
-		return h.reply(conn, reply, nil)
+		return true, h.reply(conn, reply, nil)
 	case ActionCleanup:
 		dctx, dcancel := context.WithTimeout(context.Background(), timeout)
 		defer dcancel()
 		reply := HelperReply{OK: true}
 		reply.Removed = CleanupStale(dctx, h.runner(), req.Plan.UID, req.Plan.Device, req.Plan.Address)
 		reply.Removed = append(reply.Removed, applyStale6(dctx, h.runner(), req.Plan)...)
-		return h.reply(conn, reply, nil)
+		// 残留的出站保护链也必须摘掉：面板被杀在故障期间时，那条 DROP 还在，
+		// 而它拦的是用户机器上所有出站——不是一句「重启就好了」能交代的。
+		reply.Removed = append(reply.Removed, CleanupKill(dctx, h.runner())...)
+		return true, h.reply(conn, reply, nil)
+	case ActionReroute:
+		dctx, dcancel := context.WithTimeout(context.Background(), timeout)
+		defer dcancel()
+		reply, err := h.doReroute(dctx, req.Plan, *req.Prev)
+		if err != nil {
+			reply.Err = err.Error()
+		}
+		return true, h.reply(conn, reply, nil)
+	case ActionKill:
+		// 摘下保护走独立 ctx：解除封锁不该被一个已经花完的时间预算一起取消。
+		dctx, dcancel := context.WithTimeout(context.Background(), timeout)
+		defer dcancel()
+		reply, err := h.doKill(dctx, req.Plan, req.Allow, req.KillArm)
+		if err != nil {
+			reply.Err = err.Error()
+		}
+		return true, h.reply(conn, reply, nil)
+	case ActionDialBind:
+		// dialbind 不 exec 任何命令、也不改任何配置：只造一条已经钉好并连上的 socket。
+		// 预算取这一次请求剩下的时间——它不该把整条提权通道的超时吃满。
+		budget := timeout
+		if dl, ok := ctx.Deadline(); ok {
+			budget = time.Until(dl)
+		}
+		reply, fd, err := h.doDialBind(req, budget)
+		if err != nil {
+			return true, h.reply(conn, HelperReply{OK: false, Err: err.Error()}, nil)
+		}
+		if !reply.OK || fd < 0 {
+			if fd >= 0 {
+				_ = unix.Close(fd) // 没人认领的 fd 是一个还活着的内核引用，不能留
+			}
+			return true, h.reply(conn, reply, nil)
+		}
+		return true, h.reply(conn, reply, []int{fd})
 	default:
-		return h.reply(conn, HelperReply{Err: fmt.Sprintf("未知的 helper 动作 %q", req.Action)}, nil)
+		return true, h.reply(conn, HelperReply{Err: fmt.Sprintf("未知的 helper 动作 %q", req.Action)}, nil)
 	}
+}
+
+// doReroute 在网络变化后把绕行路由改钉到新网关。
+//
+// 命令由本包按两份计划现算（RoutePlan.RepinRoutes），helper 不接受调用方给的命令行。
+// 旧的那些清理是尽力而为：旧路由本来就不在了也不该拦住重钉。
+func (h *HelperServer) doReroute(ctx context.Context, plan, prev RoutePlan) (HelperReply, error) {
+	up, cleanup := plan.RepinRoutes(prev)
+	reply := HelperReply{OK: true}
+	for _, c := range cleanup {
+		if _, err := h.runner().Run(ctx, c); err != nil {
+			reply.Removed = append(reply.Removed, c.Desc+"（清理失败）")
+		}
+	}
+	if err := Apply(ctx, h.runner(), up); err != nil {
+		reply.OK = false
+		reply.Err = "重钉绕行路由失败: " + err.Error()
+		return reply, err
+	}
+	for _, c := range up {
+		reply.Applied = append(reply.Applied, c.Desc)
+	}
+	// v6 默认路由有没有真在位：拆旧的那条会失败（它本来就不在），不据此判断。
+	reply.V6RouteOK = plan.usable6()
+	return reply, nil
+}
+
+// doKill 挂上或摘下故障断网保护。规则同样由本包按 plan 现算（见 PlanKill），
+// 请求里的 allow 只提供地址，不提供命令行。
+//
+// 挂到一半失败必须回滚。PlanKill 把挂载点（`-I OUTPUT 1`）排在最后，所以中途失败时
+// 链是没挂上的、流量照旧——但那条半成品链必须删干净，否则下一次挂载读到的是一个
+// 我们不再追踪的白名单。回滚用摘链那组命令，它们每一步都容错，
+// 「本来就没挂上」不会把回滚也带失败。
+//
+// 摘下失败的方向正好相反，也更严重：链还在，DROP 还在拦用户此刻的流量。
+// 所以它必须报错、必须进界面，绝不能当成一次无害的清理失败。
+func (h *HelperServer) doKill(ctx context.Context, plan RoutePlan, allow []string, arm bool) (HelperReply, error) {
+	if !arm {
+		// 摘链只要链名，不看计划：strict_route 刚被关掉、白名单已经变了这些时刻
+		// 正是最需要把闸门打开的时候，而那时 PlanKill 会拒绝生成计划。
+		// 实现与本进程摘链、启动清理同一条（CleanupKill）：判据写三份早晚不一致，
+		// 而这里不一致的代价是「面板说已关闭，内核里那条 DROP 链还在」。
+		CleanupKill(ctx, h.runner())
+		return HelperReply{OK: true, Applied: []string{"断网保护已解除"}}, nil
+	}
+	kp, err := plan.PlanKill(allow)
+	if err != nil {
+		return HelperReply{OK: false, KillReason: kp.Error()}, fmt.Errorf("生成断网保护规则失败: %w", err)
+	}
+	if err := Apply(ctx, h.runner(), kp.Arm); err != nil {
+		reason := "保护挂到一半失败，已回滚，当前未生效: " + err.Error()
+		if kp.Error() != "" {
+			reason += "（" + kp.Error() + "）"
+		}
+		dctx, dcancel := context.WithTimeout(context.Background(), disarmTimeout)
+		defer dcancel()
+		for _, c := range kp.Disarm {
+			_, _ = h.runner().Run(dctx, c)
+		}
+		return HelperReply{OK: false, KillReason: reason}, errors.New(reason)
+	}
+	reply := HelperReply{OK: true, KillV4: kp.V4, KillV6: kp.V6, KillReason: kp.Error()}
+	for _, c := range kp.Arm {
+		reply.Applied = append(reply.Applied, c.Desc)
+	}
+	return reply, nil
 }
 
 func (h *HelperServer) doUp(ctx context.Context, plan RoutePlan) (HelperReply, int, error) {
@@ -160,11 +277,23 @@ func (h *HelperServer) doUp(ctx context.Context, plan RoutePlan) (HelperReply, i
 	// v6 那一组单独成败：多半是内核没有 ip6table_nat。
 	// 失败只降级 v6（AAAA 回 NODATA），绝不能因此把已经配好的 v4 也一起掀了。
 	v6up, v6down, _ := plan.PlanV6()
-	v6OK := len(v6up) > 0
+	v6OK := plan.v6FakeIPUsable() && len(v6up) > 0
 	if v6OK {
 		if err := Apply(ctx, h.runner(), v6up); err != nil {
 			v6OK = false
 			for _, c := range v6down {
+				_, _ = h.runner().Run(ctx, c)
+			}
+		}
+	}
+	// v6 全局接管又是单独一组：它决定的是「v6 流量有没有被接管」，
+	// 与 v6 假 IP 能不能用是两件事，必须各自成败、各自回滚。
+	route6up, route6down, _ := plan.PlanV6Route()
+	v6RouteOK := len(route6up) > 0
+	if v6RouteOK {
+		if err := Apply(ctx, h.runner(), route6up); err != nil {
+			v6RouteOK = false
+			for _, c := range route6down {
 				_, _ = h.runner().Run(ctx, c)
 			}
 		}
@@ -176,7 +305,7 @@ func (h *HelperServer) doUp(ctx context.Context, plan RoutePlan) (HelperReply, i
 	}
 	// Applied 回传给面板显示：GUI 里那串「实际跑过哪些步骤」是排障的主要线索，
 	// 走 helper 之后它来自 root 侧，不能因为换了执行者就丢掉。
-	names := make([]string, 0, len(up)+len(v6up))
+	names := make([]string, 0, len(up)+len(v6up)+len(route6up))
 	for _, c := range up {
 		names = append(names, c.Desc)
 	}
@@ -185,7 +314,12 @@ func (h *HelperServer) doUp(ctx context.Context, plan RoutePlan) (HelperReply, i
 			names = append(names, c.Desc)
 		}
 	}
-	return HelperReply{OK: true, Applied: names, V6OK: v6OK, Device: plan.Device, MTU: mtu}, fd, nil
+	if v6RouteOK {
+		for _, c := range route6up {
+			names = append(names, c.Desc)
+		}
+	}
+	return HelperReply{OK: true, Applied: names, V6OK: v6OK, V6RouteOK: v6RouteOK, Device: plan.Device, MTU: mtu}, fd, nil
 }
 
 func (h *HelperServer) doDown(ctx context.Context, plan RoutePlan) (HelperReply, error) {
@@ -194,15 +328,21 @@ func (h *HelperServer) doDown(ctx context.Context, plan RoutePlan) (HelperReply,
 		return HelperReply{OK: false}, err
 	}
 	// v6 的先拆：它的 down 不依赖网卡还在，最后再摘地址。
+	// v6 接管那一组也先拆：它装着 v6 默认路由，留着会让整机 v6 流量继续指向 tun。
+	if _, v6down, verr := plan.PlanV6Route(); verr == nil {
+		down = append(v6down, down...)
+	}
 	if _, v6down, verr := plan.PlanV6(); verr == nil {
 		down = append(v6down, down...)
 	}
 	reply := HelperReply{OK: true}
 	var failed []string
 	for _, c := range down {
-		if _, err := h.runner().Run(ctx, c); err != nil {
+		out, err := h.runner().Run(ctx, c)
+		if err != nil {
 			// Optional 的失败是常态（那些东西本来就不在），只有非 Optional 才算没拆干净。
-			if !c.Optional {
+			// 判据和本地那一路共用一份，见 tolerates。
+			if !tolerates(c, out) {
 				failed = append(failed, fmt.Sprintf("%s: %v", c.Desc, err))
 			}
 			continue
@@ -416,7 +556,10 @@ func (c HelperClient) Run(ctx context.Context, req HelperRequest) (HelperReply, 
 		}
 		return reply, -1, errors.New(msg)
 	}
-	if req.Action == ActionUp {
+	// up 交回 tun fd，dialbind 交回一条钉住并已连通的 TCP socket fd：
+	// 这两个动作的应答**必须**带一个 fd 回来，少一个都当失败处理，
+	// 因为面板在那边等的就是这条 fd，拿不到就是拿不到。
+	if req.Action == ActionUp || req.Action == ActionDialBind {
 		if len(fds) != 1 {
 			closeAll(fds)
 			return reply, -1, fmt.Errorf("helper 应答里带回来 %d 个 fd，期望 1 个", len(fds))
@@ -538,4 +681,31 @@ func RunHelperForMain(path string, timeout time.Duration) error {
 		logx.Warnf("tun-helper 正以 uid=%d 运行，创建网卡与改路由多半会失败（请用 sudo 起面板，或在配置里给免密 sudo 的命令）", os.Geteuid())
 	}
 	return srv.ServeConn(conn)
+}
+
+// DialBound 向 helper 要一条钉在 dev 上、已连通 addr 的 TCP 连接。
+//
+// 拿回来的是普通 net.Conn，调用方关掉它就行：fd 是从对面 dup 过来的，
+// os.File 那份引用在 FileConn 之后立刻关掉，不留一个没人认领的描述符。
+//
+// 失败时原样递出 helper 那句拒绝（名单不合用、网卡不在、连不上……）——
+// 这几种原因各自要去查的地方完全不同，包成一句"提权失败"就等于白跑一趟。
+func (c HelperClient) DialBound(ctx context.Context, dev, addr string, allow []string) (net.Conn, error) {
+	reply, fd, err := c.Run(ctx, DialBindRequest(os.Geteuid(), dev, addr, allow))
+	if err != nil {
+		return nil, err
+	}
+	if fd < 0 {
+		if reply.Err != "" {
+			return nil, errors.New(reply.Err)
+		}
+		return nil, errors.New("helper 没有交回 socket fd")
+	}
+	f := os.NewFile(uintptr(fd), "wps_app-bound-socket")
+	defer func() { _ = f.Close() }()
+	conn, err := net.FileConn(f)
+	if err != nil {
+		return nil, fmt.Errorf("接管 helper 交回的 socket 失败: %w", err)
+	}
+	return conn, nil
 }

@@ -64,6 +64,7 @@ var typePairs = []struct {
 	{"metrics.Sample", metrics.Sample{}, "Sample"},
 	{"metrics.BlockedHit", metrics.BlockedHit{}, "BlockedHit"},
 	{"metrics.NodeTraffic", metrics.NodeTraffic{}, "NodeTraffic"},
+	{"metrics.RuleTraffic", metrics.RuleTraffic{}, "RuleTraffic"},
 	{"metrics.Snapshot", metrics.Snapshot{}, "TrafficSnapshot"},
 	{"sysproxy.Status", sysproxy.Status{}, "SystemProxyStatus"},
 	{"ui.ProfileList", ProfileList{}, "ProfileList"},

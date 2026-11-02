@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +181,46 @@ func TestFailoverSwitchesWithoutTouchingConfig(t *testing.T) {
 	}
 	if disk.Active != "a-hy2" {
 		t.Fatalf("自动切换把应急决定写进了用户的配置文件: active=%q", disk.Active)
+	}
+}
+
+// TestSwitchReasonSurvivesFaultWindow 切换理由必须在切换那一刻定稿。
+//
+// 失败流水只留 faultWindow，而用户看见「它自己切了」通常已经是几分钟之后。
+// 那时窗口早滑过去了，快照若还去现数一遍，只会打出
+// 「有 0 次节点级失败（涉及 0 个不同目标）」——一句自相矛盾的告警，
+// 比不给理由更让人怀疑这软件在乱动。
+func TestSwitchReasonSurvivesFaultWindow(t *testing.T) {
+	svc, _ := startTwoNodes(t)
+	svc.probeCandidate = func(outbound.Dialer) error { return nil }
+
+	// 攒够一轮判据：3 次失败、跨 2 个不同目标。
+	svc.mu.Lock()
+	for _, h := range []string{"a.example.com:443", "b.example.com:443", "a.example.com:443"} {
+		svc.recordFaultLocked("a-hy2", h)
+	}
+	svc.mu.Unlock()
+
+	svc.tryFailover("a-hy2")
+	if got := svc.Snapshot().ActiveProfile; got != "b-trojan" {
+		t.Fatalf("没有自动切换: %q", got)
+	}
+
+	// 时间过去：把这几条流水推出统计窗口，等价于「八分钟之后再看面板」。
+	svc.mu.Lock()
+	if f := svc.faults["a-hy2"]; f != nil {
+		for i := range f.stamps {
+			f.stamps[i].at = time.Now().Add(-faultWindow - time.Minute)
+		}
+	}
+	svc.mu.Unlock()
+
+	snap := svc.Snapshot()
+	if strings.Contains(snap.SwitchReason, "0 次节点级失败") {
+		t.Fatalf("切换理由退化成空账: %q", snap.SwitchReason)
+	}
+	if !strings.Contains(snap.SwitchReason, "3 次节点级失败") {
+		t.Fatalf("切换理由没记住当时的次数: %q", snap.SwitchReason)
 	}
 }
 
@@ -366,5 +407,76 @@ func TestFailoverRoundCooldown(t *testing.T) {
 	svc.tryFailover("a-hy2")
 	if probes != 2 {
 		t.Fatalf("冷却过期后没能再起一轮（多半是 failoverBusy 没释放）: probes=%d", probes)
+	}
+}
+
+// TestProfileViewsCarryCooling 冷却必须投影到节点列表上。
+//
+// 为什么值得单独测：冷却只约束自动切换、不约束用户手动选节点。
+// 界面上不写出来，用户手动选回一个还在冷却的节点之后，
+// 下一轮自动切换又把它挪走——那看起来就是「程序不听我的」。
+func TestProfileViewsCarryCooling(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Proxies = []config.ProxyProfile{
+		{Name: "a-hy2", Server: config.ServerConfig{Type: config.ProtocolHysteria2, Addr: "203.0.113.1:443", Auth: "x"}},
+		{Name: "b-tj", Server: config.ServerConfig{Type: config.ProtocolTrojan, Addr: "203.0.113.2:443", Auth: "x"}},
+		{Name: "c-hy2", Server: config.ServerConfig{Type: config.ProtocolHysteria2, Addr: "203.0.113.3:443", Auth: "x"}},
+	}
+	now := time.Now()
+	cooling := map[string]time.Time{
+		"a-hy2": now.Add(4 * time.Minute), // 还在冷却
+		"b-tj":  now.Add(-time.Minute),    // 已经过期
+		// c-hy2 压根没被切走过
+	}
+	byName := map[string]ProfileView{}
+	for _, v := range profileViews(cfg, "c-hy2", cooling) {
+		byName[v.Name] = v
+	}
+	if got := byName["a-hy2"].CoolingUntil; got <= now.UnixMilli() {
+		t.Errorf("还在冷却的节点没带上到期时刻: %d", got)
+	}
+	if byName["b-tj"].CoolingUntil != 0 {
+		t.Errorf("过期的冷却还在报: %d", byName["b-tj"].CoolingUntil)
+	}
+	if byName["c-hy2"].CoolingUntil != 0 {
+		t.Errorf("没被切走过的节点不该有冷却: %d", byName["c-hy2"].CoolingUntil)
+	}
+}
+
+// TestSnapshotReportsSwitchTime 自动切换的时刻要能问出来。
+//
+// 「切了」这个布尔值答不了「刚才那下是不是它干的」——那需要时间和现象对齐。
+func TestSnapshotReportsSwitchTime(t *testing.T) {
+	svc, _ := startTwoNodes(t)
+	if at := svc.Snapshot().AutoSwitchedAt; at != 0 {
+		t.Fatalf("没切过就该是 0， got %d", at)
+	}
+	// 取一个「不是配置里那个」的节点名当 override——两个节点的配置里必然有一个。
+	svc.mu.Lock()
+	other := ""
+	for _, p := range svc.cfg.Proxies {
+		if p.Name != svc.cfg.Active {
+			other = p.Name
+			break
+		}
+	}
+	svc.mu.Unlock()
+	if other == "" {
+		t.Fatal("这份配置没有第二个节点，测不了自动切换的读数")
+	}
+
+	at := time.Now().Add(-2 * time.Minute)
+	svc.mu.Lock()
+	svc.switchedAt = at
+	svc.failoverOverride = other
+	svc.mu.Unlock()
+
+	snap := svc.Snapshot()
+	if snap.AutoSwitchedAt != at.UnixMilli() {
+		t.Errorf("切换时刻没进快照: got %d want %d", snap.AutoSwitchedAt, at.UnixMilli())
+	}
+	// 时刻要跟着真正生效的那个节点走，不是配置里写的那个。
+	if !snap.AutoSwitched {
+		t.Error("生效节点已经是 override 了，快照却说不算自动切换")
 	}
 }

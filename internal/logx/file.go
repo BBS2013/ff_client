@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"wps_app/internal/sudoown"
 )
 
 // 日志文件的上限与保留份数。20MB × 3 份足够覆盖"昨天那次为什么断了"，
@@ -17,6 +19,14 @@ const (
 
 // rotatingFile 是一个按大小轮转的文件 sink。
 //
+// restoreLogOwner 把 root 面板新写出的日志还给桌面用户。
+//
+// 日志是 0600 且常被拿来排查故障；root 跑过一次面板后，普通用户连读都读不了。
+// 这里只能 best-effort：logx 不能反过来打日志（会递归），失败就算了。
+func restoreLogOwner(path string) {
+	_ = sudoown.ToDesktopUser(path)
+}
+
 // 不用第三方库：轮转规则只有三条（超过上限、挪备份、重开文件），
 // 而这份代码要在"日志本身就是排查手段"的场景里工作，少一层依赖少一个变量。
 type rotatingFile struct {
@@ -52,6 +62,8 @@ func newRotatingFile(path string, max int64, backups int) (*rotatingFile, error)
 		_ = f.Close()
 		return nil, err
 	}
+	// 文件可能是 root 刚建的（sudo 起的面板）：把属主还给 SUDO_USER。
+	restoreLogOwner(path)
 	return &rotatingFile{path: path, max: max, backups: backups, f: f, size: st.Size()}, nil
 }
 
@@ -78,11 +90,13 @@ func (w *rotatingFile) rotate() error {
 			_ = os.Rename(old, next) // 缺失的备份是常态，不算错误
 		}
 		_ = os.Rename(w.path, w.path+".1")
+		restoreLogOwner(w.path + ".1")
 	}
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
+	restoreLogOwner(w.path)
 	w.f = f
 	w.size = 0
 	return nil

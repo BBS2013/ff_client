@@ -1,8 +1,10 @@
 package service
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"wps_app/internal/config"
 	"wps_app/internal/netdev"
@@ -159,12 +161,14 @@ func TestResolveSplitListsEveryCard(t *testing.T) {
 // 换指针的话正在传的隧道还攥着老实例，关开关就只是把新实例的闸门关了——
 // 界面说"未开启"，隧道其实还钉在那张卡上。
 func TestApplyPlanReusesTheSameSplit(t *testing.T) {
-	sp := outbound.NewSplit("", "")
+	// 起点就是"代理已经钉在这张卡上"：换卡才要重建隧道，而重建会去拨真节点。
+	// 这条用例要验的是特权通道的开合，不是重建本身。
+	sp := outbound.NewSplit("wlp3s0f0", "wlx001f0578cdff")
 	svc := New(writeCfg(t), nil)
 	svc.split = sp
 	sp.SetActive(true)
 
-	svc.applyPlan(splitPlan{pick: splitPick{direct: "wlp3s0f0", proxy: "wlx001f0578cdff"}}, false)
+	_, _ = svc.applyPlan(splitPlan{pick: splitPick{direct: "wlp3s0f0", proxy: "wlx001f0578cdff"}}, false, "example.com:8443")
 
 	if svc.split != sp {
 		t.Fatal("applyPlan 换掉了 Split 实例：出站还攥着老的那份")
@@ -274,5 +278,244 @@ func TestSetIfaceSplitCardsPersists(t *testing.T) {
 	if cfg.IfaceSplit.Direct.Dev != "" || cfg.IfaceSplit.Proxy.Dev != "" {
 		t.Fatalf("两边都传空串就该落成不点名，得到 %+v / %+v",
 			cfg.IfaceSplit.Direct, cfg.IfaceSplit.Proxy)
+	}
+}
+
+// ---------- 钉上网卡却发不出包 ----------
+
+// stubEgress 把那一次真拨号换成假的：键是网卡名（空串=不钉的对照组），值是非空表示拨不通。
+func stubEgress(t *testing.T, res map[string]string) {
+	t.Helper()
+	old := probeEgress
+	probeEgress = func(dev, _ string, _ time.Duration) error {
+		if msg := res[dev]; msg != "" {
+			return errors.New(msg)
+		}
+		return nil
+	}
+	t.Cleanup(func() { probeEgress = old })
+}
+
+func splitSvc() *Service { return &Service{} }
+
+// setsockopt 成功不代表包出得去：这台机器的链路安全软件就是在普通进程钉网卡之后
+// 静默丢包。只看系统调用会留下一句「已生效」，症状却是全部代理连接一起超时
+// （2026-10-20 的 612 条拨不通、2026-10-29 复现，都是这一条）。
+// 所以钉不通而不钉能通时，必须自己退回默认路由并把原因写进 note。
+func TestEgressBlockedDowngradesToDefaultRoute(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout", "": ""})
+	why, useBind := splitSvc().egressBlockedWhy("wlx001f0578cdff", "example.com:8443", "代理", nil)
+	if !strings.Contains(why, "发不出包") || !strings.Contains(why, "系统默认路由") {
+		t.Fatalf("退回默认路由这件事必须写在 note 里: %q", why)
+	}
+	if !strings.Contains(why, "example.com:8443") {
+		t.Fatalf("note 要给出对照组拨通的是哪个地址: %q", why)
+	}
+	if useBind {
+		t.Fatal("没配 tun.helper 时不该说有特权通道可用")
+	}
+}
+
+// 没给目标就不许假装验过：命令行那条路上配置还没落定。
+func TestEgressBlockedNeedsATarget(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout"})
+	if why, _ := splitSvc().egressBlockedWhy("wlx001f0578cdff", "", "代理", nil); why != "" {
+		t.Fatalf("没有拨号目标时不该给出结论: %q", why)
+	}
+}
+
+// 不钉也拨不通时不能冤枉分流：那是节点或链路的事，界面上的红要留给真正的原因。
+func TestEgressBlockedStaysSilentWhenNodeUnreachable(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout", "": "connection refused"})
+	if why, _ := splitSvc().egressBlockedWhy("wlx001f0578cdff", "example.com:8443", "代理", nil); why != "" {
+		t.Fatalf("两条都拨不通不该报分流问题: %q", why)
+	}
+}
+
+// 钉上也能发出去时不提这事——否则每次正常分流都要被冤枉一遍。
+func TestEgressBlockedQuietWhenBindWorks(t *testing.T) {
+	stubEgress(t, nil)
+	if why, _ := splitSvc().egressBlockedWhy("wlx001f0578cdff", "example.com:8443", "代理", nil); why != "" {
+		t.Fatalf("能发出去就不该有 note: %q", why)
+	}
+}
+
+// applyPlan 这一层要真的把钉住撤掉，而不只是记一句话。
+func TestApplyPlanDropsPinWhenEgressBlocked(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout", "": ""})
+	s := splitSvc()
+	eff, err := s.applyPlan(splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, true, "example.com:8443")
+	if err != nil {
+		t.Fatalf("applyPlan: %v", err)
+	}
+	// 交回的必须是**实际落地的**那一份：网卡扫描拿它当基线，
+	// 还拿点名的那份去记，就会每 5 秒以为"没落地"再判一次（刷出 190 条日志的循环）。
+	if eff.proxy != "" || eff.direct != "wlp3s0f0" {
+		t.Fatalf("降级后交回的应当是实际落地的挑选: %+v", eff)
+	}
+	s.mu.Lock()
+	st := s.ifaceSplit
+	s.mu.Unlock()
+	if st.ProxyDev != "" {
+		t.Fatalf("发不出包就不该还钉着这张卡: %+v", st)
+	}
+	// 直连那侧是真的在干活，不该陪着一起退。
+	if st.DirectDev != "wlp3s0f0" {
+		t.Fatalf("只该松开代理那一侧，直连应当还钉着: %+v", st)
+	}
+	if !strings.Contains(st.Note, "发不出包") {
+		t.Fatalf("降级这件事必须在 note 里看得见: %q", st.Note)
+	}
+}
+
+// 同一个「网卡|目标」只许探一次。判成降级会重建隧道，而 commitProxy 在 strict_route
+// 下会回头再走一遍装配、装配又探一次——2026-10-29 实测这样每 3~5 秒刷一组日志、
+// 每组两次真拨号（113 行里 36 条）。用户拨开关或换卡才是"重新问一次"的信号。
+func TestEgressVerdictIsProbedOncePerPair(t *testing.T) {
+	var calls int
+	old := probeEgress
+	probeEgress = func(dev, _ string, _ time.Duration) error {
+		if dev != "" {
+			calls++
+			return errors.New("i/o timeout")
+		}
+		return nil
+	}
+	t.Cleanup(func() { probeEgress = old })
+
+	s := splitSvc()
+	for i := 0; i < 5; i++ {
+		if why, _ := s.egressBlockedWhy("wlx0", "node.example:8443", "代理", nil); why == "" {
+			t.Fatalf("第 %d 次仍应给出降级结论", i)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("同一个组合只该探一次，探了 %d 次", calls)
+	}
+	s.clearEgressVerdict()
+	if why, _ := s.egressBlockedWhy("wlx0", "node.example:8443", "代理", nil); why == "" {
+		t.Fatal("清掉结论后应当重新探")
+	}
+	if calls != 2 {
+		t.Fatalf("清掉后该再探一次，探了 %d 次", calls)
+	}
+}
+
+// 同一句「钉上发不出包」，在有提权 helper 的机器上是另一种处置：不改拓扑，
+// 把造 socket 这一步交给 helper。这两条用例盯的就是"别退回默认路由"这个决定。
+func TestEgressBlockedPrefersBindChannel(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout", "": ""})
+	s := &Service{cfg: &config.Config{
+		Active:  "n",
+		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+	}}
+	why, useBind := s.egressBlockedWhy("wlx001f0578cdff", "example.com:8443", "代理", s.cfg)
+	if !useBind {
+		t.Fatalf("配了 helper 就该走特权通道: %q", why)
+	}
+	if !strings.Contains(why, "提权 helper") || !strings.Contains(why, "仍然钉在") {
+		t.Fatalf("这句话要说清拓扑没变: %q", why)
+	}
+	if strings.Contains(why, "退回系统默认路由") {
+		t.Fatalf("走特权通道时不该出现退回默认路由: %q", why)
+	}
+}
+
+// applyPlan 走特权通道时必须维持点名（不 unpin），并把通道真的打开。
+func TestApplyPlanKeepsPinWhenBindAvailable(t *testing.T) {
+	stubEgress(t, map[string]string{"wlx001f0578cdff": "i/o timeout", "": ""})
+	// 起点就是"代理已钉在这张卡"：换卡才要重建隧道，而重建会去拨真节点。
+	sp := outbound.NewSplit("wlp3s0f0", "wlx001f0578cdff")
+	sp.SetActive(true) // 特权通道只在分流真的在跑时开（ShouldUseBind 的第一道闸）
+	s := &Service{split: sp, ifaceSplit: IfaceSplitStatus{Note: "上一轮的说明"}, cfg: &config.Config{
+		Active:  "n",
+		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+	}}
+	eff, err := s.applyPlan(splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, true, "example.com:8443")
+	if err != nil {
+		t.Fatalf("applyPlan: %v", err)
+	}
+	if eff.proxy != "wlx001f0578cdff" {
+		t.Fatalf("有特权通道就该维持点名，实际交回 %+v", eff)
+	}
+	if !sp.ShouldUseBind(outbound.PolicyProxy) {
+		t.Fatal("特权通道没打开：ShouldUseBind 应为 true")
+	}
+}
+
+// 这句话会出现两处（状态 note 与测速那一格）。两处各写一份就会各说各话，
+// 而"发不出包"很容易被读成"那张卡坏了"——实际坏的是普通进程去钉这一层。
+// 这条用例盯住"同一个事实同一句话"。
+func TestBindViaHelperNoteIsTheOnlyWording(t *testing.T) {
+	note := bindViaHelperNote("代理", "wlx001f0578cdff", "钉在 wlx001f0578cdff 上拨 x 不通，不钉时却拨得通")
+	for _, want := range []string{"面板自己（普通权限）", "wlx001f0578cdff", "提权 helper 代劳", "代理仍然钉在这张卡"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("这句话里少了 %q: %q", want, note)
+		}
+	}
+	if !strings.Contains(note, "不钉时却拨得通") {
+		t.Fatalf("带上事实时也要留着它: %q", note)
+	}
+	// 不带事实时句子仍然完整（测速那格放得下短版）。
+	short := bindViaHelperNote("代理", "wlx001f0578cdff", "")
+	if !strings.Contains(short, "提权 helper 代劳") || strings.Contains(short, "不通") {
+		t.Fatalf("短版也要说清谁代劳: %q", short)
+	}
+}
+
+// 探针以前只问代理侧，于是 note 里那句「直连钉在内置卡上是真的在干活」是假的：
+// 2026-10-30 实测普通权限下内置卡的钉卡同样被静默丢包（两台面板 via DIRECT 失败
+// 363/1244 条、成功建连 0 条；转 root 后失败 0、成功 17）。settleEgress 把同一问句
+// 在两侧各问一次——谁钉不上松谁，另一侧不该陪着退，也不该替它说话。
+func TestSettleEgressProbesBothSides(t *testing.T) {
+	stubEgress(t, map[string]string{"wlp3s0f0": "i/o timeout", "": ""})
+	s := splitSvc()
+	plan, bindDirect, bindProxy, notes := s.settleEgress(
+		splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, "example.com:8443", nil)
+	if plan.pick.direct != "" {
+		t.Fatalf("直连侧钉上发不出包，必须退回默认路由，got %q", plan.pick.direct)
+	}
+	if plan.pick.proxy != "wlx001f0578cdff" {
+		t.Fatalf("代理侧钉得住，不该陪着退: %+v", plan.pick)
+	}
+	if bindDirect || bindProxy || len(notes) != 0 {
+		t.Fatalf("这台机器上没有特权通道，不该把它打开: %v %v %v", bindDirect, bindProxy, notes)
+	}
+	if !strings.Contains(plan.note, "直连") {
+		t.Fatalf("note 必须说是哪一侧退的，got %q", plan.note)
+	}
+}
+
+// 两侧都被判钉不上、而这台机器有 helper：两张卡都照用户点名的钉着，各自走通道。
+// 这是"拓扑不许退"那件事在按侧之后的形状。
+func TestSettleEgressKeepsBothPinsViaBindChannel(t *testing.T) {
+	stubEgress(t, map[string]string{
+		"wlp3s0f0": "i/o timeout", "wlx001f0578cdff": "i/o timeout", "": "",
+	})
+	s := &Service{cfg: &config.Config{
+		Active:  "n",
+		TUN:     config.TUNConfig{Helper: []string{"sudo", "-n", "./wps_app-gui", "--tun-helper"}},
+		Proxies: []config.ProxyProfile{{Name: "n", Server: config.ServerConfig{Addr: "example.com:8443"}}},
+	}}
+	plan, bindDirect, bindProxy, notes := s.settleEgress(
+		splitPlan{pick: pickOf("wlp3s0f0", "wlx001f0578cdff")}, "example.com:8443", s.cfg)
+	if plan.pick.direct != "wlp3s0f0" || plan.pick.proxy != "wlx001f0578cdff" {
+		t.Fatalf("有特权通道时两张卡都不该被松开: %+v", plan.pick)
+	}
+	if !bindDirect || !bindProxy {
+		t.Fatalf("两侧都该走通道: direct=%v proxy=%v", bindDirect, bindProxy)
+	}
+	if len(notes) != 2 {
+		t.Fatalf("两侧各说一句，got %v", notes)
+	}
+	if !strings.Contains(notes[0], "代理") || !strings.Contains(notes[1], "直连") {
+		t.Fatalf("两句必须各自点名是哪一侧换了人做: %v", notes)
+	}
+	for _, n := range notes {
+		if !strings.Contains(n, "提权 helper 代劳") {
+			t.Fatalf("句子要说清谁代劳: %q", n)
+		}
 	}
 }

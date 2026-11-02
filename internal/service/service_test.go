@@ -535,7 +535,7 @@ func TestProfileViewUDPMatchesOutbound(t *testing.T) {
 		{Name: "noType", Server: config.ServerConfig{Addr: "203.0.113.3:443", Auth: "x"}},
 	}
 
-	views := profileViews(cfg, "hy")
+	views := profileViews(cfg, "hy", nil)
 	if len(views) != len(cfg.Proxies) {
 		t.Fatalf("视图条数 = %d, want %d", len(views), len(cfg.Proxies))
 	}

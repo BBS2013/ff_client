@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"wps_app/internal/logx"
+	"wps_app/internal/sudoown"
 )
 
 // Mode 是分流模式。它属于路由决策，但字面量来自配置文件，因此定义放在
@@ -141,6 +144,14 @@ type TUNConfig struct {
 	Helper []string `yaml:"helper,omitempty"`
 	// RouteExclude 在 StrictRoute 下钉回物理网关的网段（CIDR 列表）。
 	RouteExclude []string `yaml:"route_exclude"`
+	// KillSwitch 打开「故障断网保护」：自动切换放弃时把本机出站收窄到白名单
+	// （所有节点、DNS 上游、回环与 DHCP），其余一律丢弃，堵住换节点重启那几百毫秒
+	// 里的裸奔窗口。
+	//
+	// 默认关闭，且只在 strict_route（全局接管）下有意义：选择性 TUN 里直连本来就该
+	// 从物理网卡出去，挂上它等于把这个模式要的功能关掉。开了但装不上时，
+	// 面板会明确报「未生效」，不会显示成一道开着的保护。
+	KillSwitch bool `yaml:"kill_switch"`
 }
 
 // DefaultTUN 返回 TUN 段的默认值，供 applyDefaults 与 GUI 表单共用。
@@ -636,6 +647,17 @@ func Save(path string, c *Config) error {
 	return nil
 }
 
+// restoreBackupOwner 把 root 面板新建的备份文件还给桌面用户。
+//
+// 配置本体在 Save 里已经保住原属主，但 .orig / .bak 是新建 inode：
+// root 跑一次面板就会留下 root:root 0600 的备份，普通用户既读不到也覆盖不了，
+// 下次保存会在“备份”这一步失败。失败只告警，不推翻已经写好的配置。
+func restoreBackupOwner(path string) {
+	if err := sudoown.ToDesktopUser(path); err != nil {
+		logx.Warnf("把配置备份 %s 的属主还给桌面用户失败: %v", path, err)
+	}
+}
+
 // backup 把当前文件另存为 <path>.bak，并在第一次保存时留下 <path>.orig。
 // 文件不存在时不算错误（首次保存）。
 func backup(path string) error {
@@ -656,14 +678,17 @@ func backup(path string) error {
 				_ = os.Remove(orig)
 				return fmt.Errorf("关闭原始备份 %s: %w", orig, cerr)
 			}
+			restoreBackupOwner(orig)
 		case errors.Is(oerr, os.ErrExist):
-			// 已经有一份原件了，按约定不再覆盖。
+			// 已经有一份原件了，按约定不再覆盖；顺手把历史 root 属主收回来。
+			restoreBackupOwner(orig)
 		default:
 			return fmt.Errorf("创建原始备份 %s: %w", orig, oerr)
 		}
 		if err := os.WriteFile(path+BackupSuffix, old, 0o600); err != nil {
 			return fmt.Errorf("backup %s: %w", path+BackupSuffix, err)
 		}
+		restoreBackupOwner(path + BackupSuffix)
 		return nil
 	case errors.Is(err, os.ErrNotExist):
 		return nil

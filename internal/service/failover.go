@@ -184,6 +184,9 @@ func (s *Service) tryFailover(from string) {
 	}
 	if len(candidates) == 0 {
 		logx.Warnf("节点 %q 连续失败但没找到可用替代品（其余节点都在冷却里）", from)
+		// 这就是「已经没有别的办法」的那个点：流量接下来只会一条条失败在坏节点上。
+		// 用户开了故障断网保护的话，此刻是它唯一该落下的时机。
+		s.armKill("没有可用替代节点（其余都在冷却里）")
 		return
 	}
 
@@ -213,6 +216,9 @@ func (s *Service) tryFailover(from string) {
 		return
 	}
 	logx.Warnf("节点 %q 判定故障，但所有候选节点都试过了，保持现状", from)
+	// 保持现状不等于什么都不做：这一轮的结论是「此刻没有一个节点能用」，
+	// 而那些失败流量里每一条都本可以从隧道里出去、现在却只能裸奔在物理网卡上。
+	s.armKill("所有候选节点都试过了，没有一个能用")
 }
 
 // commitFailover 把切换落实。
@@ -247,6 +253,16 @@ func (s *Service) commitFailover(from, to string, proxy outbound.Conn) error {
 		s.failoverOverride = to
 	}
 	s.switchedAt = time.Now()
+	// 理由必须在切换这一刻定稿：from 的失败流水再过 faultWindow 就滑出窗口，
+	// 之后谁再来数都只剩 0 条（面板上那句「0 次失败」的老毛病就是这么来的）。
+	if n, hosts := s.faultSummaryLocked(from); n > 0 {
+		s.switchReason = fmt.Sprintf("配置里的节点 %s 在 %v 内有 %d 次节点级失败（涉及 %d 个不同目标）",
+			from, faultWindow, n, len(hosts))
+	} else {
+		// 没有窗口内的流水也能走到这里：tryFailover 被直接调用（测试）或
+		// 失败流水刚被清空。实话实说，不凭空编一个次数。
+		s.switchReason = fmt.Sprintf("配置里的节点 %s 被判定不可用，本次运行已切到 %s", from, to)
+	}
 	// 刚放弃的节点冷却 dwell 这么久：不然一轮失败就把它切回去，来回掐。
 	if s.cooling == nil {
 		s.cooling = make(map[string]time.Time)
@@ -265,6 +281,9 @@ func (s *Service) commitFailover(from, to string, proxy outbound.Conn) error {
 	}
 	logx.Infof("已自动切换节点 %s → %s（%s 连续 %d 次节点级失败）",
 		from, to, from, faultThreshold)
+	// 切换成功就是「又有一条能走的路了」：闸门必须跟着打开。
+	// 留着它的后果比挂上它的收益大得多——新节点明明能用，流量却被自己的规则拦下。
+	s.disarmKill("已自动切换到 " + to)
 	return nil
 }
 
@@ -301,6 +320,7 @@ func (s *Service) activeNameLocked(cfg *config.Config) string {
 		// override 指向的节点已经不在了（多半是刚被删掉）：把它丢掉，
 		// 别让整个服务对着一个不存在的名字判断健康。
 		s.failoverOverride = ""
+		s.switchReason = ""
 	}
 	return cfg.Active
 }

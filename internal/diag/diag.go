@@ -68,7 +68,7 @@ func Report(ctx context.Context, cfgPath string, w io.Writer) error {
 		usage(b, cfg, cfgPath)
 		rules(b, cfg)
 		dns(b, cfg)
-		tun(b, cfg)
+		tun(b, ctx, cfg, tunx.ExecRunner{})
 		ifaceSplit(b, cfg)
 		sys(b, ctx, cfg, cfgPath)
 	}
@@ -472,13 +472,17 @@ func inFakeRange(ip net.IP, cfg *config.Config) bool {
 	return false
 }
 
-func tun(b *builder, cfg *config.Config) {
+func tun(b *builder, ctx context.Context, cfg *config.Config, r tunx.Runner) {
 	b.section("TUN")
+	dev := orNoneStr(cfg.TUN.Device, "wps-tun")
 	if !cfg.TUN.Enable {
 		b.line("配置里没开 TUN：不建网卡、不装 iptables 劫持，这是默认。")
+		// 没开也要读一遍默认路由。这里要是出现「指向 wps-tun」，
+		// 那就是上一次停止没撤销的残留：面板显示 TUN 已停止，机器却没有出口。
+		// 只写"没开"的话，这一节对那种现场是帮不上忙的。
+		takeoverLines(b, ctx, r, dev, false)
 		return
 	}
-	dev := orNoneStr(cfg.TUN.Device, "wps-tun")
 	iface, err := net.InterfaceByName(dev)
 	switch {
 	case err != nil:
@@ -490,12 +494,70 @@ func tun(b *builder, cfg *config.Config) {
 		b.line("没配 tun.helper：以当前 uid %d 直接建网卡，非 root 会失败。", os.Getuid())
 	} else {
 		b.line("提权 helper：%s", strings.Join(cfg.TUN.Helper, " "))
+		// 顺手问一句那个文件自报的提权协议（以普通用户身份跑它的 -version，不起 root）。
+		// 版本错位这一类故障不该等到用户真的点开 TUN 才露出来——
+		// 而报告里只印两个数字和印「该动哪一边」，是两种不同的有用程度。
+		if path := tunx.HelperPath(cfg.TUN.Helper); path != "" {
+			theirs, err := tunx.ProbeHelperProto(ctx, path)
+			switch {
+			case err != nil:
+				b.line("  读不到它自报的提权协议：%v（这不等于版本不对，启用时照旧会去试）", err)
+			case theirs != tunx.HelperProto():
+				b.line("  它自报提权协议 %d，本程序是 %d：%s",
+					theirs, tunx.HelperProto(),
+					tunx.HelperMismatchAdvice(tunx.HelperProto(), theirs, cfg.TUN.Helper))
+			default:
+				b.line("  它自报提权协议 %d，与本程序一致", theirs)
+			}
+		}
 	}
 	b.line("假 IP 段 %s；DNS 劫持 %s；严格路由 %s",
 		orNoneStr(cfg.TUN.FakeIPRange, "（未配）"),
 		yesNo(cfg.TUN.HijackDNS), onOff(cfg.TUN.StrictRoute))
+	takeoverLines(b, ctx, r, dev, cfg.TUN.StrictRoute)
 	for _, note := range tunx.CapabilityNotes(cfg) {
 		b.line("注意：%s", note)
+	}
+}
+
+// takeoverLines 写「内核此刻把哪一族的默认路由交给了谁」。
+//
+// 面板上那两格读的是本进程记得的状态，这里读的是 `ip route`——不一致的那一刻
+// 恰恰最值得写在纸上：helper 挂了、v6 那一族没装上、网络变了而重钉没成功、
+// 上一次停止没撤销。判据是默认路由的归属，不是"网卡在不在"：
+// 网卡在而默认路由没交给它，就没有接管；反过来说，网卡早没了而默认路由还指着它，
+// 这一族的流量就是进了一个黑洞。
+func takeoverLines(b *builder, ctx context.Context, r tunx.Runner, dev string, wantStrict bool) {
+	for _, fam := range []struct {
+		label string
+		args  []string
+	}{
+		{"IPv4", []string{"-o", "route", "show", "default"}},
+		{"IPv6", []string{"-6", "-o", "route", "show", "default"}},
+	} {
+		out, err := r.Run(ctx, tunx.Cmd{Bin: "ip", Args: fam.args})
+		if err != nil {
+			b.line("%s 默认路由：读不到（%v）——这一族的接管与否本报告无法判断", fam.label, err)
+			continue
+		}
+		dr, ok := tunx.ParseDefaultRoute(out)
+		if !ok || dr.Iface == "" {
+			b.line("%s 默认路由：没有。这一族本来就没出口，接管与否都与它无关", fam.label)
+			continue
+		}
+		switch {
+		case dr.Iface == dev && wantStrict:
+			b.line("%s 默认路由指向 %s：接管成立", fam.label, dev)
+		case dr.Iface == dev && !wantStrict:
+			b.line("%s 默认路由指向 %s，可配置里没要求接管：这是没撤销干净的残留，"+
+				"这一族的流量此刻全在往 tun 里进", fam.label, dev)
+		case dr.Iface != dev && wantStrict:
+			b.line("%s 默认路由指向 %s（网关 %s），而配置要求接管：接管没成立，"+
+				"这一族此刻走的是物理出口", fam.label, dr.Iface, orNoneStr(dr.Gateway, "无"))
+		default:
+			b.line("%s 默认路由指向 %s（网关 %s）：未接管，与配置一致",
+				fam.label, dr.Iface, orNoneStr(dr.Gateway, "无"))
+		}
 	}
 }
 
@@ -529,6 +591,26 @@ func ifaceSplit(b *builder, cfg *config.Config) {
 	if why != "" {
 		b.line("注意：%s", why)
 	}
+	// 绑得上不等于钉得住。这台机器上普通用户进程 `SO_BINDTODEVICE` 返回成功，
+	// 包却一个都上不了线——只看下面那次 setsockopt 探测，这份报告就会替假话背书，
+	// 所以这里也真拨一次，判据与面板装配时是同一份（outbound.EgressPair）。
+	// 而且**两侧各问一次**：以前只问代理侧，报告里那句"直连仍钉在 X"就是没根据的——
+	// 2026-10-30 实测普通权限下内置卡同样被静默丢包（via DIRECT 失败 363/1244 条、成功 0 条）。
+	addr := strings.TrimSpace(cfg.ActiveServer().Addr)
+	blockedProxy, factProxy := outbound.EgressPair(outbound.ProbeDeviceEgress, p.Name, addr, 2*time.Second)
+	blockedDirect, factDirect := outbound.EgressPair(outbound.ProbeDeviceEgress, d.Name, addr, 2*time.Second)
+	if blockedProxy || blockedDirect {
+		var who []string
+		if blockedProxy {
+			who = append(who, "代理这张卡（"+p.Name+"）钉上发不出包："+factProxy)
+		}
+		if blockedDirect {
+			who = append(who, "直连这张卡（"+d.Name+"）钉上发不出包："+factDirect)
+		}
+		b.line("已开，规则模式，但%s", strings.Join(who, "；"))
+		b.line("  %s", splitBlockedConclusion(len(cfg.TUN.Helper) > 0))
+		return
+	}
 	b.line("已开，规则模式：直连钉在 %s（%s），代理钉在 %s（%s）",
 		d.Name, strings.Join(d.Addrs, "、"), p.Name, strings.Join(p.Addrs, "、"))
 	// 权限探测只建一个空 UDP 套接字再设一次选项，一个字节都不往外发。
@@ -537,6 +619,19 @@ func ifaceSplit(b *builder, cfg *config.Config) {
 			b.line("钉不到 %s：%v（内核拒绝时表现为分流看着开着、流量其实仍走默认路由）", dev, err)
 		}
 	}
+}
+
+// splitBlockedConclusion 说明普通权限探针失败之后，面板实际会怎么走。
+//
+// 配了 tun.helper 的面板并不会“退回系统默认路由”——它会把钉卡这一步交给
+// 提权 helper（见 service.egressBlockedWhy / bindViaHelperNote）。这份报告只
+// 做了普通权限探针，不能替 helper 那条路下结论；否则就会出现“报告说走默认
+// 路由、ss 里却明明钉在 wlx 上”这种自相矛盾，排障时比不说更糟。
+func splitBlockedConclusion(hasHelper bool) string {
+	if hasHelper {
+		return "这是普通权限探针的结论；配置了 tun.helper，面板会把钉卡交给提权 helper（本报告未验证 helper 是否可用）。"
+	}
+	return "钉不上的那一路实际按系统默认路由走。面板装配时用的是同一条判据。"
 }
 
 // choiceOf 把配置里的点名转成 netdev 的说法。

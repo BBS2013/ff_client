@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -25,12 +25,12 @@ import (
 )
 
 func trojanHash(password string) string {
-	sum := sha1.Sum([]byte(password))
+	sum := sha256.Sum224([]byte(password))
 	return hex.EncodeToString(sum[:])
 }
 
 func TestTrojanHeaderEncoding(t *testing.T) {
-	const hash = "0123456789abcdef0123456789abcdef01234567"
+	const hash = "0123456789abcdef0123456789abcdef0123456789abcdef01234567"
 
 	tests := []struct {
 		name   string
@@ -41,8 +41,8 @@ func TestTrojanHeaderEncoding(t *testing.T) {
 			name:   "ipv4",
 			target: "93.184.216.34:443",
 			want: concat(
-				[]byte{0x04, '\r', '\n'},
 				[]byte(hash), []byte{'\r', '\n'},
+				[]byte{0x01}, // CMD CONNECT
 				[]byte{0x01, 93, 184, 216, 34},
 				[]byte{0x01, 0xbb}, // 443
 				[]byte{'\r', '\n'},
@@ -52,8 +52,8 @@ func TestTrojanHeaderEncoding(t *testing.T) {
 			name:   "domain",
 			target: "example.com:8443",
 			want: concat(
-				[]byte{0x04, '\r', '\n'},
 				[]byte(hash), []byte{'\r', '\n'},
+				[]byte{0x01}, // CMD CONNECT
 				[]byte{0x03, byte(len("example.com"))}, []byte("example.com"),
 				[]byte{0x20, 0xfb}, // 8443
 				[]byte{'\r', '\n'},
@@ -63,8 +63,8 @@ func TestTrojanHeaderEncoding(t *testing.T) {
 			name:   "ipv6",
 			target: "[2001:db8::1]:80",
 			want: concat(
-				[]byte{0x04, '\r', '\n'},
 				[]byte(hash), []byte{'\r', '\n'},
+				[]byte{0x01}, // CMD CONNECT
 				[]byte{0x04,
 					0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01},
 				[]byte{0x00, 0x50},
@@ -97,8 +97,8 @@ func TestTrojanHeaderRejects(t *testing.T) {
 			t.Fatalf("trojanHeader(%q) 期望报错", target)
 		}
 	}
-	// 摘要长度不对必须拦住：真实服务端是按 sha1 的 40 个 hex 字符定长读的，
-	// 长度错了它会把后面的 ATYP 当摘要的一部分，整条连接就错位了。
+	// 摘要长度不对必须拦住：真实服务端是按 sha224 的 56 个 hex 字符定长读的，
+	// 长度错了它会把后面的命令字节当摘要的一部分，整条连接就错位了。
 	if _, err := trojanHeader("example.com:443", "deadbeef"); err == nil {
 		t.Fatal("短摘要应当被拒绝")
 	}
@@ -180,29 +180,31 @@ func (st *trojanStub) handle(raw net.Conn) {
 	st.reqs <- req
 	if req.hash != trojanHash(st.password) {
 		// 规范就是这么规定的：口令不对不报错，直接把连接关掉。
-		// 客户端要等到第一次读才会发现——这也是测速必须探一次读的原因。
+		// 没配兼底的服务端就是这样；配了的那台会改回一张 400 页面，
+		// 那才是 wbthinks 这个节点被记成"兼底型节点"的源头。
 		_ = tc.Close()
 		return
 	}
+	// 接受头部之后服务端**不发任何应答**，直接等客户端的数据——2026-10-29 在这台
+	// trojan 1.16 上实测：把隧道打到它自己的 nginx，请求前 0 字节，
+	// 请求后第一个字节已经是 "HTTP/1.1 301"。所以这里不许替它补那 10 个字节。
 	_, _ = io.Copy(tc, tc) //nolint:errcheck // 回显，对端关掉就结束
 	_ = tc.Close()
 }
 
 func readTrojanHeader(r *bufio.Reader) (trojanRequest, error) {
 	var req trojanRequest
-	cmd, err := r.ReadByte()
-	if err != nil {
-		return req, err
-	}
-	req.cmd = cmd
-	if err := expectCRLF(r); err != nil {
-		return req, err
-	}
+	// 第一行是口令摘要，第二行才是「命令字节 + 地址族 + 地址 + 端口」的裸字节。
 	line, err := readLine(r)
 	if err != nil {
 		return req, err
 	}
 	req.hash = line
+	cmd, err := r.ReadByte()
+	if err != nil {
+		return req, err
+	}
+	req.cmd = cmd
 	atyp, err := r.ReadByte()
 	if err != nil {
 		return req, err
@@ -342,8 +344,8 @@ func TestTrojanEndToEnd(t *testing.T) {
 
 	select {
 	case req := <-st.reqs:
-		if req.cmd != 0x04 {
-			t.Fatalf("命令字节 = %#x, want 0x04", req.cmd)
+		if req.cmd != 0x01 {
+			t.Fatalf("命令字节 = %#x, want 0x01", req.cmd)
 		}
 		if req.hash != trojanHash("sekrit") {
 			t.Fatalf("口令摘要不对: %q", req.hash)
@@ -365,10 +367,12 @@ func TestTrojanEndToEnd(t *testing.T) {
 	}
 }
 
-// TestTrojanWrongPasswordSurfacesOnlyOnRead 钉住一个协议事实：
-// 口令不对时 DialContext 不会失败（TLS 握手在认证之前就完成了），
-// 错误只会在第一次读时以 EOF 出现。测速要是只报「握手成功」，
-// 用户看到的就是一条永远显示正常的错误配置。
+// TestTrojanWrongPasswordSurfacesOnlyOnRead 钉住口令不对时的形状：TLS 握手在认证之前
+// 就完成了，拨号本身不会失败，错误只在第一次读时以 EOF 出现。
+//
+// 今天在现场被验证了一次反面：那台配了兼底页的服务端连 EOF 都不给，改成回一张 400，
+// 于是界面上"电路通了"照旧绿灯、只有应用层探针报红——这就是测速必须再探一次页面
+// （pageProbe）的理由，也是这条测试留在这里的意义。
 func TestTrojanWrongPasswordSurfacesOnlyOnRead(t *testing.T) {
 	st := newTrojanStub(t, "right")
 	defer st.close()

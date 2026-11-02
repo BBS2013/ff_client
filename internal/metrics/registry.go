@@ -8,6 +8,7 @@ package metrics
 import (
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,8 +112,38 @@ func nodeCounts(n string) bool {
 }
 
 // nodeBytes 是一个去处累计的字节与连接数（内部账，不直接投影）。
+// 按规则的那本账形状完全一样，所以共用这一个类型：
+// 两张表必须对同一批连接说话，字段少一个都会变成"两份账对不上"。
 type nodeBytes struct {
 	up, down, conns uint64
+}
+
+type ruleBytes = nodeBytes
+
+// chargedDelta 算「水位以上还剩多少字节要记账」。
+//
+// 这段判断原来在四处各写了一遍（收尾的上下行、在跑的上下行），
+// 少写一处的后果是账本半真半假：水位以下的重算会让"清空统计"之后
+// 某节点又冒出几个 GB，而漏掉回退那一支时，一次计数器回绕会加成天文数字。
+func chargedDelta(now, charged uint64) uint64 {
+	if now >= charged {
+		return now - charged
+	}
+	return now
+}
+
+// ruleSlotLocked 取出该记账的那一条规则条目。调用方必须持有 r.mu。
+//
+// 新键在账本已满时并进溢出桶：这张表是"现在谁在搬流量"的排行，
+// 不是审计日志——让它的键随规则数无限增长，等于在这里另存一份规则文件。
+func (r *Registry) ruleSlotLocked(matched string) (string, ruleBytes) {
+	if _, ok := r.ruleClosed[matched]; ok {
+		return matched, r.ruleClosed[matched]
+	}
+	if len(r.ruleClosed) >= ruleKeyCap {
+		return ruleOverflowKey, r.ruleClosed[ruleOverflowKey]
+	}
+	return matched, r.ruleClosed[matched]
 }
 
 // NodeTraffic 是一个"去处"在本次运行里用掉的字节。
@@ -128,6 +159,36 @@ type NodeTraffic struct {
 	// 跨重启再拆方向已经没有意义，拆开的两份账对不上一次崩溃）。
 	// 界面上"本次 X · 累计 Y"的 Y 就是 Up+Down+Prior。见 usage.go。
 	Prior uint64 `json:"prior"`
+}
+
+// ruleKeyCap 是「按规则汇总」最多留多少条不同的命中依据。
+//
+// 必须设上限：规则文件动辄几千条，逐条留账会把一张「现在谁在搬流量」的临时排行
+// 做成一份永久账本——那份账本该由日志与落盘用量负责，不是这里。
+// 超出上限的新条目并进一个「其余」桶，界面上的总数仍然对得上。
+const ruleKeyCap = 256
+
+// ruleRowsShown 是给界面看的行数（含那一条合并行）。
+const ruleRowsShown = 12
+
+// ruleOverflowKey 是那个合并桶的名字。它直接当 map 的键用，
+// 于是"超出上限的量"从一开始就走的是和正常条目同一条路径，
+// 不需要在读的时候再想办法补平。
+const ruleOverflowKey = "（汇总上限之外的其余规则）"
+
+// RuleTraffic 是一条命中依据在本次运行里搬了多少字节。
+//
+// 它回答的是「量记在哪条规则名下」，与规则页那一栏「命中次数」是两个口径：
+// 命中次数包含被拦下与拨不通的（那些一个字节都没有），这张表只数真的搬过东西的连接。
+// 两者混在一个数里，就会出现"这条规则拦了 800 次，可它一个字节都没走过"那种读不懂的行。
+type RuleTraffic struct {
+	Rule  string `json:"rule"`
+	Up    uint64 `json:"up"`
+	Down  uint64 `json:"down"`
+	Conns uint64 `json:"conns"`
+	// Folded 非零表示这一行合了多少条规则；最后一行才是合并行。
+	// 有它才能既把表控制在可读的篇幅里，又让"这些加起来等于总量"这句话成立。
+	Folded uint64 `json:"folded,omitempty"`
 }
 
 // Snapshot 是 Registry 的一次全量快照。
@@ -148,7 +209,12 @@ type Snapshot struct {
 	// ByNode 是"字节记在哪个去处名下"的合计，按总量从大到小。
 	// 见 NodeTraffic：为什么需要它，是因为节点会自动切换之后，
 	// 只看总数已经回答不了"这个月的量是谁用掉的"。
-	ByNode    []NodeTraffic `json:"byNode"`
+	ByNode []NodeTraffic `json:"byNode"`
+	// ByRule 是"字节记在哪条规则名下"的合计，最多 ruleRowsShown 行，
+	// 超出部分折进最后一行（Folded 说明折了几条）。见 RuleTraffic：
+	// 为什么要单独一张表，是因为节点会切换、规则却不会——
+	// "这个站点的量为什么这么大"只能按命中依据回答。
+	ByRule    []RuleTraffic `json:"byRule"`
 	TotalUp   uint64        `json:"totalUp"`
 	TotalDown uint64        `json:"totalDown"`
 	// PriorSince / PriorSavedAt 是给"累计（跨重启）"这一栏配的两句说明，单位 Unix 毫秒：
@@ -201,6 +267,9 @@ type Registry struct {
 	// 面板那一栏要把它对回用户写的行，靠的是 rules.UserRule.Desc() 现算同一个串，
 	// 不是在这里再拆一遍——见 Desc 的注释。
 	ruleHits map[string]int64
+	// ruleClosed 是**已收尾**连接的按命中依据累计；还在跑的那部分不写在这里，
+	// 由 Snapshot 现从 active 加上来——与 nodeClosed 同一套算法，见那里的注释。
+	ruleClosed map[string]ruleBytes
 
 	// prior 是上一次进程落盘时各节点已经跑掉的量，只当基数用（见 usage.go）：
 	// End 与 Reset 都不碰它，界面上"累计"那一栏 = prior + 本次。
@@ -234,6 +303,7 @@ func NewRegistry(histCap, seriesCap int) *Registry {
 	return &Registry{
 		active:     make(map[uint64]*Conn),
 		nodeClosed: make(map[string]nodeBytes),
+		ruleClosed: make(map[string]ruleBytes),
 		histCap:    histCap,
 		seriesCap:  seriesCap,
 	}
@@ -305,6 +375,9 @@ func (r *Registry) countRuleHitLocked(matched string) {
 	}
 	if r.ruleHits == nil {
 		r.ruleHits = make(map[string]int64)
+		// 按规则的字节账同属"本次会话的读数"：只清命中不清字节，
+		// 界面上就会留下"规则页说没命中过、流量页说它刚搬了 2GB"。
+		r.ruleClosed = make(map[string]ruleBytes)
 	}
 	r.ruleHits[matched]++
 }
@@ -379,20 +452,23 @@ func (r *Registry) End(c *Conn) {
 	// 它们在 Snapshot 里由 active 现算，所以既不用在每次写包时加锁，
 	// 也不会出现"关了之后从 active 消失、总数却掉下去"的那种倒退。
 	if n := c.Node; nodeCounts(n) {
-		acc := r.nodeClosed[n]
 		// 收尾的这条只补"上次清零之后"的那部分；水位以下的已经算过了。
-		if up >= c.chargedUp {
-			acc.up += up - c.chargedUp
-		} else {
-			acc.up += up
-		}
-		if down >= c.chargedDown {
-			acc.down += down - c.chargedDown
-		} else {
-			acc.down += down
-		}
+		acc := r.nodeClosed[n]
+		acc.up += chargedDelta(up, c.chargedUp)
+		acc.down += chargedDelta(down, c.chargedDown)
 		acc.conns++
 		r.nodeClosed[n] = acc
+	}
+	// 同一批字节再按命中依据记一遍：节点会切换，规则不会，
+	// "这个站点的量为什么这么大"只有按规则才答得上来。
+	// 被拦的（Node 是 REJECT）在这里占一行——它在节点表里没有行，
+	// 因为零字节只会稀释那张表；而"哪条规则在拦"本身就是这条表的用途。
+	if m := strings.TrimSpace(c.Matched); m != "" {
+		key, acc := r.ruleSlotLocked(m)
+		acc.up += chargedDelta(up, c.chargedUp)
+		acc.down += chargedDelta(down, c.chargedDown)
+		acc.conns++
+		r.ruleClosed[key] = acc
 	}
 	delete(r.active, c.ID)
 	if r.histCap > 0 {
@@ -585,12 +661,8 @@ func (r *Registry) Snapshot() Snapshot {
 		}
 		a := live[n]
 		// 在跑的这条只算水位以上：清零之后它不该再把历史字节算进来。
-		if up := c.Up.Load(); up > c.chargedUp {
-			a.up += up - c.chargedUp
-		}
-		if down := c.Down.Load(); down > c.chargedDown {
-			a.down += down - c.chargedDown
-		}
+		a.up += chargedDelta(c.Up.Load(), c.chargedUp)
+		a.down += chargedDelta(c.Down.Load(), c.chargedDown)
 		a.conns++
 		live[n] = a
 	}
@@ -632,6 +704,58 @@ func (r *Registry) Snapshot() Snapshot {
 		return byNode[i].Node < byNode[j].Node
 	})
 
+	// 按规则合计：同一批字节的另一种分法。活的这条也算水位以上。
+	liveRule := map[string]ruleBytes{}
+	for _, c := range r.active {
+		m := strings.TrimSpace(c.Matched)
+		if m == "" {
+			continue
+		}
+		a := liveRule[m]
+		a.up += chargedDelta(c.Up.Load(), c.chargedUp)
+		a.down += chargedDelta(c.Down.Load(), c.chargedDown)
+		a.conns++
+		liveRule[m] = a
+	}
+	mergedRule := make(map[string]ruleBytes, len(r.ruleClosed)+len(liveRule))
+	for m, a := range r.ruleClosed {
+		mergedRule[m] = a
+	}
+	for m, a := range liveRule {
+		x := mergedRule[m]
+		x.up += a.up
+		x.down += a.down
+		x.conns += a.conns
+		mergedRule[m] = x
+	}
+	ruleRows := make([]RuleTraffic, 0, len(mergedRule))
+	for m, a := range mergedRule {
+		ruleRows = append(ruleRows, RuleTraffic{Rule: m, Up: a.up, Down: a.down, Conns: a.conns})
+	}
+	sort.Slice(ruleRows, func(i, j int) bool {
+		si := ruleRows[i].Up + ruleRows[i].Down
+		sj := ruleRows[j].Up + ruleRows[j].Down
+		if si != sj {
+			return si > sj
+		}
+		return ruleRows[i].Rule < ruleRows[j].Rule
+	})
+	// 超出展示行数的那部分折成一行，而不是丢掉：这张表加起来必须仍然等于总量，
+	// 否则「按规则看」就成了一个只能看不能对账的东西——
+	// 而它唯一的用途恰恰是回答"这些量到底是谁的"。
+	if len(ruleRows) > ruleRowsShown {
+		rest := ruleRows[ruleRowsShown-1:]
+		var folded RuleTraffic
+		folded.Rule = "（其余 " + strconv.Itoa(len(rest)) + " 条规则）"
+		folded.Folded = uint64(len(rest))
+		for _, row := range rest {
+			folded.Up += row.Up
+			folded.Down += row.Down
+			folded.Conns += row.Conns
+		}
+		ruleRows = append(ruleRows[:ruleRowsShown-1], folded)
+	}
+
 	// 留痕按"最近撞上的排最前"交给投影这一层来翻，内部始终是新在后。
 	blocked := make([]BlockedHit, len(r.blocked))
 	for i, b := range r.blocked {
@@ -654,6 +778,7 @@ func (r *Registry) Snapshot() Snapshot {
 		TotalFailed:   r.totalFailed.Load(),
 		RecentBlocked: blocked,
 		ByNode:        byNode,
+		ByRule:        ruleRows,
 		TotalUp:       up,
 		TotalDown:     down,
 		PriorSince:    r.priorSince,

@@ -100,12 +100,15 @@ func (s *Service) checkIfaceChanged() {
 	if !ifaceSettled(pickOf(d, p), prev, plan.pick) {
 		return
 	}
-	if err := s.applyPlan(plan, true); err != nil {
+	eff, err := s.applyPlan(plan, true, activeAddrOf(cfg))
+	if err != nil {
 		logx.Warnf("网卡变化后重设分流失败: %v", err)
 		return
 	}
+	// 这句念的是**实际落地**的那一份：降级之后还照着点名念「代理走 wlx」，
+	// 日志就与同一秒那句「发不出包」互相打脸。
 	logx.Infof("检测到网卡变化：直连走 %s，代理走 %s（%s）",
-		devOr(plan.pick.direct, "系统默认路由"), devOr(plan.pick.proxy, "系统默认路由"), set.Describe())
+		devOr(eff.direct, "系统默认路由"), devOr(eff.proxy, "系统默认路由"), set.Describe())
 }
 
 // ifaceSettled 回答「这一轮的结果能不能动手」。

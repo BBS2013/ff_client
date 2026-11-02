@@ -63,11 +63,19 @@ type Status struct {
 	FakeIPs int `json:"fakeIps"`
 	// Active 是正在 tun 里转发的 TCP 连接数。
 	Active int64 `json:"active"`
-	// DNSServed 是累计应答过的 DNS 查询数。
-	DNSServed int64    `json:"dnsServed"`
-	StartedAt int64    `json:"startedAt"`
-	LastError string   `json:"lastError"`
-	Applied   []string `json:"applied"`
+	// DNSServed 是**答上了**的 DNS 查询数（不含回 SERVFAIL 的那些）。
+	DNSServed int64 `json:"dnsServed"`
+	// DNSFailed 是回了 SERVFAIL 的查询数——上游一个都没答上。
+	// 它必须单独报：只有"应答数"的话，上游全挂时那个数照样涨，
+	// 面板就会在最需要说"解析在失败"的时刻说"解析很健康"。
+	DNSFailed int64 `json:"dnsFailed"`
+	// DNSFailedAt 是最近一次解析失败的时刻（Unix 毫秒），0 表示还没发生过。
+	// 有了它，界面上那句告警才可以说"现在还在失败"而不是"这辈子失败过"
+	// ——只给累计数的话，一次抖动留下的告警会一直亮到重启。
+	DNSFailedAt int64    `json:"dnsFailedAt"`
+	StartedAt   int64    `json:"startedAt"`
+	LastError   string   `json:"lastError"`
+	Applied     []string `json:"applied"`
 	// IPv6 是用户要不要 v6 假 IP（tun.ipv6）。
 	IPv6 bool `json:"ipv6"`
 	// V6Ready 是 v6 那一组命令是否真的全装上了。
@@ -76,11 +84,41 @@ type Status struct {
 	// V6Ready 为 false 而 IPv6 为 true 时 AAAA 回 NODATA，应用退回 A 记录——
 	// 这是能工作的降级，比发一个路由不到的假 v6 好。
 	V6Ready bool `json:"v6Ready"`
+	// TakeoverV4 / TakeoverV6 说清两族的默认路由到底有没有被接管。
+	//
+	// 这两个字段必须分开、且只反映「默认路由装上了没有」：
+	// 「开了 strict_route」「开了而且装上了」「开了但 v6 装不上」
+	// 是三种完全不同的状态，合成一个布尔值只会让人以为全局接管已经生效。
+	// v6 为 true 而 v4 为 false 的组合是可能的（只有 v6 的网络）。
+	TakeoverV4 bool `json:"takeoverV4"`
+	TakeoverV6 bool `json:"takeoverV6"`
+	// TakeoverFrom 说清上面两格的来源：kernel 是刚才真去读了路由表，
+	// memory 是读不到（只能按本进程装过什么来说），not-running 是根本没在跑。
+	// 这三档必须分得开：接管被 DHCP 抢回去的那一刻，"我们相信还在接管"
+	// 与"内核说已经接管"是两句话，界面前者该显出来但不该冒充后者。
+	TakeoverFrom string `json:"takeoverFrom"`
+	// RouteFixes 是网络变化后重钉绕行路由的次数。
+	// 它不为零说明「换网之后自己恢复了」——这正是用户看不出来、
+	// 却最想知道的一件事。
+	RouteFixes int64 `json:"routeFixes"`
+	// LastRouteFix 是上一次重钉的时刻（Unix 毫秒），0 表示还没发生过。
+	LastRouteFix int64 `json:"lastRouteFix"`
 	// Privilege 说清「刚才那些 ip/iptables 是谁干的」：self 是本进程直接开，
 	// helper 是提权命令代开。排障时这一眼就能区分权限问题的成因。
 	Privilege string `json:"privilege"`
 	// HelperCmd 是配置里的提权命令，出错时用户要能看见自己配的是什么。
 	HelperCmd []string `json:"helperCmd,omitempty"`
+	// KillArmed / KillV4 / KillV6 / KillReason 说清故障断网保护此刻到底在不在。
+	// 四个都要：只报「用户开了」会让一次没装成功的保护看起来像保护到位了，
+	// 而这道闸门失灵的后果是本机所有出站照旧裸奔，界面上一切正常。
+	KillArmed bool `json:"killArmed"`
+	KillV4    bool `json:"killV4"`
+	KillV6    bool `json:"killV6"`
+	// KillEnabled 是用户有没有开这道保护。它和 KillArmed 必须分开：
+	// 「没开」是配置，「开了但没触发」是正常状态，「触发了没挂上」才是故障。
+	KillEnabled bool `json:"killEnabled"`
+	// KillReason 是「为什么没挂上 / 只挂上了一族」，挂全了为空。
+	KillReason string `json:"killReason,omitempty"`
 }
 
 // TUN 是一块虚拟网卡加挂在它上面的用户态协议栈。
@@ -107,14 +145,57 @@ type TUN struct {
 	running   bool
 	startedAt time.Time
 	lastErr   error
-	applied   []Cmd
-	plan      RoutePlan
+	// helperMismatchAt 是上一次「helper 因为协议版本对不上而拒收」的时刻（Unix 毫秒，0=没有）。
+	// 记着它只为一件事：这种失败不会自己好，除非有人刷新那个文件或重启面板，
+	// 所以在那之前每轮启用都再叫一次 root，只是把同一句拒绝多打几遍。
+	// 用原子而不是 mu：登记它的地方有持锁的（Start 那一路），也有不持锁的
+	// （监视器的重钉、断网保护的挂摘）——一份字段配两套锁纪律，迟早会写错一处。
+	helperMismatchAt atomic.Int64
+	applied          []Cmd
+	plan             RoutePlan
 	// v6Ready 记「v6 那一组命令全装上了」。DNS 只在它为真时才发假 v6 地址：
 	// 发出去却路由不到，应用只会一路连到超时，而 NODATA 至少能退回 A 记录。
 	v6Ready bool
+	// v6RouteReady 记「v6 默认路由真的交给 tun 了」。
+	// 它和 v6Ready 分开：v6Ready 说的是假 IP 与 DNS 劫持能不能用，
+	// v6RouteReady 说的是 v6 全局流量有没有被接管。
+	// 两者可以一个成一个不成（v6 网卡有地址但默认路由装不上），
+	// 合成一个字段就只剩一个说不清的布尔值。
+	v6RouteReady bool
+	// 内核眼里的接管现状（带 2 秒缓存）。与上面两个「我们装没装上」的字段分开存：
+	// 前者是事实，后者是意图，二者不一致的那一刻正是最需要界面说实话的时候。
+	takeoverV4 bool
+	takeoverV6 bool
+	takeoverAt time.Time
 
-	active    atomic.Int64
-	dnsServed atomic.Int64
+	// watchCancel 是网络监视循环的取消函数；nil 表示没在监视。
+	watchCancel context.CancelFunc
+	// watchWG 等监视循环真正退出：拆除与重钉同时动路由会互相打架，
+	// 所以拆之前要确认没有一轮重钉正在进行。
+	watchWG sync.WaitGroup
+	// netSeen 是上一轮看到的网络状态，去抖时用来判断「稳没稳」。
+	netSeen routeState
+	// netPinnedDNS 是上一次重钉时看到的系统解析器。
+	// 拿它和当前比，是为了知道「DNS 是不是换人了」——
+	// 系统解析器一换，通常意味着 DHCP 换了一整套配置。
+	netPinnedDNS string
+	// netDownDesc 是上一次「网络断了」那句话的内容。
+	// 同一次中断里每 5 秒重打一遍，只会把日志里真出事的那几行埋掉；
+	// 形态变了（v4 回来 v6 没回来、DNS 换人）才算新消息，值得再说一次。
+	netDownDesc string
+
+	routeFixes atomic.Int64
+	// lastFixAt 是上一次重钉绕行路由的时刻（Unix 毫秒）。
+	lastFixAt atomic.Int64
+
+	// kill 是故障断网保护的实际落地状态（见 KillState）。
+	// 界面上「用户要不要这道保护」来自配置，「它到底在不在」只能从这里来。
+	kill KillState
+
+	active      atomic.Int64
+	dnsServed   atomic.Int64
+	dnsFailed   atomic.Int64
+	dnsFailedAt atomic.Int64
 }
 
 // New 只做参数校验与假 IP 表初始化，不碰系统。
@@ -182,6 +263,18 @@ func (t *TUN) Start(ctx context.Context) error {
 		return err
 	}
 	t.plan = plan
+	// 监视器的起点就是「当前装的是哪一份」：
+	// 第一轮探测拿它和现状比，差得多就说明网络真的动了。
+	t.initNetWatch(plan)
+
+	// 动 root 之前先问一句对面是谁：版本对不上是「此后再试多少次都一样」的失败，
+	// 而这一问只要一次无特权的 fork（见 helper_probe.go 里那段故障记录）。
+	if t.usesHelper() {
+		if err := t.preflightHelper(ctx); err != nil {
+			t.lastErr = err
+			return err
+		}
+	}
 
 	// 无条件先清残留：上一次被 kill -9 的话，劫持规则还挂在 nat 表上，
 	// 而它指向的地址已经随网卡一起没了，整机解析会挂。
@@ -213,6 +306,15 @@ func (t *TUN) Start(ctx context.Context) error {
 	t.running = true
 	t.startedAt = time.Now()
 	t.lastErr = nil
+	// 监视网络变化：换了网关之后绕行路由要重新钉，
+	// 否则发往节点的包会一直送到那个已经不存在的出口。
+	t.startNetWatchLocked()
+	// 监视器第一轮最快也要 5 秒之后；用户启用之后第一件事就是看那两格，
+	// 所以这里立刻问一次内核，别让面板在最该准的这一刻退回去猜。
+	t.publishTakeoverLocked(ctx)
+	if t.conf.DNSHijackEnabled() {
+		t.flushResolverCache(ctx)
+	}
 	logx.Infof("TUN 已启用: %s 地址 %s，假 IP %s，DNS 劫持点 %s:53",
 		t.conf.Device, t.conf.Address, t.conf.FakeIPRange, t.dnsAddress())
 	return nil
@@ -249,12 +351,24 @@ func (t *TUN) provision(ctx context.Context, plan RoutePlan) (linkDevice, []Cmd,
 			return nil, nil, fmt.Errorf("配置 tun 网络失败: %w（常见原因是缺少 CAP_NET_ADMIN，请用 sudo 或 setcap 启动）", err)
 		}
 		t.setV6Ready(t.applyV6(ctx, plan))
+		t.applyV6Route(ctx, plan)
 		return dev, up, nil
 	}
 
 	reply, fd, err := t.helper.Run(ctx, HelperRequest{V: helperProtoVersion, Action: ActionUp, Plan: plan})
 	if err != nil {
+		// 版本对不上要单独说：它是「此后再试多少次都一样」的那种失败，
+		// 而界面上拿到的原文只有两个版本号。
+		if advice := t.noteHelperMismatch(err.Error()); advice != "" {
+			return nil, nil, fmt.Errorf("经 tun.helper 开网卡失败: %v。%s", err, advice)
+		}
 		return nil, nil, fmt.Errorf("经 tun.helper 开网卡失败: %w", err)
+	}
+	t.clearHelperMismatch()
+	if !reply.V6OK && plan.Gateway6 == "" {
+		// helper 只报「成没成」，不解释为什么。这一句是给面板日志的：
+		// 否则用户只看到 v6 没启用，不知道是因为这台机器根本没有 v6 出口。
+		logx.Warnf("TUN: 本机没有 v6 默认路由，v6 假 IP 不发（AAAA 回 NODATA，应用退回 A 记录）")
 	}
 	dev, err := deviceFromFD(fd, reply.Device, reply.MTU)
 	if err != nil {
@@ -273,6 +387,7 @@ func (t *TUN) provision(ctx context.Context, plan RoutePlan) (linkDevice, []Cmd,
 		applied = append(applied, Cmd{Desc: desc})
 	}
 	t.setV6Ready(reply.V6OK)
+	t.setV6RouteReady(reply.V6RouteOK)
 	logx.Infof("TUN: 网卡 %s 由 tun.helper 创建，fd 已交给本进程（uid=%d）", reply.Device, t.uid)
 	return dev, applied, nil
 }
@@ -282,6 +397,11 @@ func (t *TUN) releaseSystem(ctx context.Context, plan RoutePlan) error {
 	if !t.usesHelper() {
 		_, down, err := plan.Plan()
 		if err == nil {
+			// v6 接管那一组要一起撤：它装了 v6 默认路由与 v6 绕行路由，
+			// 留着的话下次启动的绕行路由会指向可能已经失效的网关。
+			if _, v6down, verr := plan.PlanV6Route(); verr == nil {
+				down = append(v6down, down...)
+			}
 			if _, v6down, verr := plan.PlanV6(); verr == nil {
 				down = append(v6down, down...)
 			}
@@ -291,14 +411,24 @@ func (t *TUN) releaseSystem(ctx context.Context, plan RoutePlan) error {
 		}
 		var errs []error
 		for _, c := range down {
-			if _, err := t.runner.Run(ctx, c); err != nil {
+			out, err := t.runner.Run(ctx, c)
+			// 判据与 helper 那一路同一份（tolerates）：以前这里只看"有没有报错"，
+			// 于是网卡先消失时那三条必然的 Cannot find device 被当成拆除失败，
+			// 面板显示"TUN 已停止但撤销出错"，而实际上系统里干干净净。
+			if err != nil && !tolerates(c, out) {
 				errs = append(errs, fmt.Errorf("%s: %w", c.Desc, err))
 			}
 		}
 		return errors.Join(errs...)
 	}
+	// 拆除这一路**永远不跳过**，哪怕已知版本对不上：跳过不会让失败变小，只会让它改名——
+	// 网卡、路由与劫持规则就留在机器上了，而那正是「面板显示已停、整机 DNS 挂死」的形态。
+	// 这里能做的只有把该动哪一边说清楚。
 	reply, _, err := t.helper.Run(ctx, HelperRequest{V: helperProtoVersion, Action: ActionDown, Plan: plan})
 	if err != nil {
+		if advice := t.noteHelperMismatch(err.Error()); advice != "" {
+			return fmt.Errorf("%w。%s（拆除这一步不能跳：跳了那些东西就留在机器上）", err, advice)
+		}
 		return err
 	}
 	if !reply.OK {
@@ -307,26 +437,96 @@ func (t *TUN) releaseSystem(ctx context.Context, plan RoutePlan) error {
 		}
 		return errors.New(reply.Err)
 	}
+	t.clearHelperMismatch()
 	return nil
+}
+
+// flushResolverCache 清掉系统解析器里的缓存。
+//
+// 为什么两头都要刷：装好劫持之后，缓存里可能还压着几十秒前问到的**真 IP**，
+// 那些地址不进 tun，全局模式下的去向下落就少了一截；而拆掉劫持之后，
+// 缓存里压着的却是**假 IP**——它们指向一块已经不存在的网卡，
+// 症状是「代理关了，浏览器反而几分钟上不了网」，且只有这一个解释。
+// 失败只记 Debug：resolvectl 不在（非 systemd 解析器）时这一步本来就没有意义。
+func (t *TUN) flushResolverCache(ctx context.Context) {
+	out, err := t.runner.Run(ctx, Cmd{Bin: "resolvectl", Args: []string{"flush-caches"}, Desc: "清系统解析器缓存", Optional: true})
+	if err != nil && !tolerates(Cmd{Optional: true}, out) {
+		logx.Debugf("TUN: 刷系统解析器缓存失败（不影响接管本身）: %v", err)
+	}
+}
+
+// helperMismatchSilence 是「已知两边版本对不上」这句话的保质期。
+// 之所以要有保质期而不是永久拉黑：修法就是把那一侧换成同一个构建，
+// 而刷新文件这件事不需要本进程配合——下一次调用自然会成功，
+// 成功的那一刻缓存就被清掉（见 clearHelperMismatch）。
+const helperMismatchSilence = 60 * time.Second
+
+// errHelperMismatchSkip 标出「这一趟压根没发出去，因为已知会被拒」。
+// 调用方靠它把日志降到 Debug：监视器每 5 秒一轮，
+// 每轮一条 WARN 会把日志刷满，把真正有用的那几行埋掉。
+var errHelperMismatchSkip = errors.New("已知 helper 的协议版本与本程序对不上")
+
+// noteHelperMismatch 认一次 helper 失败是不是协议版本对不上；是的话记一笔，
+// 并把「该动哪一边」这句话回给调用方拼进错误里（不是版本问题就返回空串）。
+func (t *TUN) noteHelperMismatch(errText string) string {
+	mine, theirs, ok := helperVersionRejection(errText)
+	if !ok {
+		return ""
+	}
+	t.helperMismatchAt.Store(time.Now().UnixMilli())
+	// 路径取自 conf.Helper 而不是 helper.Argv：要告诉用户「动哪个文件」，
+	// 而那个文件由配置决定；客户端结构体是可以在测试里整个换掉的。
+	return helperMismatchAdvice(mine, theirs, t.conf.Helper)
+}
+
+// clearHelperMismatch 一次成功的 helper 往返就是「两边其实是同一个协议」的实测证据，
+// 缓存必须当场作废：文件被刷新的那一刻起，跳过理由就不存在了。
+func (t *TUN) clearHelperMismatch() { t.helperMismatchAt.Store(0) }
+
+// helperMismatchKnown 报告现在再叫 helper 是否注定还是那句拒绝。
+func (t *TUN) helperMismatchKnown() bool {
+	ms := t.helperMismatchAt.Load()
+	return ms != 0 && time.Since(time.UnixMilli(ms)) < helperMismatchSilence
 }
 
 // cleanupStale 清历史残留。配了 helper 就必须让它去跑 iptables——
 // 在本进程跑只会在普通用户下全军覆没，而「残留没清」正是整机 DNS 挂掉那个坑。
 func (t *TUN) cleanupStale(ctx context.Context) []string {
 	if !t.usesHelper() {
-		return CleanupStale(ctx, t.runner, t.uid, t.conf.Device, t.conf.Address)
+		done := CleanupStale(ctx, t.runner, t.uid, t.conf.Device, t.conf.Address)
+		// 残链同样要清：那条链拦的是本机所有出站，而挂上它的那个进程可能根本没走到摘的那步。
+		return append(done, CleanupKill(ctx, t.runner)...)
+	}
+	if t.helperMismatchKnown() {
+		// 已知对面会因为版本拒收：这一趟注定白跑，而且它留下的日志与「第一次失败」
+		// 长得一模一样，看日志的人分不清是在重试还是在恶化。
+		logx.Debugf("TUN: 跳过经 helper 清残留（已知协议版本对不上，刷新二进制或重启面板之前不会再变）")
+		return nil
 	}
 	reply, _, err := t.helper.Run(ctx, CleanupRequest(t.uid, t.conf.Device, t.conf.Address))
 	if err != nil {
 		// 清残留失败不阻断启用：下面的 up 本身是可重入的。
-		logx.Warnf("TUN: 经 helper 清残留失败，继续尝试启用: %v", err)
+		if advice := t.noteHelperMismatch(err.Error()); advice != "" {
+			logx.Warnf("TUN: 经 helper 清残留失败，继续尝试启用: %v。%s", err, advice)
+		} else {
+			logx.Warnf("TUN: 经 helper 清残留失败，继续尝试启用: %v", err)
+		}
 		return nil
 	}
+	t.clearHelperMismatch()
 	return reply.Removed
 }
 
 // Stop 关栈、拆路由、销网卡。可重复调用。
 func (t *TUN) Stop(ctx context.Context) error {
+	// 先停监视并等它真正退出，再拆：监视循环可能正在重钉路由，
+	// 拆与钉同时动路由会互相打架（拆完又被钉回来，界面显示已停而路由还在）。
+	// 这一步不能持有 t.mu：监视循环正等着这把锁。
+	t.mu.Lock()
+	t.stopNetWatchLocked()
+	t.mu.Unlock()
+	t.watchWG.Wait()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.running && t.dev == nil {
@@ -352,12 +552,28 @@ func (t *TUN) teardownLocked(ctx context.Context) error {
 		}
 		t.stack = nil
 	}
+	// 网卡的 fd 归协议栈所有：上面那句 stack.Close() 销毁链路时已经调过一次 Close()
+	// 了（非 persistent 的 tun 就是在那一刻消失的，挂在它上面的路由被内核一并收走）。
+	// 这里这一次是兜底——比如栈没建起来那条路径——fdDevice.Close() 里有 once，
+	// 重复调用不会再关一遍同一个描述符。
 	if t.dev != nil {
 		t.dev.Close()
 		t.dev = nil
 	}
-	// 网卡一消失，内核会自动收掉挂在它上面的路由；iptables 却不会自己干净，
-	// 所以这里按 best-effort 跑一遍 Down 列表，重点保证劫持规则被摘掉。
+	// 出站保护必须先摘，而且要在自己的时间预算里摘：那条链拦的是本机所有出站，
+	// TUN 拆干净了却把 DROP 留在机器上，用户看到的症状是「关了代理反而上不了网」。
+	if t.kill.Armed {
+		kctx, kcancel := context.WithTimeout(context.Background(), disarmTimeout)
+		defer kcancel()
+		if err := t.disarm(kctx); err != nil {
+			errs = append(errs, fmt.Errorf("摘除出站保护失败（本机出站可能仍被限制）: %w", err))
+		} else {
+			t.kill = KillState{}
+		}
+	}
+	// 按 best-effort 跑一遍 Down 列表。点名网卡的那几条容忍"设备已经没了"
+	// （见 tolerateGone）：网卡先消失的话内核已经把路由收走了，那条命令要的效果已经达成；
+	// 而 iptables 那些不会随网卡消失的规则，这里删不掉就是真残留，必须报错。
 	if t.plan.Device != "" {
 		if err := t.releaseSystem(ctx, t.plan); err != nil {
 			errs = append(errs, err)
@@ -365,6 +581,8 @@ func (t *TUN) teardownLocked(ctx context.Context) error {
 		t.applied = nil
 		t.plan = RoutePlan{}
 	}
+	// 劫持规则已经拆了，缓存里那些假 IP 现在只会把人送进一块不存在的网卡。
+	t.flushResolverCache(ctx)
 	return errors.Join(errs...)
 }
 
@@ -372,6 +590,11 @@ func (t *TUN) teardownLocked(ctx context.Context) error {
 func (t *TUN) Status() Status {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// 接管那两格读的是监视器贴出来的内核读数；读不到或过期了就走记忆那一档。
+	// 这里一次进程都不 fork：面板每 1–2 秒问一次，而路由表每 5 秒已经被读过一次。
+	takeoverV4, takeoverV6, takeoverFrom := t.takeoverReading()
+
 	st := Status{
 		Enabled:     t.conf.Enable,
 		Running:     t.running,
@@ -386,8 +609,23 @@ func (t *TUN) Status() Status {
 		V6Ready:     t.v6Ready,
 		Active:      t.active.Load(),
 		DNSServed:   t.dnsServed.Load(),
+		DNSFailed:   t.dnsFailed.Load(),
+		DNSFailedAt: t.dnsFailedAt.Load(),
 		Privilege:   "self",
 		HelperCmd:   t.helper.Argv,
+		// 接管以内核为准：装上的那一刻之后路由随时可能被别人改回去，
+		// 而"我们装过"不是"现在还在"。读不到内核时退回进程记忆并如实标注来源。
+		TakeoverV4:   takeoverV4,
+		TakeoverV6:   takeoverV6,
+		TakeoverFrom: takeoverFrom,
+		RouteFixes:   t.routeFixes.Load(),
+		LastRouteFix: t.lastFixAt.Load(),
+		// 直接读 t.kill：这里已经持有 mu，而 Kill() 也要拿它（Go 的 Mutex 不可重入）。
+		KillArmed:   t.kill.Armed,
+		KillV4:      t.kill.V4,
+		KillV6:      t.kill.V6,
+		KillEnabled: t.conf.KillSwitch,
+		KillReason:  t.kill.Reason,
 	}
 	if t.usesHelper() {
 		st.Privilege = "helper"
@@ -445,6 +683,11 @@ func (t *TUN) dns6Address() string {
 // 表现是「AAAA 解析得出地址但连不上」——比回 NODATA 难查得多，
 // 因为应用不会退回 A 记录，它只会一直重试到超时。
 func (t *TUN) applyV6(ctx context.Context, plan RoutePlan) bool {
+	if !plan.v6FakeIPUsable() {
+		// 没有 v6 出口就不发假 v6：应用拿到一个拨不通的地址，比拿不到地址更糟。
+		logx.Warnf("TUN: 本机没有 v6 出口（没有 v6 默认路由），v6 假 IP 不发——AAAA 回 NODATA，应用退回 A 记录")
+		return false
+	}
 	up, down, err := plan.PlanV6()
 	if err != nil {
 		logx.Warnf("TUN: IPv6 那一组配置有问题，v6 假 IP 不启用（AAAA 仍回 NODATA）: %v", err)
@@ -462,6 +705,48 @@ func (t *TUN) applyV6(ctx context.Context, plan RoutePlan) bool {
 		return false
 	}
 	return true
+}
+
+// applyV6Route 单独应用 v6 全局接管那一组命令，成败用返回值表达。
+//
+// 失败只降级 v6 接管，不掀 v4：v4 的默认路由已经装好了，v6 装不上时
+// 整机照样能用 v4 出网，只是 v6 流量绕过 tun 而已。
+// 撤干净是必须的：留半套绕行路由比完全没装更糟——
+// 下次启动时它们会指向可能已经失效的网关，表现为「节点时好时坏」。
+//
+// 状态由本函数自己写：返回值与状态分成两处写，就迟早会出现
+// 「返回成功但状态是 false」这种自相矛盾。
+func (t *TUN) applyV6Route(ctx context.Context, plan RoutePlan) bool {
+	up, down, err := plan.PlanV6Route()
+	if err != nil {
+		logx.Warnf("TUN: IPv6 接管这一组配置有问题，v6 默认路由不交给 tun（v6 流量走系统默认出口）: %v", err)
+		t.setV6RouteReady(false)
+		return false
+	}
+	if len(up) == 0 {
+		if plan.StrictRoute && plan.Address6 != "" {
+			logx.Infof("TUN: 没有可用的 IPv6 网关或网卡，v6 默认路由不交给 tun（v6 流量走系统默认出口）")
+		}
+		t.setV6RouteReady(false)
+		return false
+	}
+	if err := Apply(ctx, t.runner, up); err != nil {
+		logx.Warnf("TUN: IPv6 全局接管未生效，已撤回这一组（v6 流量走系统默认出口）: %v", err)
+		if derr := Apply(ctx, t.runner, down); derr != nil {
+			logx.Warnf("TUN: 撤回 IPv6 接管配置时也没干净: %v", derr)
+		}
+		t.setV6RouteReady(false)
+		return false
+	}
+	logx.Infof("TUN: IPv6 默认路由已交给 %s，v6 全局流量进入隧道", plan.Device)
+	t.setV6RouteReady(true)
+	return true
+}
+
+// setV6RouteReady 记录 v6 默认路由是否真的接管了。
+// Start 已经持有 t.mu，这里不再加锁。
+func (t *TUN) setV6RouteReady(ok bool) {
+	t.v6RouteReady = ok
 }
 
 // buildPlan 补齐需要现场探测的字段：当前默认路由（strict_route 的排除路由要用）。
@@ -486,11 +771,32 @@ func (t *TUN) buildPlan(ctx context.Context) (RoutePlan, error) {
 		if err != nil {
 			return plan, fmt.Errorf("查默认路由失败，无法安全开启 strict_route: %w", err)
 		}
-		gw, iface, ok := ParseDefaultRoute(out)
-		if !ok {
-			return plan, errors.New("tun: 没找到默认路由，strict_route 会把默认路由指向一个不存在的出口")
+		dr, ok := ParseDefaultRouteExcept(out, plan.Device)
+		if ok && dr.Gateway != "" {
+			plan.Gateway, plan.Interface = dr.Gateway, dr.Iface
+		} else {
+			// 没有 v4 默认路由（或它没有网关）：这一族不接管。
+			// 只有 v6 的网络照样要能用 v6 接管，所以这里不是致命错误。
+			logx.Infof("TUN: 本机没有可用的 IPv4 默认路由，IPv4 全局接管不成，v4 流量走系统默认出口")
 		}
-		plan.Gateway, plan.Interface = gw, iface
+		// v6 那一族单独探测。没有 v6 默认路由是常态（很多网络只有 v4），
+		// 所以查不到不算失败——只是 v6 接管不成，界面会如实说没接管。
+		out6, err6 := t.runner.Run(ctx, Cmd{Bin: "ip", Args: []string{"-6", "-o", "route", "show", "default"}, Desc: "查 IPv6 默认路由"})
+		if err6 != nil {
+			logx.Debugf("TUN: 查不到 IPv6 默认路由（%v），IPv6 全局接管不成，v6 流量走系统默认出口", err6)
+		} else if dr6, ok6 := ParseDefaultRouteExcept(out6, plan.Device); ok6 {
+			if dr6.Gateway != "" {
+				plan.Gateway6, plan.Interface6 = dr6.Gateway, dr6.Iface
+			} else {
+				logx.Warnf("TUN: IPv6 默认路由没有网关（dev %s），不做 v6 全局接管：钉不回绕行路由，装了默认路由我们的出站会被自己抓回去", dr6.Iface)
+			}
+		} else {
+			logx.Infof("TUN: 本机没有 IPv6 默认路由，IPv6 全局接管不成，v6 流量走系统默认出口")
+		}
+		// 两族都没有可用的网关：无处可去，strict_route 装不了。
+		if plan.Gateway == "" && plan.Gateway6 == "" {
+			return plan, errors.New("tun: 没有可用的默认路由网关，strict_route 会把默认路由指向一个不存在的出口")
+		}
 		// 自己的出站必须先绕开 tun：DNS 上游与被代理服务端一旦落进 tun，
 		// 我们发出的包会被自己再抓一遍，形成环路。
 		for _, ip := range t.bypass {
@@ -555,10 +861,11 @@ func (t *TUN) relayTCP(c adapter.TCPConn) {
 	// 拨了出去。发 TCP DNS 的（Go 程序在 UDP 应答被截断时、以及开了 TC 的 glibc）
 	// 拿不到任何应答，只能等到超时。
 	if dst.Port() == 53 {
-		n, err := serveDNSOverTCP(c, t.dns.Serve, dnsTCPIdle)
+		n, bad, err := serveDNSOverTCP(c, t.dns.Reply, dnsTCPIdle)
 		t.dnsServed.Add(int64(n))
+		t.countDNSFailures(bad)
 		if err != nil {
-			logx.Debugf("tun dns(tcp) %s 处理中断（已应答 %d 条）: %v", src, n, err)
+			logx.Debugf("tun dns(tcp) %s 处理中断（已应答 %d 条，其中失败 %d 条）: %v", src, n, bad, err)
 		}
 		return
 	}
@@ -654,18 +961,37 @@ func (t *TUN) serveUDPDNS(c adapter.UDPConn, src string) {
 		}
 		query := append([]byte(nil), buf[:n]...)
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		resp, err := t.dns.Serve(ctx, query)
+		rep, err := t.dns.Reply(ctx, query)
 		cancel()
 		if err != nil {
 			logx.Warnf("tun dns %s 应答失败: %v", src, err)
 			return
 		}
-		t.dnsServed.Add(1)
-		if _, err := c.Write(resp); err != nil {
+		// 分开计是这一轮补上的：SERVFAIL 也"应答过"，但把上游全挂时的一百次失败
+		// 报成「已应答 DNS 一百次」说的是反话——这个数字的用途就是证明劫持在工作。
+		if rep.ServFail {
+			t.countDNSFailures(1)
+		} else {
+			t.dnsServed.Add(1)
+		}
+		if _, err := c.Write(rep.Packet); err != nil {
 			logx.Debugf("tun dns 写回失败: %v", err)
 			return
 		}
 	}
+}
+
+// countDNSFailures 记几笔「上游没答上」：累计数与最近时刻一起写。
+//
+// 两个都要，因为它们回答的是两个问题：告警那句要的是"现在还在失败吗"，
+// 统计那一栏要的是"这一共失败过多少次"。只给累计数的话，
+// 一次网络抖动留下的告警会一直亮到重启——那种告警教给用户的不是排查，是忽略它。
+func (t *TUN) countDNSFailures(n int) {
+	if n <= 0 {
+		return
+	}
+	t.dnsFailed.Add(int64(n))
+	t.dnsFailedAt.Store(time.Now().UnixMilli())
 }
 
 // udpIdle 是 UDP 关联的空闲回收窗口。
@@ -718,6 +1044,10 @@ func (t *TUN) relayUDP(c udpFlow, dst netip.AddrPort, srcAddr netip.AddrPort, sr
 		// 「这条路本来就不通」（节点协议不带 UDP、会话数打满）不是节点故障，
 		// 但也不能静默丢掉——应用的表现会是干等到超时，而超时从不说为什么。
 		logx.Warnf("tun udp %s -> %s 未转发: %v", src, dialTarget, err)
+		// 与 relayTCP 同一句话的理由：拨不通要在流量页留一行。
+		// UDP 这一侧尤其需要，因为它连个错误都传不回应用（丢包是唯一能表达的）——
+		// 界面上不出现，用户手上就什么都没有：QUIC 站点打不开，而连接表一片干净。
+		t.reg.Refuse("tun", src, dialTarget, res, err.Error())
 		return
 	}
 	defer pc.Close()

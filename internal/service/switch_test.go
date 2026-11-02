@@ -209,6 +209,20 @@ func TestSetActiveProfileWhileStoppedOnlyWritesConfig(t *testing.T) {
 
 // brokenNode 是一个必然装配失败的节点：.invalid 顶级域按 RFC 6761 永远不可能被解析，
 // 所以不管有没有可用的 DNS，outbound.New 都会在这里返回错误。
+// fakeDNSActive 报告这台机器此刻的解析器是不是在**给任意名字编造答案**：
+// 全局 TUN 接管时，本机解析器对任何域名都回 198.18.x 假 IP（那是它的设计），
+// 而下面两条用例靠「.invalid 解析不了」来造出「装配必然失败」。
+// 那种环境下前提不成立——这不是被测逻辑坏了，是场景换了，所以要**带原因地跳过**，
+// 而不是让它们红得莫名其妙（2026-10-29：面板开着 global + TUN 时实际红过）。
+func fakeDNSActive() bool {
+	addrs, err := lookupHostFn("no-such-host.invalid")
+	return err == nil && len(addrs) > 0
+}
+
+// lookupHostFn 只为让上面那条判据能被测到：不能只写一句「会跳过」就了事，
+// 得证明它在「解析器编答案」时真的返回 true。
+var lookupHostFn = net.LookupHost
+
 const brokenNode = `  - name: bad-dns
     server: { addr: "no-such-host.invalid:443", auth: "x", bandwidth: { up: "50 mbps", down: "50 mbps" } }`
 
@@ -221,6 +235,9 @@ const brokenNode = `  - name: bad-dns
 // Connected/ProxyStatus 却还挂在旧节点上，流量也真的还在走旧节点：
 // 界面显示"已切换"，实际什么都没切，而且没有任何错误信息能解释这个矛盾。
 func TestFailedSwitchLeavesNoTornState(t *testing.T) {
+	if fakeDNSActive() {
+		t.Skip("系统解析器正对任意名字回假 IP（有 TUN 在接管）：`.invalid 解析不了` 这个前提不成立")
+	}
 	path := profileConfig(t, brokenNode)
 	svc := New(path, nil)
 	if err := svc.Start(); err != nil {
@@ -274,6 +291,9 @@ func TestFailedSwitchLeavesNoTornState(t *testing.T) {
 // 不失败的话结果是「活动节点从配置里消失了，运行时却还在用它」——
 // 配置里再没有任何一条记录描述正在承载流量的那个出口。
 func TestRemoveActiveProfileWithUnusableReplacementAborts(t *testing.T) {
+	if fakeDNSActive() {
+		t.Skip("系统解析器正对任意名字回假 IP（有 TUN 在接管）：`.invalid 解析不了` 这个前提不成立")
+	}
 	path := profileConfig(t, brokenNode)
 	svc := New(path, nil)
 	if err := svc.Start(); err != nil {
@@ -311,5 +331,22 @@ func TestRemoveActiveProfileWithUnusableReplacementAborts(t *testing.T) {
 	}
 	if after.Inbounds[0].Addr != probe || after.StartedAt != before.StartedAt {
 		t.Fatal("失败的删除动了运行中的服务")
+	}
+}
+
+// TestFakeDNSDetectsFabricatedAnswers 判据本身要有用例：
+// 「会跳过」这三个字没有测试保护时，最可能的结局是它永远返回 false（那两条用例照旧红），
+// 或者永远返回 true（那两条从此再也不跑）。
+func TestFakeDNSDetectsFabricatedAnswers(t *testing.T) {
+	old := lookupHostFn
+	t.Cleanup(func() { lookupHostFn = old })
+
+	lookupHostFn = func(string) ([]string, error) { return []string{"198.18.0.2"}, nil }
+	if !fakeDNSActive() {
+		t.Error("解析器编了一个假 IP，却没被认成「假 DNS 正在生效」")
+	}
+	lookupHostFn = func(string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} }
+	if fakeDNSActive() {
+		t.Error("正常的 NXDOMAIN 被判成了「假 DNS 在生效」——那两条用例会被永久跳过")
 	}
 }

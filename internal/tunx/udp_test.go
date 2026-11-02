@@ -3,6 +3,7 @@ package tunx
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -283,9 +284,12 @@ func TestRelayUDPRefusesUnknownFakeIP(t *testing.T) {
 }
 
 // TestRelayUDPWhenOutboundRefusesEndsCleanly 是「明确拒绝」的守卫：
-// 带不动的 UDP 必须立刻收尾并留下带原因的日志，而不是把应用挂在超时里。
+// 带不动的 UDP 必须立刻收尾、留下带原因的日志**和带原因的连接记录**，
+// 而不是把应用挂在超时里。
 func TestRelayUDPWhenOutboundRefusesEndsCleanly(t *testing.T) {
 	tr := newTUNForUDP(t, &refusingUDPOutbound{name: "PROXY"})
+	reg := metrics.NewRegistry(10, 0)
+	tr.reg = reg
 
 	fake, err := tr.fake.Allocate("a.example.com")
 	if err != nil {
@@ -306,5 +310,33 @@ func TestRelayUDPWhenOutboundRefusesEndsCleanly(t *testing.T) {
 	}
 	if tr.active.Load() != 0 {
 		t.Errorf("被拒的关联不该计入活跃: %d", tr.active.Load())
+	}
+
+	// 这一条是这轮补上的：被拒的 UDP 必须出现在流量页上。
+	// 理由不是"多一行好看"——UDP 传不回任何错误给应用（丢包是它唯一的表达方式），
+	// QUIC 站点打不开时应用侧一片安静，连接表再没有这一行，用户手上就什么都没有。
+	snap := reg.Snapshot()
+	if snap.TotalFailed != 1 {
+		t.Fatalf("被拒的 UDP 没进「拨不通」的账: TotalFailed=%d history=%+v", snap.TotalFailed, snap.History)
+	}
+	var row metrics.ConnView
+	for _, h := range snap.History {
+		if h.Err != "" {
+			row = h
+		}
+	}
+	if row.ID == 0 {
+		t.Fatal("历史里找不到带失败原因的那一行")
+	}
+	if row.Inbound != "tun" || row.Host != "a.example.com" || row.Port != "443" {
+		t.Errorf("失败行指错了目标: %+v", row)
+	}
+	// 原因要能看出是"这条路带不动 UDP"，而不是笼统一个"失败"：
+	// 用户据此判断该换节点（HY2）还是该换规则。
+	if !strings.Contains(row.Err, "UDP") {
+		t.Errorf("失败原因没说是 UDP 带不动: %q", row.Err)
+	}
+	if row.Up+row.Down != 0 {
+		t.Errorf("一条根本没建起来的关联不该有字节: %+v", row)
 	}
 }

@@ -403,15 +403,43 @@ func TestRoutePlanStrictRoute(t *testing.T) {
 		t.Errorf("down 没撤销路由:\n%s", downText)
 	}
 
-	// 没有已知网关时坚决不进入 strict_route：把默认路由指向一个不存在的出口，
-	// 等于把这台机器的网络关掉。
-	if _, _, err := (RoutePlan{Device: "t", Address: "10.0.0.1/24", StrictRoute: true}).Plan(); err == nil {
-		t.Error("缺网关时应报错")
+	// 这一族没有网关时，这一族整组不装（只有 v6 的机器照样要能用 v6 接管）。
+	// 「两族都没有网关」由 buildPlan 拦——那里才是真正决定能不能接管的地方。
+	up, _, err = (RoutePlan{Device: "t", Address: "10.0.0.1/24", StrictRoute: true}).Plan()
+	if err != nil {
+		t.Fatalf("缺一族的网关不该报错: %v", err)
+	}
+	for _, c := range up {
+		if strings.Contains(c.String(), "route add default") {
+			t.Errorf("没有网关却装了默认路由: %s", c.String())
+		}
 	}
 }
 
 // TestApplyTreatsFileExistsAsSuccess 盯住那次把 TUN 永久卡住的故障：
 // 排除路由已经在了，ip route add 回 EEXIST，却被当成致命错误 → 开启路径不可重入。
+// TestApplyTreatsChainAlreadyExistsAsSuccess iptables 的「已经存在」不说 File exists。
+//
+// 只认 iproute2 那句措辞的代价是真实发生过的：重挂断网保护时 -N 报
+// "Chain already exists."，Apply 把它判成失败，于是 ArmKill 走回滚并报告「未生效」——
+// 每一次白名单变化都把刚刚挂上的保护摘掉，而用户以为它在。
+// 一个判据要同时对上两套工具的措辞，因为它们本来就挂在同一份计划上。
+func TestApplyTreatsChainAlreadyExistsAsSuccess(t *testing.T) {
+	r := &recorderRunner{fail: map[string]error{
+		"iptables -t filter -N wps_app_kill": errors.New("iptables: Chain already exists."),
+	}}
+	err := Apply(context.Background(), r, []Cmd{
+		{Bin: "iptables", Args: []string{"-t", "filter", "-N", "wps_app_kill"}, Desc: "建链", TolerateExists: true},
+		{Bin: "iptables", Args: []string{"-t", "filter", "-I", "OUTPUT", "1", "-j", "wps_app_kill"}, Desc: "挂载点"},
+	})
+	if err != nil {
+		t.Fatalf("链已存在应视为成功（那正是我们要的状态）: %v", err)
+	}
+	if len(r.ran) != 2 {
+		t.Fatalf("后续步骤应继续执行，挂载点不能被漏掉: %v", r.ran)
+	}
+}
+
 func TestApplyTreatsFileExistsAsSuccess(t *testing.T) {
 	r := &recorderRunner{fail: map[string]error{
 		"ip route add 223.5.5.5/32 via 10.180.63.254 dev wlp3s0f0": errors.New("RTNETLINK answers: File exists"),
@@ -443,11 +471,11 @@ func TestApplyTreatsFileExistsAsSuccess(t *testing.T) {
 }
 
 func TestParseDefaultRoute(t *testing.T) {
-	gw, iface, ok := ParseDefaultRoute("default via 10.180.63.254 dev wlp3s0f0 proto dhcp metric 600\n")
-	if !ok || gw != "10.180.63.254" || iface != "wlp3s0f0" {
-		t.Fatalf("解析失败: %q %q %v", gw, iface, ok)
+	dr, ok := ParseDefaultRoute("default via 10.180.63.254 dev wlp3s0f0 proto dhcp metric 600\n")
+	if !ok || dr.Gateway != "10.180.63.254" || dr.Iface != "wlp3s0f0" {
+		t.Fatalf("解析失败: %+v %v", dr, ok)
 	}
-	if _, _, ok := ParseDefaultRoute("10.0.0.0/24 dev eth0\n"); ok {
+	if _, ok := ParseDefaultRoute("10.0.0.0/24 dev eth0\n"); ok {
 		t.Fatal("没有默认路由时不该报成功")
 	}
 }

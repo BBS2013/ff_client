@@ -50,12 +50,12 @@ func (s *Service) startTUN(cfg *config.Config) error {
 		// 句柄留着：Status 里的 LastError 是界面唯一的错误来源，
 		// 丢了句柄就只剩日志里一行字。
 		s.mu.Lock()
-		s.tun = t
+		s.tun, s.killOp = t, t
 		s.mu.Unlock()
 		return err
 	}
 	s.mu.Lock()
-	s.tun = t
+	s.tun, s.killOp = t, t
 	s.mu.Unlock()
 	return nil
 }
@@ -85,7 +85,7 @@ func (s *Service) stopTUN() error {
 		// 一旦丢掉句柄，界面上再没有任何入口能清理它，只能手敲 -tun-reset。
 		return err
 	}
-	s.tun = nil
+	s.tun, s.killOp = nil, nil
 	return nil
 }
 
@@ -178,11 +178,14 @@ func tunStatusFromConfig(tc config.TUNConfig) tunx.Status {
 		StrictRoute: tc.StrictRoute,
 		// TUN 没在跑，V6Ready 只能是 false。但「用户要不要 v6」仍然要报出来——
 		// 面板上这一栏是「开着的」还是「没要的」，两者的排查方向完全不同。
-		IPv6:      tc.IPv6On(),
-		V6Ready:   false,
-		HelperCmd: tc.Helper,
-		Privilege: "self",
-		Applied:   []string{},
+		IPv6:    tc.IPv6On(),
+		V6Ready: false,
+		// 保护「开没开」来自配置，TUN 没在跑时也一样要报——界面上
+		// 「用户没要这道保护」和「要了，但现在挂不上」是两回事。
+		KillEnabled: tc.KillSwitch,
+		HelperCmd:   tc.Helper,
+		Privilege:   "self",
+		Applied:     []string{},
 	}
 	if len(tc.Helper) > 0 {
 		st.Privilege = "helper"

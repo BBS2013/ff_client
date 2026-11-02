@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"time"
@@ -33,6 +34,13 @@ type ProfileView struct {
 	// QuotaText 是人写下来的那一句原文（"1.5TiB"）。界面用它说话，
 	// 用 QuotaBytes 算百分比——两份各有分工，不是同一个值的两份拷贝。
 	QuotaText string `json:"quotaText"`
+	// CoolingUntil 是这个节点被自动切走之后的冷却到期时刻（Unix 毫秒），
+	// 0 = 不在冷却里。
+	//
+	// 界面必须说出来：用户手动点回一个「其实还在冷却」的节点时，
+	// 下一次自动切换会立刻又把它切走，看起来像「程序不听我的」。
+	// 冷却只约束自动切换，手动选节点永远有效——这条得写在界面上。
+	CoolingUntil int64 `json:"coolingUntil"`
 }
 
 // ProfileSpec 是新增/修改一个节点时要填的字段。
@@ -147,7 +155,17 @@ func (s *Service) Profiles() ([]ProfileView, string, error) {
 		return nil, "", fmt.Errorf("配置不可用")
 	}
 	_, activeName := activeServerFor(cfg, s.activeOverride())
-	return profileViews(cfg, activeName), activeName, nil
+	return profileViews(cfg, activeName, s.coolingSnapshot()), activeName, nil
+}
+
+// coolingSnapshot 在锁外安全地取一份冷却表。
+func (s *Service) coolingSnapshot() map[string]time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cooling) == 0 {
+		return nil
+	}
+	return maps.Clone(s.cooling)
 }
 
 // activeOverride 读出本次运行的自动切换结果。
@@ -187,7 +205,14 @@ func (s *Service) SetActiveProfile(name string) error {
 	// 用户明确点名了要哪个节点，自动切换的那个结论就此作废：
 	// 留着它，界面上看到的永远不是用户选的那个，而且没人能解释为什么。
 	s.clearFailoverOverride()
-	return s.commitProxy(proxy)
+	if err := s.commitProxy(proxy); err != nil {
+		return err
+	}
+	// 人工选点也要把故障断网保护摘掉。这是那把锁唯一的手动出口：
+	// 自动切换判死的时候，备用节点的地址多半还没解析出来、也就不在白名单里，
+	// 而现在用户亲手指了一个——继续拦着就是把用户自己的决定挡在规则后面。
+	s.disarmKill("已手动选择节点 " + name)
+	return nil
 }
 
 // clearFailoverOverride 丢掉本次运行的自动切换结果，并清空失败流水。
@@ -196,6 +221,7 @@ func (s *Service) clearFailoverOverride() {
 	defer s.mu.Unlock()
 	s.failoverOverride = ""
 	s.switchedAt = time.Time{}
+	s.switchReason = ""
 	s.cooling = nil
 	s.faults = nil
 	// 轮次冷却也要一起清：用户刚亲手点过节点，下一次自动切换不该被上一轮的账卡住。
@@ -398,13 +424,169 @@ type ProfileTest struct {
 	PageChecked bool   `json:"pageChecked"`
 	Page        string `json:"page"`
 	PageErr     string `json:"pageErr"`
+	// SplitNote 非空 = 这次测速的代理流量没有按普通方式钉在点名的网卡上，
+	// 内容是分流给出的原因（普通进程钉不上、由提权 helper 代劳……）。
+	// 界面上它挂在读数下面一行：同样是红，"节点不通"与"我根本没走到那张卡上"
+	// 是两件要做不同决定的事。
+	SplitNote string `json:"splitNote"`
+	// HopAddr 是到节点那一条连接**实际用的源地址**（如 192.168.0.104:44546）。
+	// 它是从已建立的连接上读出来的，不是我们对自己的意图——所以主机路由、
+	// 策略路由、helper 代劳钉卡，各种情形下它都说得对。
+	//
+	// 但只对 TCP 系（trojan）成立。hysteria2 的流是 QUIC 上开出来的虚拟 stream，
+	// `LocalAddr()` 报的是隧道对端（实测把服务器 43.156.119.19:443 写了进来），
+	// 那不是任何一张网卡的源地址——照原话说出去，用户只会读成"没走代理那张卡"。
+	// 所以 UDP 这一族不用 HopAddr，改用 HopDev（见下）。
+	HopAddr string `json:"hopAddr"`
+	// HopDev 是这条隧道 socket 实际钉住的设备名（如 wlx001f0578cdff）。
+	//
+	// 它是 hysteria2 唯一说得对的出网证据：SO_BINDTODEVICE 钉住之后，
+	// 包只可能从这张设备出去，源地址由内核按它挑（通配绑定本来就没有源地址可读）。
+	//
+	// TCP 系（trojan）也会给：那里的设备名是从 socket 自己身上回读的
+	// （boundDevice，与 `ss` 显示的 %dev 后缀同一个来源），所以它和 HopAddr **一起**
+	// 出现，界面拼成「源地址%设备」。UDP 那一族仍然只有设备没有地址。
+	// 「互斥」的老规矩到此为止：互斥是当年 TCP 拿不出设备名时的将就，
+	// 而设备名恰恰是用户最想核对的那半句（2026-10-30 现场）。
+	HopDev string `json:"hopDev"`
 }
 
 // TestProfile 用指定节点单独握手并拨一次目标，量出建链耗时。
 //
 // 它与当前选中的节点无关：单独建一条临时出站，测完就关，
 // 因此在界面上点「测速」不会打断正在跑的隧道。
+//
+// 外面这一层只补两件事：把「分流有没有真的把代理钉到点名的网卡上」带给界面，
+// 以及给两类"看着像节点坏了"的读数加一句可核对的原因（见 annotateNodeFault）。
 func (s *Service) TestProfile(name, target string) ProfileTest {
+	res := s.testProfileCore(name, target)
+	note := s.splitCaveat()
+	if !s.IfaceSplitStatus().Enabled && (res.Error != "" || res.PageErr != "") {
+		// 分流没开 + 这次不通 = 代理流量走的是系统默认路由。这两句要一起说，
+		// 因为"证书不受信"最常见的成因就是出口上有人替换证书（2026-10-30 实测）。
+		note = "网卡分流没开，代理流量走的是系统默认路由"
+	}
+	res.SplitNote = note
+	res.Error = annotateNodeFault(res.Error, note)
+	res.PageErr = annotateNodeFault(res.PageErr, note)
+	return res
+}
+
+// splitCaveat 是「这次测速的代理流量并没有真的从点名的网卡出去」那句话说；
+// 分流正常、没开或还没启动时给空串。
+func (s *Service) splitCaveat() string {
+	st := s.IfaceSplitStatus()
+	if !st.Enabled {
+		return ""
+	}
+	if st.Active {
+		// 分流是在生效的，只是"钉卡"这一步换了个人做（普通进程钉不上，由提权 helper 代劳）。
+		// 这件事要说出来：否则界面上一句"已生效"会让人以为普通绑定是好的。
+		if dev := st.ProxyDev; dev != "" {
+			if s.bindChannel() != nil && s.egressBindNeeded(dev) {
+				return bindViaHelperNote("代理", dev, "")
+			}
+		}
+		return ""
+	}
+	if st.Note == "" {
+		return ""
+	}
+	return st.Note
+}
+
+// egressBindNeeded 报告"代理那张卡被判普通进程钉不上、因而交给特权通道"这件事。
+func (s *Service) egressBindNeeded(dev string) bool {
+	cfg := s.currentCfg()
+	if cfg == nil {
+		return false
+	}
+	v := s.egressVerdictFor(dev, strings.TrimSpace(cfg.ActiveServer().Addr), cfg)
+	return v.blocked && v.bind
+}
+
+// hopEvidence 把「这一跳到底从哪儿出去」说成界面能照抄的一项证据。
+//
+// 为什么不能一律用 conn.LocalAddr()：
+//   - trojan 的流底下就是那条真 TCP socket，LocalAddr 是内核给的源地址，
+//     钉卡、主机路由、helper 代劳哪种方式下它都对；
+//   - hysteria2 的流是 QUIC 连接上开出来的虚拟 stream，LocalAddr 是**伪地址**，
+//     quic-go 把这一个填成了隧道对端。线上面板 10-30 15:2x 那屏就写着
+//     「这一跳实际从 43.156.119.19 出去」——43.156.119.19 是节点自己，
+//     本机地址是 192.168.0.104 / 10.180.56.177，一眼就不是源地址。
+//     用户照着这一格读，结论必然是"测速没走代理那张卡"，而实际上
+//     `ss -unpa` 里那条 QUIC socket 是 `*%wlx001f0578cdff`，钉得好好的。
+//
+// 于是分工：源地址只有 TCP 系说得出；设备名两边都说得出口径。
+//
+// 但设备名必须分两种给：
+//   - TCP 系从 socket 自己身上回读（boundDevice，读的是 SO_BINDTODEVICE 的现值），
+//     那是**事实**，且恰好是 `ss -tnp` 里 `192.168.0.104%wlx001f0578cdff` 那个后缀的来源。
+//     这一格存在的全部理由就是让人能拿着它跟 ss 对账，所以这里不许退化成
+//     "我打算绑在哪张卡上"——意图对不上账时，读的人只会再来问一次"到底走了没"。
+//   - UDP 系回读不到（QUIC 那条 socket 不在这条 conn 手上），只能报这次真的生效的
+//     代理网卡，那是这一类唯一说得出口的东西，但它不是回读值。
+//
+// 什么都说不出来就都给空，界面那一句整个不显示。
+func hopEvidence(proto string, conn net.Conn, proxyDev string) (addr, dev string) {
+	if proto == config.ProtocolHysteria2 {
+		// 没有生效的分流就没有可说的设备：宁可不说话，也不拿伪地址冒充源地址。
+		return "", strings.TrimSpace(proxyDev)
+	}
+	if conn == nil || conn.LocalAddr() == nil {
+		return "", ""
+	}
+	la := conn.LocalAddr()
+	host := la.String()
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host, boundDevice(conn)
+}
+
+// activeProxyDev 报告本次运行**真的生效**的代理网卡；没生效或没点名时给空串。
+//
+// 取的是运行期状态而不是配置：配置里写着 wlx… 但分流没真的装上（降级回默认路由）时，
+// 报设备名就等于替一次没发生的钉卡背书。
+func (s *Service) activeProxyDev() string {
+	st := s.IfaceSplitStatus()
+	if !st.Active {
+		return ""
+	}
+	return st.ProxyDev
+}
+
+// annotateNodeFault 给两种 TLS 形状的失败补一句"还有一种不是节点的错"。
+//
+// 为什么需要：这两句都被读成"节点不行"，而 2026-10-29 实测的是同一个出口链路上
+// 有设备在替我们终止 TLS——它一会儿给一张不受信的自签证书（unknown authority），
+// 一会儿干脆回明文（不像 TLS 握手）。分流没生效时最容易撞上它。
+// 这里不改判据也不下结论，只把第二种可能摆在同一格里，让人有得核对。
+func annotateNodeFault(msg, splitNote string) string {
+	if msg == "" {
+		return msg
+	}
+	why := ""
+	switch {
+	case strings.Contains(msg, "certificate signed by unknown authority"):
+		why = "这不一定就是节点的证书：链路上有设备替我们终止 TLS 时也报这一句"
+	case strings.Contains(msg, "first record does not look like a TLS handshake"):
+		why = "对端回的是明文：可能是链路设备代答，也可能是节点把这条流交给了兼底页"
+	}
+	if splitNote != "" {
+		if strings.HasPrefix(splitNote, "网卡分流没开") {
+			why += "；" + splitNote
+		} else {
+			why += "；而这次代理流量没有真的钉在点名的网卡上"
+		}
+	}
+	if why == "" {
+		return msg
+	}
+	return msg + "（" + strings.TrimPrefix(why, "；") + "）"
+}
+
+func (s *Service) testProfileCore(name, target string) ProfileTest {
 	res := ProfileTest{Name: name}
 	cfg, err := config.Load(s.cfgPath)
 	if err != nil {
@@ -459,6 +641,9 @@ func (s *Service) TestProfile(name, target string) ProfileTest {
 		return res
 	}
 	res.LatencyMS = time.Since(start).Milliseconds()
+	// 记下这一跳的出网证据。取哪一项取决于协议：TCP 系读源地址，
+	// UDP 系只能报钉住的设备（理由见 hopEvidence）。
+	res.HopAddr, res.HopDev = hopEvidence(profile.Server.Protocol(), conn, s.activeProxyDev())
 	probeErr := probeAccept(conn)
 	_ = conn.Close()
 	if probeErr != nil {
@@ -546,9 +731,19 @@ func probeAccept(conn net.Conn) error {
 // maskedSecret 与 ui 层保持一致：表单里回显的占位符不是真口令。
 const maskedSecret = "********"
 
-func profileViews(cfg *config.Config, activeName string) []ProfileView {
+// profileViews 把配置里的节点投影成界面要的那份。
+//
+// cooling 是本次运行的自动切换冷却表，必须显式传进来：
+// 少传一个参数就会得到一个「所有节点都不冷却」的列表，
+// 而那看起来和「从来没切过节点」一模一样，界面上分不出来。
+func profileViews(cfg *config.Config, activeName string, cooling map[string]time.Time) []ProfileView {
 	out := make([]ProfileView, 0, len(cfg.Proxies))
+	now := time.Now()
 	for _, p := range cfg.Proxies {
+		var coolingUntil int64
+		if until, ok := cooling[p.Name]; ok && now.Before(until) {
+			coolingUntil = until.UnixMilli()
+		}
 		out = append(out, ProfileView{
 			Name:    p.Name,
 			Type:    p.Server.Protocol(),
@@ -564,6 +759,9 @@ func profileViews(cfg *config.Config, activeName string) []ProfileView {
 			// 看到 "1.6 TB"——同一个数换了单位，人就以为程序把配置改了。
 			QuotaBytes: p.QuotaBytes(),
 			QuotaText:  strings.TrimSpace(p.Quota),
+			// 冷却是「自动切换不再把它选上来」的到期时刻，不是节点的属性。
+			// 界面上不写出来，用户手动选回去之后会以为「节点又坏了」。
+			CoolingUntil: coolingUntil,
 		})
 	}
 	return out

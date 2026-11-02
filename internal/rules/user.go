@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"wps_app/internal/logx"
+	"wps_app/internal/sudoown"
 )
 
 // UserRuleFileName 是用户自定义规则的文件名，与主规则集放在同一目录。
@@ -299,6 +302,20 @@ func parseUserRules(body string) ([]UserRule, error) {
 	return out, nil
 }
 
+// chownToDesktopUser 抽成变量：root 分支要真 root 才能跑，测试可以在这里
+// 截住“保存后到底有没有归还属主”这件事，而不必真的 chown 别人的文件。
+var chownToDesktopUser = sudoown.ToDesktopUser
+
+// restoreUserFileOwner 把 root 面板写出的文件还给桌面用户。
+//
+// 规则文件是用户会直接打开编辑的（README §4.x），root 留下 0600/root:root
+// 之后普通用户连读都读不了；这里失败只告警，不推翻已经落盘的规则内容。
+func restoreUserFileOwner(path string) {
+	if err := chownToDesktopUser(path); err != nil {
+		logx.Warnf("把 %s 的属主还给桌面用户失败: %v", path, err)
+	}
+}
+
 // SaveUserRules 原子写回：先备份旧文件，再写临时文件 rename。
 // 权限 0644——这份文件不含凭据，且要保证主进程之外的脚本也能读。
 func SaveUserRules(path string, list []UserRule) error {
@@ -326,6 +343,7 @@ func SaveUserRules(path string, list []UserRule) error {
 		if err := os.WriteFile(path+".bak", old, 0o644); err != nil {
 			return fmt.Errorf("备份 %s.bak: %w", path, err)
 		}
+		restoreUserFileOwner(path + ".bak")
 	}
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -348,7 +366,11 @@ func SaveUserRules(path string, list []UserRule) error {
 	if err := os.Chmod(name, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	restoreUserFileOwner(path)
+	return nil
 }
 
 // UpsertUserRule 加入或替换一条规则：同类型同域名的旧条目被新的策略覆盖，

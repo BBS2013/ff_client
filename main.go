@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -60,7 +61,7 @@ func (t targetsFlag) Set(s string) error {
 }
 
 // boolFlags 是布尔开关，拆分参数时不吃掉后面那个参数。
-var boolFlags = map[string]bool{"check": true, "gui": true, "cli": true, "h": true, "help": true, "tun-helper": true, "version": true}
+var boolFlags = map[string]bool{"check": true, "gui": true, "cli": true, "h": true, "help": true, "tun-helper": true, "dial-helper": true, "version": true}
 
 // splitArgs 把命令行拆成 flag 部分与位置参数部分。
 // 标准库 flag.Parse 遇到第一个非 flag 参数就会停止，导致
@@ -115,6 +116,12 @@ type options struct {
 	// 自己则以普通用户身份保住系统托盘（见 internal/tunx/helper_linux.go）。
 	tunHelper        bool
 	tunHelperConnect string
+	// dialHelper 让同一个二进制以**常驻**提权 helper 身份运行：面板保持一条连接，
+	// 按需要一条"钉在指定网卡上、已连通"的 socket（见 internal/tunx/persistent_linux.go）。
+	// 与 tun-helper 的差别只有"活多久、扛几次"：那个一次请求一个进程，这个一直活着。
+	dialHelper        bool
+	dialHelperConnect string
+	dialHelperOwner   string
 }
 
 // newFlagSet 构造命令行选项集合。
@@ -136,6 +143,9 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.StringVar(&o.logFile, "log-file", "", "日志同时写入这个文件（0600，20MB×3 轮转）；GUI 不写时默认 <config>.log")
 	fs.StringVar(&o.pprof, "pprof", "", "开启 pprof 诊断监听（只允许回环地址，如 127.0.0.1:6060；默认关）")
 	fs.BoolVar(&o.tunHelper, "tun-helper", false, "以 TUN 提权 helper 身份运行：连回面板、开/关网卡、退出（面板通过 tun.helper 配置唤起，需要 root）")
+	fs.BoolVar(&o.dialHelper, "dial-helper", false, "以常驻提权 helper 身份运行：替面板造钉在指定网卡上的 socket（面板通过 tun.helper 配置唤起，需要 root）")
+	fs.StringVar(&o.dialHelperConnect, "dial-helper-connect", "", "常驻 helper 要监听的套接字路径（由面板自动传入）")
+	fs.StringVar(&o.dialHelperOwner, "dial-helper-owner", "", "常驻 helper 要把套接字交给哪个 uid（由面板自动传入）")
 	fs.StringVar(&o.tunHelperConnect, "tun-helper-connect", "", "helper 模式下要连接的套接字路径（由面板自动传入，不用手写）")
 	return fs
 }
@@ -209,6 +219,11 @@ func main() {
 func runCLI(o options) error {
 	if o.version {
 		fmt.Println(buildinfo.Summary())
+		// 第二行是给机器读的：面板在唤起 root 之前会拿同一个二进制跑一次 -version，
+		// 用这个数比一比「tun.helper 那个文件是不是和我同一份提权协议」。
+		// 为什么值得单列一行：版本对不上是「此后再试多少次都一样」的失败，
+		// 而发现它的代价本来是一次 sudo + 一个 root 进程 + 一条注定被拒的应答。
+		fmt.Printf("提权协议 %d\n", tunx.HelperProto())
 		return nil
 	}
 	// 显式给了 -log-file 就现在打开：一键式命令（-check/-diag/-sysproxy）也照写。
@@ -237,6 +252,9 @@ func runCLI(o options) error {
 	}
 	if o.tunHelper {
 		return tunHelperCommand(o.tunHelperConnect)
+	}
+	if o.dialHelper {
+		return dialHelperCommand(o.dialHelperConnect, o.dialHelperOwner)
 	}
 	if o.tunReset {
 		return tunCleanup(o.configPath)
@@ -447,6 +465,9 @@ func tunCleanup(configPath string) error {
 		cleaned = reply.Removed
 	} else {
 		cleaned = tunx.CleanupStale(ctx, nil, os.Geteuid(), device, address)
+		// -tun-reset 是「网络不对劲」时的应急入口，故障断网保护的那条链正是会造出
+		// 这种症状的东西：本机出站被白名单收着，而留下它的那个进程早就没了。
+		cleaned = append(cleaned, tunx.CleanupKill(ctx, nil)...)
 	}
 	logx.Infof("TUN 残留清理完成：%d 项（网卡本身随进程退出消失）", len(cleaned))
 	return nil
@@ -461,6 +482,39 @@ func tunHelperCommand(path string) error {
 		return errors.New("--tun-helper 需要 --tun-helper-connect=<面板给的套接字路径>（这个参数由面板自动加上，手写时别漏）")
 	}
 	return tunx.RunHelperForMain(path, 25*time.Second)
+}
+
+// parseDialHelperOwner 把 --dial-helper-owner 的值翻成 uid。
+//
+// **0 必须判为合法**：它表示「面板自己就是 root」（整个面板由 sudo 拉起时 os.Getuid()
+// 就是 0），那时套接字本来就归 root，helper 侧的 chown 跳过即可，不是错误。
+// 判 "uid <= 0" 时这条最大的真实取值会被拒，症状极具误导性——helper 明明收到了
+// owner 参数，却报「需要 --dial-helper-owner」，看上去像参数没传过来。
+// 空串与非数字仍算「没传」：老版本的唤起方就得被这里挡住。
+func parseDialHelperOwner(owner string) (int, error) {
+	uid, err := strconv.Atoi(strings.TrimSpace(owner))
+	if err != nil || uid < 0 {
+		return 0, errors.New("--dial-helper 需要 --dial-helper-owner=<面板的 uid>（由面板自动加上）")
+	}
+	return uid, nil
+}
+
+// dialHelperCommand 是常驻提权 helper 的入口。
+//
+// 与 tunHelperCommand 同一个纪律：它不读配置、不碰代理、不看用户的流量，
+// 只做一件事——替面板造一条钉在指定网卡上、且已连通的 socket。
+// TLS 仍然终结在面板与节点之间，所以 root 看不到任何明文。
+func dialHelperCommand(path, owner string) error {
+	if path == "" {
+		return errors.New("--dial-helper 需要 --dial-helper-connect=<套接字路径>（由面板自动加上）")
+	}
+	uid, err := parseDialHelperOwner(owner)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+	return tunx.RunDialHelper(ctx, path, uid)
 }
 
 // diagReport 打印诊断报告。

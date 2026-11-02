@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -135,28 +135,29 @@ func (o *trojanOrigin) handle(raw net.Conn) {
 	_ = tc.Close()
 }
 
-// trojanPasswordHash 是 trojan 规范要求的口令摘要：SHA1(password) 的十六进制小写。
-// 必须是 SHA-1 而不是 SHA-256 —— 客户端用 SHA-1 算，服务端换算法就永远对不上，
-// 而症状是「握手成功、第一次读就 EOF」，看上去像网络问题。
+// trojanPasswordHash 是 trojan 规范要求的口令摘要：SHA-224(password) 的十六进制小写。
+// 必须是 SHA-224：2026-10-29 在真节点（原版 trojan 1.16）上按 ALPN×摘要×第二行布局
+// 逐条对日志试过，SHA-1 的摘要一律被判成"不是 trojan 请求"、交给兼底 web 服务器。
+// 这个桩必须跟着真服务端走，否则就是单测全绿、线上一条页面都取不回。
 func trojanPasswordHash() string {
-	sum := sha1.Sum([]byte(loopbackPassword))
+	sum := sha256.Sum224([]byte(loopbackPassword))
 	return hex.EncodeToString(sum[:])
 }
 
-// readTrojanRequestHeader 解析 `CMD CRLF HASH CRLF ADDR CRLF`。
-// 顺序不能反：CMD 在最前面，且它是「一个字节 + CRLF」而不是一行文本。
+// readTrojanRequestHeader 解析 `HASH CRLF CMD ATYP ADDR PORT CRLF`。
+// 顺序不能反：第一行是口令摘要，命令字节是第二行开头的**一个裸字节**（不是文本行）。
 // 本测试的客户端不带 SNI，ADDR 用 ATYP + 地址 + 端口的形式。
 func readTrojanRequestHeader(r *bufio.Reader) (string, string, error) {
-	cmd, err := readCRLFByte(r)
-	if err != nil {
-		return "", "", err
-	}
-	if cmd != 0x04 {
-		return "", "", fmt.Errorf("只接受 CONNECT(0x04)，收到 %#x", cmd)
-	}
 	hash, err := readCRLFLine(r)
 	if err != nil {
 		return "", "", err
+	}
+	cmd, err := r.ReadByte()
+	if err != nil {
+		return "", "", err
+	}
+	if cmd != 0x01 {
+		return "", "", fmt.Errorf("只接受 CONNECT(0x01)，收到 %#x", cmd)
 	}
 	atyp, err := r.ReadByte()
 	if err != nil {

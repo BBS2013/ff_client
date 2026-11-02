@@ -565,6 +565,10 @@ func (a *App) SetSystemProxy(enable bool) error {
 		if err == nil {
 			// 用户亲手关的，就不该由下一次「启动」替他打开。
 			a.setSysProxyPaused(false)
+			// 开关这条路原来不留日志：桌面上谁改的、什么时候改的，
+			// 日志里一个字都没有。等哪天要查「桌面怎么指着我们的」，
+			// 这一句就是唯一的目击证人。
+			logx.Infof("已按界面操作把桌面系统代理切回关闭")
 		}
 		return err
 	}
@@ -574,6 +578,8 @@ func (a *App) SetSystemProxy(enable bool) error {
 	})
 	if err == nil {
 		a.setSysProxyPaused(false) // 现在这根指针是用户要的了，停止时该由停止拔掉它
+		logx.Infof("已按界面操作把桌面系统代理指向本客户端入站（http %s / socks %s），记账 %s",
+			c.HTTPAddr, c.SOCKSAddr, statePath)
 	}
 	return err
 }

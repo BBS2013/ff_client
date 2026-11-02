@@ -884,3 +884,181 @@ func TestRegistryRuleHitsSkipsEmptyMatched(t *testing.T) {
 		t.Errorf("空命中依据被记了一笔: %+v", got)
 	}
 }
+
+// ---------- 按规则的字节汇总 ----------
+
+// TestByRuleTotals 已收尾的加进来、还在跑的也算进来，与按节点那张表同一条算法。
+func TestByRuleTotals(t *testing.T) {
+	r := NewRegistry(10, 4)
+
+	a := r.Begin("socks5", "127.0.0.1:1", router.Result{Host: "a.example", Policy: outbound.PolicyProxy,
+		Matched: "DOMAIN-SUFFIX,a.example,PROXY", Node: "A"})
+	a.Up.Add(1000)
+	a.Down.Add(2000)
+	r.End(a)
+	// 同一条规则上还在跑的那条也要算：只看 End 的话，长连接永远不出现在排行里，
+	// 而"谁在搬流量"恰恰多半是长连接。
+	live := r.Begin("socks5", "127.0.0.1:2", router.Result{Host: "a2.example", Policy: outbound.PolicyProxy,
+		Matched: "DOMAIN-SUFFIX,a.example,PROXY", Node: "A"})
+	live.Up.Add(7)
+	live.Down.Add(11)
+
+	d := r.Begin("http", "127.0.0.1:3", router.Result{Host: "c.example", Policy: outbound.PolicyDirect,
+		Matched: "FINAL", Node: "DIRECT"})
+	d.Down.Add(500)
+	r.End(d)
+
+	// 没有命中依据的连接不配占一行：那会造出一条对不上任何规则的幽灵。
+	ghost := r.Begin("socks5", "127.0.0.1:4", router.Result{Host: "x.example", Policy: outbound.PolicyProxy})
+	ghost.Up.Add(9999)
+	r.End(ghost)
+
+	snap := r.Snapshot()
+	got := map[string]RuleTraffic{}
+	for _, row := range snap.ByRule {
+		got[row.Rule] = row
+	}
+	if len(snap.ByRule) != 2 {
+		t.Fatalf("应当只有两条规则，得到 %+v", snap.ByRule)
+	}
+	if a := got["DOMAIN-SUFFIX,a.example,PROXY"]; a.Up != 1007 || a.Down != 2011 || a.Conns != 2 {
+		t.Errorf("这条规则的账算错了（收尾的 + 在跑的）：%+v", a)
+	}
+	if f := got["FINAL"]; f.Down != 500 || f.Conns != 1 {
+		t.Errorf("FINAL 那行不对：%+v", f)
+	}
+}
+
+// TestByRuleReconcilesWithTotal 是这张表唯一要守住的算式：
+// 各行加起来必须等于总量，否则"按规则看"就成一个只能看、不能对账的东西。
+func TestByRuleReconcilesWithTotal(t *testing.T) {
+	r := NewRegistry(0, 0)
+	ruleOf := func(i int) string {
+		return "DOMAIN-SUFFIX,r" + string(rune('A'+i%7)) + ".test,PROXY"
+	}
+	for i := 0; i < 40; i++ {
+		c := r.Begin("socks5", "c", router.Result{Host: "h", Policy: outbound.PolicyProxy,
+			Matched: ruleOf(i), Node: "A"})
+		c.Up.Add(uint64(100 + i))
+		c.Down.Add(uint64(7))
+		r.End(c)
+	}
+	snap := r.Snapshot()
+	var sum uint64
+	for _, row := range snap.ByRule {
+		sum += row.Up + row.Down
+	}
+	if want := snap.TotalUp + snap.TotalDown; sum != want {
+		t.Errorf("按规则加起来不等于总量：%d ≠ %d", sum, want)
+	}
+}
+
+// TestByRuleFoldsTheRest 行数有上限，但被折掉的那些必须仍然算在表里。
+func TestByRuleFoldsTheRest(t *testing.T) {
+	r := NewRegistry(0, 0)
+	// 20 条各不相同的规则，比展示上限多。
+	for i := 0; i < 20; i++ {
+		c := r.Begin("socks5", "c", router.Result{Host: "h", Policy: outbound.PolicyProxy,
+			Matched: "RULE-" + string(rune('a'+i)), Node: "A"})
+		c.Up.Add(uint64(1000 - i*10))
+		r.End(c)
+	}
+	snap := r.Snapshot()
+	if len(snap.ByRule) != ruleRowsShown {
+		t.Fatalf("行数该收在展示上限：%+v", snap.ByRule)
+	}
+	last := snap.ByRule[len(snap.ByRule)-1]
+	if last.Folded == 0 {
+		t.Fatalf("最后一行该是合并行，却写着 %+v", last)
+	}
+	var sum uint64
+	for _, row := range snap.ByRule {
+		sum += row.Up + row.Down
+	}
+	if want := snap.TotalUp + snap.TotalDown; sum != want {
+		t.Errorf("合并之后总数对不上了：%d ≠ %d", sum, want)
+	}
+	if got := snap.ByRule[0].Up; got != 1000 {
+		t.Errorf("排行没按字节从大到小：%+v", snap.ByRule)
+	}
+}
+
+// TestByRuleKeysAreBounded 规则文件的条数是几千这个量级，账本的键不能跟着无限长。
+// 超上限的部分并进一个桶，表里加总仍然等于总量——这才是"有上限"的正确形状：
+// 限制内存，而不是限制被记住的字节。
+func TestByRuleKeysAreBounded(t *testing.T) {
+	r := NewRegistry(0, 0)
+	for i := 0; i < ruleKeyCap+300; i++ {
+		c := r.Begin("socks5", "c", router.Result{Host: "h", Policy: outbound.PolicyProxy,
+			Matched: fmt.Sprintf("RULE-%d", i), Node: "A"})
+		c.Up.Add(10)
+		r.End(c)
+	}
+	snap := r.Snapshot()
+	if len(snap.ByRule) > ruleRowsShown {
+		t.Fatalf("表该被收成有限行：%d 行", len(snap.ByRule))
+	}
+	var sum uint64
+	for _, row := range snap.ByRule {
+		sum += row.Up + row.Down
+	}
+	if want := snap.TotalUp + snap.TotalDown; sum != want {
+		t.Errorf("键数封顶却把量弄丢了：%d ≠ %d", sum, want)
+	}
+	var hasOverflow bool
+	for _, row := range snap.ByRule {
+		if row.Rule == ruleOverflowKey || row.Folded > 0 {
+			hasOverflow = true
+		}
+	}
+	if !hasOverflow {
+		t.Error("超上限的量没有落在任何一个可见的桶里")
+	}
+}
+
+// TestByRuleReset 清零要连这张表一起清：只清命中不清字节，
+// 界面上就是"规则页说没命中过、流量页说它刚搬了 2GB"。
+// 而且在跑的那条不能把清零之前的字节再算一遍（水位与按节点那张表共用）。
+func TestByRuleReset(t *testing.T) {
+	r := NewRegistry(0, 0)
+	const rule = "DOMAIN-SUFFIX,big.test,PROXY"
+	c := r.Begin("socks5", "c", router.Result{Host: "h", Policy: outbound.PolicyProxy, Matched: rule, Node: "A"})
+	c.Up.Add(5 << 20)
+	live := r.Begin("socks5", "c2", router.Result{Host: "h2", Policy: outbound.PolicyProxy, Matched: rule, Node: "A"})
+	live.Up.Add(3 << 20)
+
+	r.Reset()
+	live.Up.Add(1 << 20) // 清零之后才跑的，这一笔才算新账
+	r.End(c)
+	r.End(live)
+
+	snap := r.Snapshot()
+	row, ok := func() (RuleTraffic, bool) {
+		for _, x := range snap.ByRule {
+			if x.Rule == rule {
+				return x, true
+			}
+		}
+		return RuleTraffic{}, false
+	}()
+	if !ok {
+		t.Fatalf("清零之后这条规则整行都没了：%+v", snap.ByRule)
+	}
+	if row.Up != 1<<20 {
+		t.Errorf("清零之前的字节被算进来了：%d，期望只有清零后的 1MB", row.Up)
+	}
+}
+
+// TestByRuleRefusedCarriesNoBytesButStillRows 拨不通的那条：零字节。
+// 它进这张表是好事（哪条规则在产出失败，一眼看得见），
+// 但也仅此而已——别把"命中次数"混进来，那张口径在规则页。
+func TestByRuleRefusedCarriesNoBytes(t *testing.T) {
+	r := NewRegistry(0, 0)
+	r.Refuse("socks5", "c", "h:443", router.Result{Host: "h", Matched: "GEOIP,CN,DIRECT", Node: "DIRECT"}, "拨不通")
+	snap := r.Snapshot()
+	for _, row := range snap.ByRule {
+		if row.Rule == "GEOIP,CN,DIRECT" && (row.Up != 0 || row.Down != 0) {
+			t.Errorf("拨不通的连接不该有字节：%+v", row)
+		}
+	}
+}

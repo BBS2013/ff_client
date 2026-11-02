@@ -334,3 +334,38 @@ func TestDirectCancelKeepsHostAndFirstCause(t *testing.T) {
 		}
 	}
 }
+
+// 直连侧的落点：被判「钉上这张卡发不出包」而机器上有特权通道时，造 socket 这一步
+// 交给 helper（以前只有代理侧能用它，于是直连那一半在普通权限下静默丢包）。
+// 但**域名不许交给 root**：helper 里不许解析域名，故障现场重解析会拿到假 IP——
+// 那条硬规矩在 dial 这一层也要守住。
+func TestDirectUsesBoundChannelForResolvedTargets(t *testing.T) {
+	var asked []string
+	sp := NewSplit("wlp3s0f0", "")
+	sp.SetActive(true)
+	sp.SetBindNeeded(true, false)
+	sp.SetBindSocket(func(_ context.Context, dev, addr string) (net.Conn, error) {
+		asked = append(asked, dev+"|"+addr)
+		c1, c2 := net.Pipe()
+		t.Cleanup(func() { _ = c1.Close() })
+		return c2, nil
+	})
+	d := NewDirect(2 * time.Second)
+	d.WithSplit(sp)
+
+	conn, err := d.DialContext(context.Background(), "192.0.2.1:443")
+	if err != nil {
+		t.Fatalf("已解析的目标该走特权通道: %v", err)
+	}
+	_ = conn.Close()
+	if len(asked) != 1 || asked[0] != "wlp3s0f0|192.0.2.1:443" {
+		t.Fatalf("通道要被问到一次、并带上直连那张卡: %v", asked)
+	}
+	// 域名：不许把解析这件事交给 root，照旧自己拨（这个环境里拨不通是预期的）。
+	if _, err := d.DialContext(context.Background(), "node.example:443"); err == nil {
+		t.Fatal("域名目标本该拨不通，却拨通了")
+	}
+	if len(asked) != 1 {
+		t.Fatalf("域名目标不许走特权通道: %v", asked)
+	}
+}

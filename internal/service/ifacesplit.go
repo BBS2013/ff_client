@@ -1,13 +1,17 @@
 package service
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"strings"
+	"time"
 
 	"wps_app/internal/config"
 	"wps_app/internal/logx"
 	"wps_app/internal/netdev"
 	"wps_app/internal/outbound"
+	"wps_app/internal/tunx"
 )
 
 // IfaceCardView 是下拉框里的一行：本机一张可用的无线卡。
@@ -48,6 +52,36 @@ func (p splitPick) same(o splitPick) bool { return p.direct == o.direct && p.pro
 
 func pickOf(d, p string) splitPick { return splitPick{direct: d, proxy: p} }
 
+// unpinProxy / unpinDirect 把一份解析结果里「某一侧钉在哪张卡」松开，另一侧与网卡清单留着，
+// 换上降级原因。
+//
+// 为什么要分两侧各一个：这两侧的病可以不一样，而 2026-10-30 之前只有代理侧这一半，
+// note 里那句「直连钉在内置卡上是真的在干活」因此是**假的**——普通权限下内置卡的
+// 钉卡同样被静默丢包（两台面板 via DIRECT 失败 363/1244 条、成功建连 0 条；
+// 转 root 后失败 0、成功 17）。留着另一侧的前提是"它真的在干活"，这个前提必须被问过。
+//
+// 做成函数而不是就地赋字面量：service.go 里那份 plan 的局部变量名叫 splitPlan，
+// 正好挡住同名的类型，`splitPlan{...}` 在那儿写不出来。
+func unpinProxy(p splitPlan, why string) splitPlan {
+	return splitPlan{pick: pickOf(p.pick.direct, ""), note: joinWhy(p.note, why), cards: p.cards}
+}
+
+func unpinDirect(p splitPlan, why string) splitPlan {
+	return splitPlan{pick: pickOf("", p.pick.proxy), note: joinWhy(p.note, why), cards: p.cards}
+}
+
+// joinWhy 把两句话并成一句：两侧都降级时界面上只有那一格，后一句不能把前一句顶掉。
+func joinWhy(old, add string) string {
+	switch {
+	case old == "":
+		return add
+	case add == "":
+		return old
+	default:
+		return old + "；" + add
+	}
+}
+
 // splitPlan 是一次解析的完整结果：两张卡钉在哪、为什么没钉成、界面上有哪些卡可选。
 type splitPlan struct {
 	pick  splitPick
@@ -58,6 +92,226 @@ type splitPlan struct {
 // probeBind 探当前进程有没有权限钉网卡。
 // 做成变量是为了让单测不必真的去建 socket 绑网卡：那一步是真的系统调用。
 var probeBind = outbound.ProbeDeviceBind
+
+// probeEgress 是「钉上这张卡之后包到底出不出得去」那一次真拨号。
+// 抽成变量有两个理由：真拨要等两秒，单测不能等；而它分不清的责任
+// （钉卡 vs 节点本身不通）要靠一个对照组来拆。
+var probeEgress = outbound.ProbeDeviceEgress
+
+// egressProbeBudget 是给这一次探路的预算。两秒是权衡出来的：
+// 比一次正常握手慢不了多少，又足够把「静默丢包」和「链路慢」分开。
+const egressProbeBudget = 2 * time.Second
+
+// egressBlockedWhy 验一次代理那张卡能不能真的发包，返回一句给人看的原因；
+// 能发出去时返回空串。addr 是**这一次要拨的目标**（当前选中节点），由调用方给：
+// 命令行那条路上 s.cfg 还没落定，藏在函数里读 s.cfg 会静默跳过这次检查。
+//
+// 这一步是补上的，不是多余的：这台机器的链路安全软件让普通进程钉网卡之后
+// **静默丢包**，而 setsockopt 返回成功——只看系统调用就会在界面上写
+// 「已生效」，症状却是所有出海连接一起超时（2026-10-20 那次 612 条拨不通、
+// 2026-10-29 复现，都是这一条）。
+//
+// 失败时还要用不钉网卡的方式再拨一次：两条都拨不通说明是节点或链路的事，
+// 不该把「分流未生效」这顶帽子扣上去。
+func (s *Service) egressBlockedWhy(dev, addr, what string, cfg *config.Config) (note string, useBind bool) {
+	v := s.egressVerdictFor(dev, addr, cfg)
+	if !v.blocked {
+		if v.fact != "" {
+			// 钉着与不钉都拨不通：那是节点或链路的事，别抢走界面里那一格。
+			logx.Debugf("分流探针不下结论：%s", v.fact)
+		}
+		return "", false
+	}
+	if v.bind {
+		// 这句话必须把"谁绑不上"说清楚：钉不上的是**普通权限的那个进程**，
+		// 不是这张卡——同一张卡上 helper 造出来的 socket 跑得好好的。
+		// 写成"发不出包"会被读成"这张卡坏了"，而实际要处理的是权限那一层。
+		return bindViaHelperNote(what, dev, v.fact), true
+	}
+	return fmt.Sprintf("开关已打开，但钉上发不出包（%s）——%s这一侧退回系统默认路由，没有真的换到这张卡", v.fact, what), false
+}
+
+// settleEgress 把「钉上这张卡发不发得出包」在**两侧各问一次**，据此决定每一侧是
+// 维持点名（有特权通道就交给它）还是退回系统默认路由。
+//
+// 为什么单独成一层：Start 与运行期的 applyPlan 必须共用同一判据（启动不走 applyPlan，
+// 这正是这条判据原来漏掉它的原因），而两侧共用同一问句——只问代理侧，就是
+// 2026-10-30 之前那个"直连那一半废了却没人说"的形状。
+// 返回落地用的 plan、两侧各自该不该走特权通道、以及**只有走通道时**该说一次的话
+// （退回默认路由那一句已经写进 plan.note，由 logSplitPlan 去说，这里再说一遍就是刷屏）。
+func (s *Service) settleEgress(plan splitPlan, nodeAddr string, cfg *config.Config) (splitPlan, bool, bool, []string) {
+	if strings.TrimSpace(nodeAddr) == "" {
+		return plan, false, false, nil // 没有目标就不许编结论
+	}
+	var (
+		notes                 []string
+		bindDirect, bindProxy bool
+	)
+	if plan.pick.proxy != "" {
+		if why, useBind := s.egressBlockedWhy(plan.pick.proxy, nodeAddr, "代理", cfg); why != "" {
+			if useBind {
+				bindProxy, notes = true, append(notes, why)
+			} else {
+				plan = unpinProxy(plan, why)
+			}
+		}
+	}
+	if plan.pick.direct != "" {
+		if why, useBind := s.egressBlockedWhy(plan.pick.direct, nodeAddr, "直连", cfg); why != "" {
+			if useBind {
+				bindDirect, notes = true, append(notes, why)
+			} else {
+				plan = unpinDirect(plan, why)
+			}
+		}
+	}
+	return plan, bindDirect, bindProxy, notes
+}
+
+// egressVerdict 是对「钉上这张卡到底发不出包」的一次判定结果。
+// 存结构而不是存句子：句子被 egressBlockedWhy 消费，缓存里存句子就会在第二次
+// 命中时被再包一层（同一个事实套两遍说法）。
+type egressVerdict struct {
+	blocked bool
+	bind    bool   // blocked 且这条机器上有提权 helper：交给它，而不是退回默认路由
+	fact    string // 一句事实（EgressPair 给的），或"分不清"的那句
+}
+
+// egressVerdictFor 是"同一个网卡+目标只探一次"那层缓存。
+//
+// 为什么必须缓存而不是每轮都探：判成降级会重建隧道，而 commitProxy 在 strict_route 下
+// 会回头再走一遍装配，装配又探一次、又判降级——2026-10-29 就是这么每 3~5 秒刷一组日志
+// （详见 README §10.19 与 ACCEPTANCE A55）。用户拨开关/改点名才是"重新问一次"。
+func (s *Service) egressVerdictFor(dev, addr string, cfg *config.Config) egressVerdict {
+	addr = strings.TrimSpace(addr)
+	if dev == "" || addr == "" {
+		return egressVerdict{}
+	}
+	// 有没有特权通道按**这次装配用的那份配置**判：Start 那条路上 s.cfg 还没落定，
+	// 去读它会得到"没有 helper"的错结论，于是把本该走 helper 的机器退回了默认路由
+	// （2026-10-30 第一次上线就是这么错的：面板启动时判成"钉不上"）。
+	binder := s.bindChannelWith(cfg)
+	key := dev + "|" + addr + "|" + fmt.Sprint(binder != nil)
+	s.mu.Lock()
+	v, seen := s.egressVerdict[key]
+	s.mu.Unlock()
+	if seen {
+		return v
+	}
+	blocked, fact := outbound.EgressPair(probeEgress, dev, addr, egressProbeBudget)
+	v = egressVerdict{blocked: blocked, bind: blocked && binder != nil, fact: fact}
+	s.mu.Lock()
+	if s.egressVerdict == nil {
+		s.egressVerdict = map[string]egressVerdict{}
+	}
+	s.egressVerdict[key] = v
+	s.mu.Unlock()
+	return v
+}
+
+// bindChannel 造那条「请 helper 替我把 socket 钉到这张卡上」的通道。
+//
+// 没有配 tun.helper 就没有这条通道（返回 nil），那时分流只能"能绑就绑、绑不上就退回
+// 默认路由并说清"——那是 2026-10-29 的形状。配了之后面板仍然不碰 root：
+// 它只是拿回一条已经钉好并连上的 socket（与 TUN 的 fd 交接同一条机制）。
+func (s *Service) bindChannel() outbound.BindSocketFunc {
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	return s.bindChannelWith(cfg)
+}
+
+// bindChannelWith 同上，但用调用手头这份配置（Start 那条路上 s.cfg 还没落定）。
+func (s *Service) bindChannelWith(cfg *config.Config) outbound.BindSocketFunc {
+	h := s.ensureDialHelper(cfg)
+	if h == nil {
+		return nil
+	}
+	return func(ctx context.Context, dev, addr string) (net.Conn, error) {
+		// 名单就是这一次要连的端点本身。它防的不是这个配置的属主（他想加端点随时加得动），
+		// 而是以后某条路径把用户在界面上输入的地址顺手交给 root 去连——那一步必须被拒。
+		return h.DialBound(ctx, dev, addr, []string{addr})
+	}
+}
+
+// ensureDialHelper 按需拉起**常驻**提权 helper：只拉一次，之后一直用。
+//
+// 为什么要常驻：造一条钉住网卡的 socket 每条流都要做一次，一次性的 helper
+// 每请求付一次 sudo + 进程起落（实测 0.08~0.11s），那笔开销直接摊在用户的每一次浏览上。
+func (s *Service) ensureDialHelper(cfg *config.Config) *tunx.PersistentHelper {
+	prefix := helperArgvPrefix(cfg)
+	if prefix == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dialHelper != nil {
+		return s.dialHelper
+	}
+	s.dialHelper = &tunx.PersistentHelper{Argv: prefix, Timeout: dialHelperTimeout}
+	return s.dialHelper
+}
+
+// helperArgvPrefix 从配置里的提权命令里取出"唤起常驻 helper"要用的前缀：
+// 去掉 --tun-helper（那是"跑一次就退出"的模式），剩下的就是 sudo + 二进制。
+func helperArgvPrefix(cfg *config.Config) []string {
+	if cfg == nil || len(cfg.TUN.Helper) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(cfg.TUN.Helper))
+	for _, a := range cfg.TUN.Helper {
+		if strings.HasPrefix(a, "--tun-helper") || strings.HasPrefix(a, "--dial-helper") {
+			continue
+		}
+		out = append(out, a)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// dialHelperTimeout 是常驻 helper 一次请求的预算。
+const dialHelperTimeout = 25 * time.Second
+
+// clearEgressVerdict 丢掉「网卡|目标」的探针结论，让下一次落地重新探一遍。
+// 只有用户拨开关/改点名这条路会调它——自动重扫网卡不该反复问（见 egressPair 那段）。
+func (s *Service) clearEgressVerdict() {
+	s.mu.Lock()
+	s.egressVerdict = nil
+	s.mu.Unlock()
+}
+
+// currentCfg 取当前这份配置（可能在装配落定之前为空）。
+func (s *Service) currentCfg() *config.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
+// bindViaHelperNote 是"钉卡这一步换了个人做"那一句的**唯一出处**。
+//
+// 为什么要有且只有一个：这句话会出现两处（状态 note 与测速那一格），各写一份就会
+// 各说各话——而"发不出包"这个说法很容易被读成"那张卡坏了"，实际坏的是普通进程
+// 去钉这一层。fact 是探针那句话（可空）：长句放得下的地方就带上。
+// what 是"代理"还是"直连"：两侧的病可以不一样（2026-10-30 实测直连那一侧同样被
+// 静默丢包，而探针以前只问代理侧），所以这句话必须说清是哪一侧换了人做。
+func bindViaHelperNote(what, dev, fact string) string {
+	out := fmt.Sprintf("面板自己（普通权限）钉在 %s 上发不出包", dev)
+	if fact != "" {
+		out += "（" + fact + "）"
+	}
+	return out + fmt.Sprintf("：这台机器上普通进程的绑定返回成功却发不出线，所以这一跳交给提权 helper 代劳，%s仍然钉在这张卡", what)
+}
+
+// activeAddrOf 取当前选中节点的地址，作为分流探针的拨号目标。
+// 没有配置就没有目标可拨，返回空串让调用方跳过探测——不编一个地址出来。
+func activeAddrOf(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.ActiveServer().Addr)
+}
 
 // resolveSplit 按配置解析一次分流。
 //
@@ -228,6 +482,10 @@ func setCardChoice(dst *config.IfaceCard, dev string, set netdev.Set) {
 // 会回头去调 Start——抱着 opMu 进来就是自死锁（failover.go 里写着同一条理由）。
 // 真正的护栏在 commitProxy 自己：它拿到 s.mu 比对，发现期间被启停过就整只作废。
 func (s *Service) refreshSplit() error {
+	// 用户主动动这个开关（拨一次、换一张卡）就是"重新问一次"的意思：
+	// 探针结论只在这时候作废，平时不重复探——重复探会带着重建隧道，
+	// 而隧道重建又会回头再走一遍装配里的探针，那是个自激循环。
+	s.clearEgressVerdict()
 	s.mu.Lock()
 	cfg, rt := s.cfg, s.rt
 	s.mu.Unlock()
@@ -237,7 +495,7 @@ func (s *Service) refreshSplit() error {
 	if cfg != nil {
 		plan = planForConfig(cfg.IfaceSplit)
 	}
-	err := s.applyPlan(plan, rt != nil && cfg != nil)
+	_, err := s.applyPlan(plan, rt != nil && cfg != nil, activeAddrOf(cfg))
 	if rt == nil || cfg == nil {
 		logx.Infof("网卡分流开关设为 %v（当前未运行，启动后生效）", cfg != nil && cfg.IfaceSplit.Enable)
 	}
@@ -270,12 +528,43 @@ func logSplitPlan(plan splitPlan) {
 // 复用同一个 Split 实例而不是换一个：出站集体持有它，换指针的话正在传的隧道
 // 还攥着老实例，关开关也只是把新实例的闸门关了——界面说"未开启"，
 // 隧道其实还钉在那张 USB 卡上。
-func (s *Service) applyPlan(plan splitPlan, running bool) error {
+func (s *Service) applyPlan(plan splitPlan, running bool, nodeAddr string) (splitPick, error) {
+	// 通道要在加锁之前拿到：ensureDialHelper 自己会加锁，在锁里调它就是自死锁。
+	// 拿到它并不会起进程——常驻 helper 是第一次真的要用时才拉起来的。
+	binder := s.bindChannel()
+	// 钉上发不出包就退回不钉：留着这条"已生效"的记录，代价是那一侧全部连接一起超时，
+	// 而界面还会指着那张卡说在用它。降级之后 note 会写清是它自己退回默认路由的。
+	// 两侧各问一次（settleEgress）：以前只问代理侧，于是直连那一半同样是废的、
+	// 而 note 写着"直连真的在干活"——那句假话的账记在 README §10.19。
+	before := plan.pick
+	var (
+		bindDirect, bindProxy bool
+		bindNotes             []string
+	)
+	if running {
+		plan, bindDirect, bindProxy, bindNotes = s.settleEgress(plan, nodeAddr, s.currentCfg())
+	}
+	downgraded := !before.same(plan.pick)
 	s.mu.Lock()
 	sp := s.split
-	_, prevProxy := sp.Devices()
+	curDirect, curProxy := "", ""
+	if sp != nil {
+		curDirect, curProxy = sp.Devices()
+	}
+	// 现状已经就是这样就到此为止：网卡监视每 10 秒问一次，以前每次都要写一遍状态、
+	// 念一遍同一句「发不出包」（2026-10-29 实测 60 秒刷了 12 条）。真变了才落地、才说。
+	// 特权通道那两个开关也在比较里：它们换了就必须重新落地，否则"helper 中途出现"
+	// 这一转会因为两张卡名字没变而被这道早退吞掉。
+	if curDirect == plan.pick.direct && curProxy == plan.pick.proxy &&
+		s.ifaceSplit.Note == plan.note && s.splitBind == [2]bool{bindDirect, bindProxy} {
+		s.mu.Unlock()
+		return plan.pick, nil
+	}
 	if sp != nil {
 		sp.SetDevices(plan.pick.direct, plan.pick.proxy)
+		sp.SetBindSocket(binder)
+		sp.SetBindNeeded(bindDirect, bindProxy)
+		s.splitBind = [2]bool{bindDirect, bindProxy}
 	}
 	s.ifaceCards = plan.cards
 	s.ifaceSplit = IfaceSplitStatus{
@@ -285,15 +574,25 @@ func (s *Service) applyPlan(plan splitPlan, running bool) error {
 	}
 	s.mu.Unlock()
 
+	// 交回**实际落地的**那一份，调用方念这句话时才不会念成点名那份（降级后是空串）。
 	if sp == nil || !running {
-		return nil
+		return plan.pick, nil
 	}
 	s.applySplitGate(s.effectiveMode())
 	logSplitPlan(plan)
-	if prevProxy == plan.pick.proxy {
-		return nil
+	if len(bindNotes) > 0 {
+		// 只在这里说一次：上面那道"现状已经就是这样"的早退保证了它不会每 10 秒刷一遍。
+		logx.Infof("网卡分流：%s", strings.Join(bindNotes, "；"))
 	}
-	return s.rebuildProxy()
+	// 降级不是"用户换了张卡"，不该触发重建：隧道本来就是按同一份判据装配的，
+	// 重建会回头再走一遍装配、装配又带着同一个结论再落一次——那是循环的另一半。
+	if downgraded || curProxy == plan.pick.proxy {
+		return plan.pick, nil
+	}
+	if err := s.rebuildProxy(); err != nil {
+		return plan.pick, err
+	}
+	return plan.pick, nil
 }
 
 // rebuildProxy 把正在传的那条隧道重造一遍，让它换到（或者离开）另一张卡。

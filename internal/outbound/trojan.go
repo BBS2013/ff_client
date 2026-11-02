@@ -2,7 +2,7 @@ package outbound
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -26,9 +26,12 @@ import (
 // 所以本地不需要知道目标的 IP——这一点和 hysteria2 完全一致，
 // 也正是域名规则能免疫 DNS 污染的前提。
 //
-//	0x04 CRLF <sha1(口令) 的 40 位 hex> CRLF <ATYP> <地址> <端口> CRLF
+//	<sha224(口令) 的 56 位 hex> CRLF <CMD=0x01> <ATYP> <地址> <端口> CRLF
 //
-// 这行的 CMD 与哈希都偏离公开规范（规范写的是 0x01 与 sha224），详见 NewTrojan 里的说明。
+// 第二行是**裸字节**：公开规范把它写成 hex，而这台服务端（以及常见的几种发行版）
+// 只认裸字节——写成 hex 会被判成"不是 trojan 请求"，然后被交给兼底 web 服务器。
+// 头部之后**不等**服务端的应答：公开规范说这里会回 10 字节，这台 1.16 实测一个字节
+// 都不发（隧道建好就等客户端先说话）。两处取舍的实测过程都写在 NewTrojan 里。
 //
 // 与 hysteria2 的差别在连接成本上：hysteria2 是「一条 QUIC 连接跑所有流」，
 // trojan 每条流都要重新做一次 TLS 握手（一个 RTT）。所以这里不做连接复用，
@@ -56,8 +59,10 @@ func (t *Trojan) WithSplit(s *Split) *Trojan {
 
 // trojan ALPN 与头部常量。
 const (
-	trojanALPN       = "Trojan"
-	trojanCmdConnect = 0x04
+	trojanALPN = "Trojan"
+	// trojanCmdConnect 是 CONNECT 的命令字节（0x02 是 UDP ASSOCIATE，
+	// 而这个客户端的 UDP 只走 hysteria2 节点，见 DialUDP）。
+	trojanCmdConnect = 0x01
 )
 
 // NewTrojan 按配置构造 trojan 出站，不立即连接。
@@ -90,11 +95,16 @@ func NewTrojan(sc config.ServerConfig, handshakeTimeout time.Duration, resolver 
 	if err != nil {
 		return nil, err
 	}
-	// 口令摘要用 SHA-1 而不是公开的 trojan 规范里写的 SHA-224，CMD 用 0x04
-	// 而不是规范里的 0x01。这两处都是对规范的有意偏离：本客户端实际连的
-	// trojan 服务端接受这一组（2026-10-16 对 wbthinks.space:8443 实测自检通过）。
-	// 别"顺手修正"成规范值——那会直接把这个节点打死。
-	sum := sha1.Sum([]byte(sc.Auth))
+	// 口令摘要用 SHA-224，即公开规范那一份。
+	//
+	// 这里原来写的是 SHA-1 + 命令字节 0x04，依据是 2026-10-16 那次
+	// 「对 wbthinks.space:8443 自检通过」。今天两端对着查，那次是**假通过**：
+	// 服务端把我们的流判成"不是 trojan 请求"、交给 nginx 兼底，兼底页照样回字节，
+	// 而当时只验到"电路通了 + 读得到东西"（正是 pageProbe 后来要补的那个缺口）。
+	// 2026-10-29 在服务器上按 ALPN × 摘要 × 第二行布局逐条对日志试：
+	// 只有 SHA-224 + 裸字节第二行被接受，SHA-1、MD5 与 hex 编码的第二行
+	// 一律记 "not trojan request"。
+	sum := sha256.Sum224([]byte(sc.Auth))
 	return &Trojan{
 		serverAddr:   net.JoinHostPort(ip, strconv.Itoa(p)),
 		sni:          trojanSNI(host, sc.TLS.SNI),
@@ -175,7 +185,7 @@ func (t *Trojan) DialContext(ctx context.Context, target string) (net.Conn, erro
 	if t.split != nil {
 		d.Control = t.split.ProxyControl()
 	}
-	raw, err := d.DialContext(ctx, "tcp", t.serverAddr)
+	raw, err := t.dialServer(ctx, d)
 	if err != nil {
 		// 与 hysteria 侧同样的区分：ctx 还活着而拨号超时，说明是我们自己的
 		// 握手预算用完了 —— 地址上没人应答，这正是节点级故障。
@@ -214,6 +224,12 @@ func (t *Trojan) DialContext(ctx context.Context, target string) (net.Conn, erro
 		return nil, fmt.Errorf("write trojan header: %w", err)
 	}
 	// 头部发完就把超时清掉：之后的超时属于业务连接，不该由握手时间管着。
+	//
+	// 这里**不等**服务端的应答：公开规范说头部之后服务端回 10 字节（CRLF+8 保留），
+	// 但这台 trojan 1.16 实测一个字节都不回——隧道建好就直接等我们的数据
+	// （2026-10-29 在服务端上把隧道打到它自己的 nginx，请求前收到 0 字节、
+	// 请求后第一字节已经是 "HTTP/1.1 301"）。等它等于把每条连接卡死到超时，
+	// 症状还是"节点没响应"。真遇到会回应答头的节点，得按 profile 加开关再来读。
 	_ = tc.SetDeadline(time.Time{})
 
 	t.mu.Lock()
@@ -221,6 +237,24 @@ func (t *Trojan) DialContext(ctx context.Context, target string) (net.Conn, erro
 	t.mu.Unlock()
 	logx.Debugf("trojan: 已连接 %s（SNI=%s, 目标 %s）", t.serverAddr, t.sni, target)
 	return tc, nil
+}
+
+// dialServer 建立到节点的那条 TCP 连接。
+//
+// 默认是自己拨、按需把 socket 钉到代理卡上。只有一种情况例外：这台机器被判定
+// 「普通进程钉上之后包发不出去」（2026-10-29 实测就是），而 service 又注入了特权通道——
+// 那时改让 helper（root）造一条已钉好并连上的 socket 交回来。
+// 不默认走它：每用一次就是一个提权进程（实测起进程 0.04s、RSS 51.9 MB），
+// 常态下自己绑就够了。
+func (t *Trojan) dialServer(ctx context.Context, d net.Dialer) (net.Conn, error) {
+	if t.split.ShouldUseBind(PolicyProxy) {
+		conn, err := t.split.BoundDialFor(ctx, PolicyProxy, t.serverAddr)
+		if err != nil {
+			return nil, fmt.Errorf("走提权通道钉卡失败: %w", err)
+		}
+		return conn, nil
+	}
+	return d.DialContext(ctx, "tcp", t.serverAddr)
 }
 
 // DialUDP 明确拒绝，而不是悄悄把 UDP 丢掉。
@@ -241,7 +275,7 @@ func (t *Trojan) Close() error {
 	return nil
 }
 
-// trojanHeader 按规范拼出请求头。
+// trojanHeader 拼出请求头：口令摘要一行，然后是「命令字节 + 地址族 + 地址 + 端口」。
 //
 // 目标地址的编码要分三种：IPv4 直接 4 字节、域名是「1 字节长度 + ASCII」、
 // IPv6 是 16 字节。域名这条最容易写错——把点分字符串按 IP 解析会静默变成
@@ -255,13 +289,12 @@ func trojanHeader(target, passwordHash string) ([]byte, error) {
 	if err != nil || p < 0 || p > 65535 {
 		return nil, fmt.Errorf("bad port in %q", target)
 	}
-	if len(passwordHash) != sha1.Size*2 {
+	if len(passwordHash) != sha256.Size224*2 {
 		return nil, fmt.Errorf("口令摘要长度不对: %d", len(passwordHash))
 	}
 
-	buf := []byte{trojanCmdConnect, '\r', '\n'}
-	buf = append(buf, passwordHash...)
-	buf = append(buf, '\r', '\n')
+	buf := []byte(passwordHash)
+	buf = append(buf, '\r', '\n', trojanCmdConnect)
 
 	// ATYP 三种编码：0x01 IPv4(4B) / 0x03 域名(1B 长度 + ASCII) / 0x04 IPv6(16B)。
 	if a, err := netip.ParseAddr(host); err == nil {

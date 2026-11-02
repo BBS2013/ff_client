@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"wps_app/internal/logx"
+	"wps_app/internal/sudoown"
 )
 
 // usageFileName 挂在配置文件旁边，与系统代理记账（config.yaml.sysproxy.json）同一个约定：
@@ -130,7 +131,17 @@ func WriteUsage(path string, st UsageState) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	// root 面板写出的账本若留在 root 手里，普通权限实例下次启动就读不出
+	// （permission denied → 从空账开始 → 界面上的「累计」凭空清零）。
+	// best-effort 归还属主（见 sudoown 包注释）：失败只提醒，不为它
+	// 推翻一次已经成功的落盘——账在，只是换个人读不动。
+	if cerr := sudoown.ToDesktopUser(path); cerr != nil {
+		logx.Warnf("用量账本属主没能还给桌面用户，普通权限实例可能读不出: %v", cerr)
+	}
+	return nil
 }
 
 // UsageState 把当前这份账（累计基数 + 本次会话）拍成一个可落盘的结构。

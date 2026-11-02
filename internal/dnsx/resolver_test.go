@@ -150,3 +150,55 @@ func TestResolverFailoverAcrossUpstreams(t *testing.T) {
 		t.Fatal("应拿到结果")
 	}
 }
+
+// TestResolverRecoversAfterEveryUpstreamFails 是验收清单里那句
+// 「Wi-Fi 断开、网关变化、DNS 故障和节点超时都应有可重复的恢复验证」中 DNS 那一格。
+//
+// 上一条只证明"有一个活的就行"，没有证明**全挂之后还能自己好回来**。
+// 这件事原来只能靠读代码推断：错误不落缓存（resolve 只在 err==nil 时写），
+// 所以看起来显然——而它一旦不成立，症状是"网都通了，某些站点还是打不开，
+// 直到重启面板为止"，那种故障没人会怀疑到 DNS 头上，更没人会去查缓存。
+// 推断不成立时该有用例红，所以这里把"挂了 → 又通了"真的演一遍。
+func TestResolverRecoversAfterEveryUpstreamFails(t *testing.T) {
+	srv := startFakeDNS(t, 0, net.ParseIP("93.184.216.34"))
+	// 只配这一台上游：它就是"全部"。超时压到 300ms，
+	// 装死时每次都按超时失败，不必让用例为了等标准库放弃而跑好几秒。
+	r, err := New([]string{srv.Addr}, 300*time.Millisecond, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Mute(true)
+	for i := 0; i < 2; i++ {
+		if addrs, err := r.LookupIP(context.Background(), "heals.example"); err == nil {
+			t.Fatalf("上游装死时第 %d 次解析却成功了: %v", i+1, addrs)
+		}
+	}
+	// 这条判据防的是"静默空跑"：装死要是让包根本没发出去，
+	// 那失败就不是在测上游无响应，而是在测一个没人听的 socket。
+	if srv.Queries() == 0 {
+		t.Fatal("装死期间一个查询都没到达上游：这条用例没在测恢复")
+	}
+
+	// 上游回来。同一个解析器、同一个域名，必须立刻答得出——
+	// 做不到就是失败被缓存住了，而这正是那条"只有重启才好"的故障。
+	srv.Mute(false)
+	addrs, err := r.LookupIP(context.Background(), "heals.example")
+	if err != nil {
+		t.Fatalf("上游恢复了，解析却没恢复（失败被记进缓存了）: %v", err)
+	}
+	if len(addrs) == 0 || !addrs[0].Is4() {
+		t.Fatalf("恢复后拿到的不是那条 A 记录: %v", addrs)
+	}
+
+	// 恢复之后再问一次应当命中缓存：上游的包数不该再涨。
+	// 没有这一句，"每次失败都重新打上游"这种实现也能过上面那段，
+	// 而那种实现会在网络抖动时被应用的成百次重试打穿。
+	before := srv.Queries()
+	if _, err := r.LookupIP(context.Background(), "heals.example"); err != nil {
+		t.Fatalf("恢复后的第二次解析失败: %v", err)
+	}
+	if got := srv.Queries(); got != before {
+		t.Errorf("恢复后没命中缓存，上游多了 %d 个包（%d → %d）", got-before, before, got)
+	}
+}

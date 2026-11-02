@@ -17,6 +17,7 @@ import (
 
 type served struct {
 	n   int
+	bad int
 	err error
 }
 
@@ -53,8 +54,8 @@ func serveDNS(t *testing.T, server net.Conn, s *dnsServer, idle time.Duration) <
 	t.Helper()
 	ch := make(chan served, 1)
 	go func() {
-		n, err := serveDNSOverTCP(server, s.Serve, idle)
-		ch <- served{n, err}
+		n, bad, err := serveDNSOverTCP(server, s.Reply, idle)
+		ch <- served{n, bad, err}
 	}()
 	return ch
 }
@@ -156,11 +157,11 @@ func TestDNSTCPRejectsOversizedFrame(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	go func() {
-		n, err := serveDNSOverTCP(server, func(context.Context, []byte) ([]byte, error) {
+		n, bad, err := serveDNSOverTCP(server, func(context.Context, []byte) (DNSReply, error) {
 			called = true
-			return nil, nil
+			return DNSReply{}, nil
 		}, dnsTCPIdle)
-		ch <- served{n, err}
+		ch <- served{n, bad, err}
 	}()
 
 	// 声称有 65535 字节，但正文一个都不发。
@@ -182,11 +183,11 @@ func TestDNSTCPZeroLengthIsError(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	go func() {
-		n, err := serveDNSOverTCP(server, func(context.Context, []byte) ([]byte, error) {
+		n, bad, err := serveDNSOverTCP(server, func(context.Context, []byte) (DNSReply, error) {
 			t.Error("长度为 0 的报文不该进入应答")
-			return nil, nil
+			return DNSReply{}, nil
 		}, dnsTCPIdle)
-		ch <- served{n, err}
+		ch <- served{n, bad, err}
 	}()
 	if _, err := client.Write([]byte{0x00, 0x00}); err != nil {
 		t.Fatal(err)
@@ -203,10 +204,10 @@ func TestDNSTCPTruncatedFrame(t *testing.T) {
 	ch := make(chan served, 1)
 	client, server := net.Pipe()
 	go func() {
-		n, err := serveDNSOverTCP(server, func(context.Context, []byte) ([]byte, error) {
-			return nil, nil
+		n, bad, err := serveDNSOverTCP(server, func(context.Context, []byte) (DNSReply, error) {
+			return DNSReply{}, nil
 		}, dnsTCPIdle)
-		ch <- served{n, err}
+		ch <- served{n, bad, err}
 	}()
 	if _, err := client.Write([]byte{0x00}); err != nil {
 		t.Fatal(err)
@@ -230,7 +231,7 @@ func TestDNSTCPPrefixAndBodyArriveSeparately(t *testing.T) {
 
 	client, server := net.Pipe()
 	defer server.Close()
-	go func() { _, _ = serveDNSOverTCP(server, s.Serve, dnsTCPIdle) }()
+	go func() { _, _, _ = serveDNSOverTCP(server, s.Reply, dnsTCPIdle) }()
 
 	for i := 0; i < 3; i++ {
 		var hdr [2]byte

@@ -36,6 +36,8 @@ type TUNForm struct {
 	HijackDNS    bool     `json:"hijackDns"`
 	StrictRoute  bool     `json:"strictRoute"`
 	RouteExclude []string `json:"routeExclude"`
+	// KillSwitch 是故障断网保护：默认关闭，只在 StrictRoute 下有意义。
+	KillSwitch bool `json:"killSwitch"`
 }
 
 // ConfigForm 是配置表单的可编辑投影，字段全为普通值。
@@ -91,6 +93,7 @@ func readForm(path string) (ConfigForm, error) {
 			FakeIPRange:  cfg.TUN.FakeIPRange,
 			HijackDNS:    cfg.TUN.DNSHijackEnabled(),
 			StrictRoute:  cfg.TUN.StrictRoute,
+			KillSwitch:   cfg.TUN.KillSwitch,
 			RouteExclude: append([]string(nil), cfg.TUN.RouteExclude...),
 		},
 	}
@@ -186,6 +189,7 @@ func writeForm(path string, f ConfigForm) error {
 			FakeIPRange:  strings.TrimSpace(f.TUN.FakeIPRange),
 			HijackDNS:    &f.TUN.HijackDNS,
 			StrictRoute:  f.TUN.StrictRoute,
+			KillSwitch:   f.TUN.KillSwitch,
 			RouteExclude: splitList(f.TUN.RouteExclude),
 		}
 		// 留空的子项沿用磁盘上的值。注意方向：是「新值为空才回填」，

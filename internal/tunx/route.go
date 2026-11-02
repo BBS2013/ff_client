@@ -29,6 +29,15 @@ type Cmd struct {
 	// Optional 为 true 时失败只记警告，不阻断整体流程
 	// （典型是卸载路径：规则可能早就不在了）。
 	Optional bool
+	// TolerateMissingDevice 非空时，"Cannot find device <这个名字>" 视为成功。
+	//
+	// 它专治拆除路径上那类"看起来失败、其实已经达成"的错：网卡 fd 被协议栈关掉时
+	// 非 persistent 的 tun 就消失了，挂在它上面的路由被内核一并收走；
+	// 这时再 `ip route del ... dev wps-tun` 必然报设备不存在，
+	// 而它说的恰恰就是我们要的结果。照原样返回错误，每次正常停止都会
+	// 带着一串"停用失败"，界面上就再也分不出"没停干净"和"本来就干净"。
+	// 只认这一个设备名，别的报错一律照旧算失败。
+	TolerateMissingDevice string
 	// TolerateExists 为 true 时，"File exists" 视为成功。
 	// 开启路径必须可重入：想要的东西已经在位，就是我们要的状态本身，
 	// 把它当致命错误会让 TUN 永远起不来（上次就是卡在这条上）。
@@ -54,10 +63,20 @@ type RoutePlan struct {
 	StrictRoute  bool
 	// Exclude 是 StrictRoute 下要钉回物理网关的网段（含代理服务端与 DNS 上游，
 	// 避免我们自己的出站被 tun 抓回去形成环路）。
+	//
+	// 里面同时可能有 v4 与 v6 网段：两族必须分开装。v4 的绕行命令是
+	// `ip route add <cidr> via <v4 网关> dev <网卡>`，把一个 v6 网段丢进去，
+	// 内核会报 invalid gateway；而这条命令失败会直接掀翻整个 TUN 启动——
+	// 一个双栈节点就能把整机代理拖下水。
 	Exclude []string
-	// Gateway/Interface 来自当前默认路由，StrictRoute 的排除路由要用。
+	// Gateway/Interface 来自当前 v4 默认路由，StrictRoute 的排除路由要用。
 	Gateway   string
 	Interface string
+	// Gateway6/Interface6 来自当前 v6 默认路由。
+	// v6 的网关常常是 fe80:: 开头的链路本地地址（RA 下发），所以要单独记一份：
+	// 拿 v4 的网关去钉 v6 的绕行路由，命令直接是非法的。
+	Gateway6   string
+	Interface6 string
 	// UID 是 DNS 劫持要放行的发起者。已不再写进规则（按 uid 豁免会让桌面用户本人
 	// 一起被豁免，见 Plan 里的说明），保留是为了日志与残留清理时认得出是谁留下的。
 	UID int
@@ -75,6 +94,8 @@ func (p RoutePlan) Plan() (up, down []Cmd, err error) {
 	if p.Device == "" || p.Address == "" {
 		return nil, nil, errors.New("tun: device 与 address 必填")
 	}
+	// 这一组只管 v4：v6 网段交给 PlanV6Route。混在一起会让 v6 网段生成
+	// 一条非法的 v4 命令，而它的失败会掀翻整个 TUN 启动。
 	up = append(up,
 		Cmd{Bin: "ip", Args: []string{"addr", "add", p.Address, "dev", p.Device}, Desc: "配置网卡地址", TolerateExists: true},
 		Cmd{Bin: "ip", Args: []string{"link", "set", "dev", p.Device, "up"}, Desc: "启用网卡"},
@@ -155,38 +176,13 @@ func (p RoutePlan) Plan() (up, down []Cmd, err error) {
 		)
 	}
 
-	if p.StrictRoute {
-		if p.Gateway == "" || p.Interface == "" {
-			return nil, nil, errors.New("tun: strict_route 需要已知默认网关与网卡")
-		}
-		for _, cidr := range p.Exclude {
-			up = append(up, Cmd{
-				Bin:            "ip",
-				Args:           []string{"route", "add", cidr, "via", p.Gateway, "dev", p.Interface},
-				Desc:           "把 " + cidr + " 钉回物理网关（防环路）",
-				TolerateExists: true,
-			})
-		}
-		up = append(up, Cmd{Bin: "ip", Args: []string{"route", "add", "default", "dev", p.Device}, Desc: "默认路由交给 tun", TolerateExists: true})
-	}
+	// 这一族没有网关就整组不装，而不是让整个 TUN 起不来：
+	// 只有 v6 的网络（没有 v4 默认路由）照样要能用 v6 接管。
+	// 「两族都没有」由 buildPlan 拦——那时确实无处可去。
+	routeUp, routeDown := p.PlanRoutes()
+	up = append(up, routeUp...)
 
-	down = append(down, Cmd{
-		Bin:  "ip",
-		Args: []string{"route", "del", "default", "dev", p.Device},
-		Desc: "撤销默认路由",
-		// 非 StrictRoute 模式下这条路由本来就不存在，失败是预期内的。
-		Optional: !p.StrictRoute,
-	})
-	if p.StrictRoute && p.Gateway != "" && p.Interface != "" {
-		for i := len(p.Exclude) - 1; i >= 0; i-- {
-			down = append(down, Cmd{
-				Bin:      "ip",
-				Args:     []string{"route", "del", p.Exclude[i], "via", p.Gateway, "dev", p.Interface},
-				Desc:     "撤销排除路由 " + p.Exclude[i],
-				Optional: true,
-			})
-		}
-	}
+	down = append(down, routeDown...)
 	if p.HijackDNS {
 		down = append(down,
 			Cmd{Bin: "iptables", Args: []string{"-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", DNSChain}, Desc: "摘掉 UDP 劫持", Optional: true},
@@ -215,7 +211,73 @@ func (p RoutePlan) Plan() (up, down []Cmd, err error) {
 		Cmd{Bin: "ip", Args: []string{"addr", "del", p.Address, "dev", p.Device}, Desc: "摘掉网卡地址", Optional: true},
 		Cmd{Bin: "ip", Args: []string{"link", "set", "dev", p.Device, "down"}, Desc: "关闭网卡", Optional: true},
 	)
-	return up, down, nil
+	// 这三条（撤销假 IP 路由 / 摘地址 / 关网卡）全点名我们的网卡，而拆的顺序是
+	// 先销毁协议栈——那一步就把网卡 fd 关掉、设备从内核摘除了，于是它们必然报
+	// "Cannot find device"。要的效果其实已经达成（路由随设备一起没了），
+	// 不该让它把 Stop 报成失败：面板会说"TUN 已停止但撤销时出错"，
+	// 而那句错误既不可恢复也没有任何可补救的东西。
+	return up, tolerateGone(down, p.Device), nil
+}
+
+// PlanRoutes 只生成「路由」这一部分：绕行路由、组播、默认路由。
+//
+// 单独拆出来是因为「网络变了要重钉路由」时只能碰这一部分：
+// DNS 劫持那条链是用 -A 追加的，重装一遍就会多出一份重复规则，
+// 而重复的劫持规则会把 :53 打到不存在的地址上。
+//
+// 没开 strict_route 时整组为空：绕行路由与组播只有在默认路由被接管时才有意义。
+func (p RoutePlan) PlanRoutes() (up, down []Cmd) {
+	if !p.StrictRoute {
+		return nil, nil
+	}
+	if p.Gateway == "" || p.Interface == "" {
+		return nil, nil
+	}
+	exclude4, _ := splitExclude(p.Exclude)
+	for _, cidr := range exclude4 {
+		up = append(up, Cmd{
+			Bin:            "ip",
+			Args:           []string{"route", "add", cidr, "via", p.Gateway, "dev", p.Interface},
+			Desc:           "把 " + cidr + " 钉回物理网关（防环路）",
+			TolerateExists: true,
+		})
+	}
+	// 组播不能跟着默认路由进 tun。本机内核默认并不给物理网卡建组播路由，
+	// 于是 224.0.0.0/4 会落到默认路由上，被 tun 收走再转发出去——
+	// 组播是链路本地流量，出了这张网卡就没有意义，只会让组播应用卡住。
+	// 带上 metric 是为了不和内核自己可能存在的组播路由抢同一条：
+	// 真有内核路由时它的 metric 更小、优先生效，我们这条形同虚设；
+	// 没有时 ours 就是唯一的那条，组播留在物理网卡上。
+	up = append(up, Cmd{
+		Bin:            "ip",
+		Args:           []string{"route", "add", multicastV4, "dev", p.Interface, "metric", multicastMetric},
+		Desc:           "把 IPv4 组播留在物理网卡",
+		TolerateExists: true,
+	})
+	up = append(up, Cmd{Bin: "ip", Args: []string{"route", "add", "default", "dev", p.Device}, Desc: "默认路由交给 tun", TolerateExists: true})
+
+	down = append(down, Cmd{
+		Bin:  "ip",
+		Args: []string{"route", "del", "default", "dev", p.Device},
+		Desc: "撤销默认路由",
+		// 非 StrictRoute 模式下这条路由本来就不存在，失败是预期内的。
+		Optional: !p.StrictRoute,
+	})
+	down = append(down, Cmd{
+		Bin:      "ip",
+		Args:     []string{"route", "del", multicastV4, "dev", p.Interface, "metric", multicastMetric},
+		Desc:     "撤销 IPv4 组播路由",
+		Optional: true,
+	})
+	for i := len(exclude4) - 1; i >= 0; i-- {
+		down = append(down, Cmd{
+			Bin:      "ip",
+			Args:     []string{"route", "del", exclude4[i], "via", p.Gateway, "dev", p.Interface},
+			Desc:     "撤销排除路由 " + exclude4[i],
+			Optional: true,
+		})
+	}
+	return up, tolerateGone(down, p.Device)
 }
 
 // PlanV6 生成 IPv6 那一组命令，与 Plan 的 v4 组完全分开。
@@ -224,6 +286,17 @@ func (p RoutePlan) Plan() (up, down []Cmd, err error) {
 // 而 v6 配不上（多半是内核没有 ip6table_nat）完全可以只放弃 v6，
 // 让 AAAA 退回 NODATA、应用改走 A 记录。把两者混在一张列表里，
 // 一条 ip6tables 失败就会把整个 TUN 拖下水。
+// v6FakeIPUsable 报告这台机器的假 v6 该不该发出去。
+//
+// 假地址只解决「应用连到哪」，真把包送出去还得本机有 v6 出口（Gateway6 来自
+// 本机当前那条 v6 默认路由）。没有出口时发假 v6 等于给应用一个拨不通的地址：
+// 应用不会退回 A 记录，只会一直重试到超时——比回 NODATA 难查得多。
+// 2026-10-29 在这台机器上撞到过：USB 网卡（带全局 v6）掉线的那段时间，
+// 假 v6 照发，而启动日志却在承诺「路由装不上时降级为 NODATA（不声称可用）」。
+func (p RoutePlan) v6FakeIPUsable() bool {
+	return p.Device != "" && p.Address6 != "" && p.FakeIPRange6 != "" && p.Gateway6 != ""
+}
+
 func (p RoutePlan) PlanV6() (up, down []Cmd, err error) {
 	if p.Device == "" || p.Address6 == "" || p.FakeIPRange6 == "" {
 		return nil, nil, nil
@@ -298,12 +371,142 @@ func (p RoutePlan) PlanV6() (up, down []Cmd, err error) {
 		}
 	}
 	down = append(down, Cmd{Bin: "ip", Args: []string{"-6", "addr", "del", p.Address6, "dev", p.Device}, Desc: "摘掉网卡 IPv6 地址", Optional: true})
-	return up, down, nil
+	return up, tolerateGone(down, p.Device), nil
 }
 
 func isV6CIDR(cidr string) bool {
 	p, err := netip.ParsePrefix(cidr)
 	return err == nil && p.Addr().Is6()
+}
+
+// 组播网段与它们被钉住时用的 metric。
+//
+// metric 不取 0 是为了不和内核自己可能存在的组播路由撞成同一条：
+// 内核那条 metric 更小、优先生效，我们这条形同虚设；内核没有时，
+// 我们这条就是唯一的那条，组播因此留在物理网卡上而不会跟着默认路由进 tun。
+const (
+	multicastV4     = "224.0.0.0/4"
+	multicastV6     = "ff00::/8"
+	multicastMetric = "1000"
+)
+
+// splitExclude 把排除网段按地址族拆开。
+//
+// 必须拆的原因：v4 的绕行命令是 `ip route add <cidr> via <v4 网关> dev <网卡>`，
+// v6 的是 `ip -6 route add <cidr> via <v6 网关> dev <网卡>`。
+// 一个双栈节点解析出来的 v6 地址混进 v4 那组，内核会报 invalid gateway，
+// 而这条命令失败会直接掀翻整个 TUN 启动——整机代理为一个节点的地址陪葬。
+//
+// 解析不了的条目直接丢掉：它们既装不进 v4 也装不进 v6，
+// 留着只会让某条命令带着垃圾参数去见内核。
+func splitExclude(in []string) (v4, v6 []string) {
+	for _, raw := range in {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(raw); err == nil {
+			addr := p.Addr()
+			switch {
+			case addr.Is4():
+				v4 = append(v4, p.String())
+			case addr.Is4In6():
+				// 4in6（::ffff:a.b.c.d）要转回 v4 形式，
+				// 原样交给 ip 会被当成 v6 网段，落到另一组里去。
+				v4 = append(v4, addr.Unmap().String()+"/32")
+			default:
+				v6 = append(v6, p.String())
+			}
+			continue
+		}
+		// 配置里也允许写裸 IP。
+		if addr, err := netip.ParseAddr(raw); err == nil {
+			if addr.Is4() || addr.Is4In6() {
+				v4 = append(v4, addr.Unmap().String()+"/32")
+			} else {
+				v6 = append(v6, addr.String()+"/128")
+			}
+		}
+	}
+	return v4, v6
+}
+
+// v6Gateway 规整 v6 网关的写法。
+//
+// 曾经给它加过 %网卡 的 zone 后缀（fe80::5%wlp3s0f0），那是错的：
+// iproute2 的 `via` 参数只认纯地址，带 zone 会报
+// "inet6 address is expected rather than fe80::5%wlp3s0f0"，整条规则加不上。
+// 出口网卡由命令里的 dev 指明，zone 本来就是多余的。
+func v6Gateway(gateway, iface string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(gateway))
+	if err != nil {
+		return gateway
+	}
+	return addr.String()
+}
+
+// PlanV6Route 生成 IPv6 全局接管的命令：把 v6 绕行路由钉回物理网关，
+// 再把 v6 默认路由交给 tun。
+//
+// 单独成组而不是并进 PlanV6，是因为两者的失败后果必须分开说：
+//   - v6 假 IP / DNS 劫持失败 → AAAA 回 NODATA，应用退回 A 记录，照样能用；
+//   - v6 默认路由接管失败 → v6 流量根本没进 tun，界面必须如实说「v6 没被接管」。
+//
+// 混成一组就只剩一个真假值，用户分不清是哪一半没成。
+//
+// 没有 v6 网关时整组不生成命令：此时钉不回绕行路由，
+// 装上 v6 默认路由就会把我们自己发往 v6 节点的包也抓回来，形成环路。
+func (p RoutePlan) PlanV6Route() (up, down []Cmd, err error) {
+	if !p.StrictRoute || p.Address6 == "" {
+		return nil, nil, nil
+	}
+	if p.Gateway6 == "" || p.Interface6 == "" {
+		return nil, nil, nil
+	}
+	_, exclude6 := splitExclude(p.Exclude)
+	gateway := v6Gateway(p.Gateway6, p.Interface6)
+	for _, cidr := range exclude6 {
+		up = append(up, Cmd{
+			Bin:            "ip",
+			Args:           []string{"-6", "route", "add", cidr, "via", gateway, "dev", p.Interface6},
+			Desc:           "把 " + cidr + " 钉回物理网关（IPv6 防环路）",
+			TolerateExists: true,
+		})
+	}
+	up = append(up, Cmd{
+		Bin:            "ip",
+		Args:           []string{"-6", "route", "add", multicastV6, "dev", p.Interface6, "metric", multicastMetric},
+		Desc:           "把 IPv6 组播留在物理网卡",
+		TolerateExists: true,
+	})
+	up = append(up, Cmd{
+		Bin:            "ip",
+		Args:           []string{"-6", "route", "add", "default", "dev", p.Device},
+		Desc:           "IPv6 默认路由交给 tun",
+		TolerateExists: true,
+	})
+
+	down = append(down, Cmd{
+		Bin:      "ip",
+		Args:     []string{"-6", "route", "del", "default", "dev", p.Device},
+		Desc:     "撤销 IPv6 默认路由",
+		Optional: true,
+	})
+	down = append(down, Cmd{
+		Bin:      "ip",
+		Args:     []string{"-6", "route", "del", multicastV6, "dev", p.Interface6, "metric", multicastMetric},
+		Desc:     "撤销 IPv6 组播路由",
+		Optional: true,
+	})
+	for i := len(exclude6) - 1; i >= 0; i-- {
+		down = append(down, Cmd{
+			Bin:      "ip",
+			Args:     []string{"-6", "route", "del", exclude6[i], "via", gateway, "dev", p.Interface6},
+			Desc:     "撤销 IPv6 排除路由 " + exclude6[i],
+			Optional: true,
+		})
+	}
+	return up, tolerateGone(down, p.Device), nil
 }
 
 // StaleCleanup 生成清理历史残留的命令。device/address 用来删掉可能遗留的 SNAT。
@@ -358,9 +561,50 @@ func StaleCleanup6(uid int, device, address6 string) []Cmd {
 	return cmds
 }
 
+// sweepOutputJump 按内容扫一遍某张表的 OUTPUT，把挂着 chain 的跳转**逐条**摘掉，返回摘掉的描述。
+//
+// 为什么 -D 一次不够：重复装载（上一个进程没清残留、或者装到一半崩了、
+// 又或者每次重挂都往前插一条）会在 OUTPUT 上留下好几份一模一样的跳转，
+// 而 `-D` 一次只删一份。剩下的那一份让 `-X` 永远失败
+// ——链还有引用就删不掉——于是那条链永久挂在用户的防火墙里，
+// 而界面上写的是「已拆除」。
+// 这条路径的意义是收敛回零；收敛回「还剩一份」等于没清。
+// 只认 `-A` 开头的行：`-S` 回的就是这个形式，装载命令当初用 -I 也一样。
+func sweepOutputJump(ctx context.Context, r Runner, table, bin, chain string) []string {
+	out, err := r.Run(ctx, Cmd{Bin: bin, Args: []string{"-t", table, "-S", "OUTPUT"}, Desc: "列出 OUTPUT"})
+	if err != nil {
+		return nil
+	}
+	var done []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "-A OUTPUT") || !strings.Contains(line, "-j "+chain) {
+			continue
+		}
+		spec := strings.Fields(strings.TrimPrefix(line, "-A OUTPUT"))
+		del := Cmd{
+			Bin:      bin,
+			Args:     append([]string{"-t", table, "-D", "OUTPUT"}, spec...),
+			Desc:     "按内容撤销残留挂载跳转",
+			Optional: true,
+		}
+		if _, err := r.Run(ctx, del); err == nil {
+			done = append(done, del.Desc)
+		}
+	}
+	return done
+}
+
+// sweepDNSJumps 摘掉 nat 表里挂着劫持链的每一份跳转。
+func sweepDNSJumps(ctx context.Context, r Runner, bin string) []string {
+	return sweepOutputJump(ctx, r, "nat", bin, DNSChain)
+}
+
 // applyStale6 跑 v6 的残留清理，返回真正清掉的动作。
 func applyStale6(ctx context.Context, r Runner, plan RoutePlan) []string {
-	var done []string
+	// 先扫跳转：StaleCleanup6 里的 -X 只有在链不再被引用时才删得掉，
+	// 而重复装载留下的正是「删不胜删」的那几份引用。
+	done := sweepDNSJumps(ctx, r, "ip6tables")
 	for _, c := range StaleCleanup6(plan.UID, plan.Device, plan.Address6) {
 		if _, err := r.Run(ctx, c); err == nil {
 			done = append(done, c.Desc)
@@ -384,6 +628,9 @@ func CleanupStale(ctx context.Context, r Runner, uid int, device, address string
 		r = ExecRunner{}
 	}
 	var done []string
+	// 先扫跳转，再跑那份逐条删除的清单：清单里的 -X 只有在链不再被引用时才删得掉，
+	// 而重复装载留下的正是「-D 一次删一份、永远删不完」的那几份引用。
+	done = append(done, sweepDNSJumps(ctx, r, "iptables")...)
 	for _, c := range StaleCleanup(uid, device, address) {
 		if _, err := r.Run(ctx, c); err == nil {
 			done = append(done, c.Desc)
@@ -423,6 +670,29 @@ func mentionsOurDevice(line, device string) bool {
 		}
 	}
 	return false
+}
+
+// tolerateGone 给所有点名我们那块网卡的拆除命令标上"设备已经没了也算成功"。
+//
+// 判据是参数里出现这个设备名，而不是命令列表的硬编码位置：
+// 新增一条挂在网卡上的拆除命令时不必记得回来改表，
+// 而挂在**物理网卡**上的绕行路由（参数里是物理网卡名）自然也不会被误标。
+func tolerateGone(cmds []Cmd, device string) []Cmd {
+	if device == "" {
+		return cmds
+	}
+	for i := range cmds {
+		if cmds[i].Bin != "ip" {
+			continue
+		}
+		for _, a := range cmds[i].Args {
+			if a == device {
+				cmds[i].TolerateMissingDevice = device
+				break
+			}
+		}
+	}
+	return cmds
 }
 
 // Runner 执行 Cmd。生产用 ExecRunner，测试换成记录型假实现。
@@ -470,17 +740,44 @@ func resolveBin(name string) (string, error) {
 	return "", fmt.Errorf("找不到可执行文件 %s（已在 PATH 与 /usr/sbin、/sbin、/usr/bin、/bin 中查找）", name)
 }
 
+// tolerates 判断一条命令的失败是否可以当作成功放过。
+//
+// 三个调用点（Apply、本地 best-effort 拆除、helper 拆除）共用这一份判据：
+// 各写一遍的话，"拆除"那两路会把本来该忽略的失败报成错误。
+// 真实踩过的那次是 Stop 时报三连 Cannot find device——网卡先被协议栈收走了，
+// 那三条要的效果已经达成，而本地循环连 Optional 都没看。
+func tolerates(c Cmd, out string) bool {
+	if c.TolerateMissingDevice != "" &&
+		strings.Contains(out, `Cannot find device "`+c.TolerateMissingDevice+`"`) {
+		return true
+	}
+	if c.TolerateExists {
+		// 「已经存在」这三套措辞来自两套工具与两类对象，缺一个就少一种重入：
+		//   iproute2 的路由 → RTNETLINK answers: File exists
+		//   iproute2 的地址 → Error: ipv4: Address already assigned.
+		//   iptables 的链   → iptables: Chain already exists.
+		// 只认前者的代价是真发生过的：挂断网保护时 -N 报的是第三种，于是第二次重挂
+		// 被判成失败并走回滚——保护每改一次白名单就自己摘自己一次。
+		// 地址这一种同样不是假设：Plan 的两条 addr add 都写着 TolerateExists，
+		// 而内核给的就是 "already assigned"，网卡上已经挂着地址的那一次重装本应成功。
+		// 这三句由 netns 用例拿真工具盯着（tolerance_netns_test.go），不靠我记得准不准。
+		for _, phrase := range []string{"File exists", "already exists", "already assigned"} {
+			if strings.Contains(out, phrase) {
+				return true
+			}
+		}
+	}
+	return c.Optional
+}
+
 // Apply 依次执行命令。Optional 的失败只记进返回值里供调用方打日志，
 // 其余失败立即中断——网卡配不上还继续往下走只会把系统留成半成品状态。
 func Apply(ctx context.Context, r Runner, cmds []Cmd) error {
 	for _, c := range cmds {
 		out, err := r.Run(ctx, c)
 		if err != nil {
-			if c.TolerateExists && strings.Contains(out, "File exists") {
-				logx.Debugf("tun: %s 已在位，按成功处理（%s）", c.Desc, c)
-				continue
-			}
-			if c.Optional {
+			if tolerates(c, out) {
+				logx.Debugf("tun: %s 没做成，但不算失败（%v）", c.Desc, firstLine(out, err))
 				continue
 			}
 			return fmt.Errorf("%s 失败 (%s): %s", c.Desc, c, firstLine(out, err))
@@ -499,29 +796,54 @@ func firstLine(out string, err error) string {
 	return err.Error()
 }
 
-// ParseDefaultRoute 从 `ip -o route show default` 的输出里取网关与网卡。
+// DefaultRoute 是一次默认路由探测的结果。
+type DefaultRoute struct {
+	// Gateway 是网关。v4 一般是 192.168.x.1 这样的普通地址；
+	// v6 常常是 fe80:: 开头的链路本地地址（RA 下发），点对点链路则可能没有网关。
+	Gateway string
+	// Iface 是出口网卡。
+	Iface string
+}
+
+// ParseDefaultRoute 从 `ip [-6] -o route show default` 的输出里取网关与网卡。
+//
 // 典型行：default via 10.180.63.254 dev wlp3s0f0 proto dhcp metric 600
-func ParseDefaultRoute(out string) (gateway, iface string, ok bool) {
+// 判据是网卡名而不是网关：v6 的默认路由可以没有网关，
+// 而「认出默认路由」与「能不能拿它钉绕行路由」是两个问题，
+// 该由调用方分两处决定，不该在这里混成一个布尔值。
+func ParseDefaultRoute(out string) (DefaultRoute, bool) {
+	return ParseDefaultRouteExcept(out, "")
+}
+
+// ParseDefaultRouteExcept 同 ParseDefaultRoute，但跳过 dev 为 skip 的行。
+//
+// skip 是我们的 tun 网卡名。接管默认路由之后，路由表里同时有两条默认路由：
+// 我们那条（metric 0，dev 是 tun）与物理那条（DHCP 来的，metric 20600）。
+// 不跳过 tun 那条的话，探测会把 tun 自己当成「出口网卡」，
+// 于是网关读成空、网卡读成 tun——监视器从此认为网络一直断着。
+func ParseDefaultRouteExcept(out, skip string) (DefaultRoute, bool) {
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "default" {
 			continue
 		}
+		var dr DefaultRoute
 		for i := 1; i < len(fields); i++ {
 			switch fields[i] {
 			case "via":
 				if i+1 < len(fields) {
-					gateway = fields[i+1]
+					dr.Gateway = fields[i+1]
 				}
 			case "dev":
 				if i+1 < len(fields) {
-					iface = fields[i+1]
+					dr.Iface = fields[i+1]
 				}
 			}
 		}
-		if gateway != "" && iface != "" {
-			return gateway, iface, true
+		if dr.Iface == "" || dr.Iface == skip {
+			continue
 		}
+		return dr, true
 	}
-	return "", "", false
+	return DefaultRoute{}, false
 }

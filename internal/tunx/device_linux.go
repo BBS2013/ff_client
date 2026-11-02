@@ -5,6 +5,7 @@ package tunx
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
@@ -55,13 +56,20 @@ type fdDevice struct {
 	tunstack.LinkEndpoint
 	name string
 	fd   int
+	// closeOnce 是给第二次调用准备的：协议栈销毁这条链路时自己会调 Close()
+	// （非 persistent 的 tun 就是在那一刻消失的），我们随后的那一次只该是空操作。
+	// 少了这道闸，第二次 unix.Close 关的是**同一个数字**——
+	// 而它可能已经被进程里另一处 open 拿去了，那种坏法排查起来完全没有方向。
+	closeOnce sync.Once
 }
 
 func (d *fdDevice) Name() string { return d.name }
 
 func (d *fdDevice) Close() {
-	d.LinkEndpoint.Close()
-	_ = unix.Close(d.fd)
+	d.closeOnce.Do(func() {
+		d.LinkEndpoint.Close()
+		_ = unix.Close(d.fd)
+	})
 }
 
 // deviceFromFD 用 helper 交来的 fd 构造链路端点。

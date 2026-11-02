@@ -2,9 +2,12 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -235,5 +238,98 @@ func TestDevForPolicyOnNilSplit(t *testing.T) {
 	var sp *Split
 	if got := sp.DevForPolicy(PolicyDirect); got != "" {
 		t.Errorf("nil Split 该答空串，得到 %q", got)
+	}
+}
+
+// 探针问的是"包出不出得去"，不是"这个端口有没有人听"。
+// 所以 ECONNREFUSED 必须算通路正常：那是对方主机自己回来的 RST，
+// 证明这条钉住的 socket 真的走了一趟。选中节点是 UDP-only（hysteria2）时，
+// 拿它的 addr 做 TCP 探针多半就是被拒——判成"不通"会每次分流都被冤枉一遍。
+func TestProbeDeviceEgressCountsRefusedAsReachable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // 端口从此没人听：拨它应当被拒
+	if err := ProbeDeviceEgress("lo", addr, 3*time.Second); err != nil {
+		t.Fatalf("被拒应当算通路是通的，得到 %v", err)
+	}
+	// 对照组：一个不存在的目标仍然要报真话。
+	if err := ProbeDeviceEgress("lo", "192.0.2.1:9", 300*time.Millisecond); err == nil {
+		t.Fatal("拨不存在的目标不该算通")
+	}
+}
+
+// EgressPair 是"绑得上≠钉得住"这条判据唯一的一份实现（面板装配与 -diag 共用），
+// 所以三种答案都得钉住：钉卡背锅、分不清不下结论、钉得上一句不提。
+func TestEgressPairThreeVerdicts(t *testing.T) {
+	tm := errors.New("i/o timeout")
+	ok := func(string, string, time.Duration) error { return nil }
+	badBound := func(dev, _ string, _ time.Duration) error {
+		if dev == "" {
+			return nil
+		}
+		return tm
+	}
+	badBoth := func(string, string, time.Duration) error { return tm }
+
+	if blocked, fact := EgressPair(badBound, "wlx0", "node.example:8443", time.Second); !blocked ||
+		!strings.Contains(fact, "wlx0") || !strings.Contains(fact, "node.example:8443") {
+		t.Fatalf("钉着拨不通而不钉能通，就该判给钉卡: %v %q", blocked, fact)
+	}
+	if blocked, fact := EgressPair(badBoth, "wlx0", "node.example:8443", time.Second); blocked || fact == "" {
+		t.Fatalf("两条都不通时不下结论，但要把证据留着: %v %q", blocked, fact)
+	}
+	if blocked, fact := EgressPair(ok, "wlx0", "node.example:8443", time.Second); blocked || fact != "" {
+		t.Fatalf("钉得上一句都不该说: %v %q", blocked, fact)
+	}
+	// 没有目标就没证据，不许编一个结论出来。
+	if blocked, _ := EgressPair(badBound, "wlx0", "", time.Second); blocked {
+		t.Fatal("没有拨号目标时不该判钉卡的锅")
+	}
+}
+
+// 特权通道的开关是**按侧**的：只被判钉不上的那一侧走 helper，另一侧照旧自己绑。
+// 以前它是一个布尔、两侧共用一个答案，于是直连那一半废了而没人问。
+func TestBindGateIsPerSide(t *testing.T) {
+	sp := NewSplit("wlp3s0f0", "wlx001f0578cdff")
+	sp.SetActive(true)
+	sp.SetBindSocket(func(context.Context, string, string) (net.Conn, error) { return nil, nil })
+	sp.SetBindNeeded(false, true)
+	if sp.ShouldUseBind(PolicyDirect) {
+		t.Fatal("直连侧没被判钉不上，不该走特权通道")
+	}
+	if !sp.ShouldUseBind(PolicyProxy) {
+		t.Fatal("代理侧被判钉不上，该走特权通道")
+	}
+	sp.SetBindNeeded(true, false)
+	if !sp.ShouldUseBind(PolicyDirect) || sp.ShouldUseBind(PolicyProxy) {
+		t.Fatal("结论换了，两侧的答案必须跟着换")
+	}
+	// 分流没在跑就不该用通道：每用一次是一次提权往返，不能当默认路径。
+	sp.SetActive(false)
+	if sp.ShouldUseBind(PolicyDirect) || sp.ShouldUseBind(PolicyProxy) {
+		t.Fatal("分流关掉时两侧都不该走特权通道")
+	}
+}
+
+// BoundDialFor 必须把"哪一侧"翻译成"哪张卡"再交给 helper——交错了卡，
+// 症状是"分流看起来生效、流量却从另一张卡出去"，正是这一整套判据要防的事。
+func TestBoundDialForPicksTheSideDevice(t *testing.T) {
+	sp := NewSplit("wlp3s0f0", "wlx001f0578cdff")
+	var asked []string
+	sp.SetBindSocket(func(_ context.Context, dev, addr string) (net.Conn, error) {
+		asked = append(asked, dev+"|"+addr)
+		return nil, errors.New("桩：不真的连")
+	})
+	for _, p := range []Policy{PolicyDirect, PolicyProxy} {
+		if _, err := sp.BoundDialFor(context.Background(), p, "192.0.2.1:443"); err == nil {
+			t.Fatal("桩里故意报错，拿到成功说明没走到它")
+		}
+	}
+	want := []string{"wlp3s0f0|192.0.2.1:443", "wlx001f0578cdff|192.0.2.1:443"}
+	if len(asked) != len(want) || asked[0] != want[0] || asked[1] != want[1] {
+		t.Fatalf("两侧各自钉自己的卡，got %v", asked)
 	}
 }

@@ -84,6 +84,30 @@ func (d *Direct) WithSplit(s *Split) *Direct {
 	return d
 }
 
+// dial 是直连唯一的落点：能自己绑就自己绑，绑了发不出包而这台机器上有特权通道时，
+// 请 root 造一条钉在**直连那张卡**上、已经连通的 socket 交回来。
+//
+// 为什么直连也要问这件事：2026-10-30 之前特权通道只接代理侧，探针也只问代理侧，
+// 于是普通权限的界面写着「直连钉在内置卡上是真的在干活」——那句话是假的：
+// 内置卡上的钉卡同样被静默丢包（两台面板 via DIRECT 失败 363/1244 条、成功 0 条；
+// 转 root 后失败 0、成功 17）。
+//
+// 只接**已解析的 ip:port**：helper 里不许解析域名（故障现场重解析会拿到假 IP，
+// 这条硬规矩在 tunx 的 checkBindTarget），所以那两条"解析器坏了退回系统解析"的
+// 降级路径仍然自己拨——宁可少钉一次，也不把域名交给 root。
+func (d *Direct) dial(ctx context.Context, addr string) (net.Conn, error) {
+	if d.split != nil && d.split.ShouldUseBind(PolicyDirect) {
+		if host, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) != nil {
+			conn, berr := d.split.BoundDialFor(ctx, PolicyDirect, addr)
+			if berr != nil {
+				return nil, fmt.Errorf("走提权通道钉卡失败: %w", berr)
+			}
+			return conn, nil
+		}
+	}
+	return d.dialer.DialContext(ctx, "tcp", addr)
+}
+
 func (d *Direct) DialContext(ctx context.Context, addr string) (net.Conn, error) {
 	if err := d.checkLoop(addr); err != nil {
 		return nil, err
@@ -91,16 +115,16 @@ func (d *Direct) DialContext(ctx context.Context, addr string) (net.Conn, error)
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		// 形状不对就别自己解释，交给拨号器报它那份标准错误。
-		return d.dialer.DialContext(ctx, "tcp", addr)
+		return d.dial(ctx, addr)
 	}
 	if d.resolve == nil || net.ParseIP(host) != nil {
-		return d.dialer.DialContext(ctx, "tcp", addr)
+		return d.dial(ctx, addr)
 	}
 	addrs, rerr := d.resolve.LookupIP(ctx, host)
 	if rerr != nil || len(addrs) == 0 {
 		// 自己的解析器坏了不能顺手把连接也判死：退回原样交给系统解析器。
 		// 这与 resolveServerHost 的降级方向一致——宁可多一次降级，不制造新的失败。
-		return d.dialer.DialContext(ctx, "tcp", addr)
+		return d.dial(ctx, addr)
 	}
 	// 自己预解析就得把 net.Dialer 原本免费提供的多地址重试补回来：
 	// 只连第一个地址的话，多宿主的域名会从"有一个能通就通"变成"第一个不通就全不通"。
@@ -122,7 +146,7 @@ func (d *Direct) DialContext(ctx context.Context, addr string) (net.Conn, error)
 		if err := d.checkLoop(candidate); err != nil {
 			return nil, err
 		}
-		conn, derr := d.dialer.DialContext(ctx, "tcp", candidate)
+		conn, derr := d.dial(ctx, candidate)
 		if derr == nil {
 			return conn, nil
 		}

@@ -214,6 +214,52 @@ func TestCliFlagParsedWithoutEatingNextArg(t *testing.T) {
 	}
 }
 
+// TestDialHelperOwnerZeroIsLegal 盯住 owner=0 这一档。
+//
+// 整个面板由 sudo 拉起时它就是这一档（os.Getuid() == 0）：套接字本来就归 root，
+// helper 不需要 chown，但绝不表示"没传 owner"。历史上这里判过 uid <= 0，
+// 结果 root 面板每次请求都被拒，报的却是「需要 --dial-helper-owner」——
+// 一条自相矛盾的报错，把人往"参数没拼上"那条错路上引。
+func TestDialHelperOwnerZeroIsLegal(t *testing.T) {
+	cases := []struct {
+		name    string
+		owner   string
+		want    int
+		wantErr bool
+	}{
+		{name: "root 面板", owner: "0", want: 0},
+		{name: "普通面板", owner: "1000", want: 1000},
+		{name: "带空白也不算没传", owner: " 1000 ", want: 1000},
+		{name: "没传", owner: "", wantErr: true},
+		{name: "非数字", owner: "root", wantErr: true},
+		{name: "负数", owner: "-1", wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseDialHelperOwner(c.owner)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("owner=%q 期望报错，实际通过并得到 uid=%d", c.owner, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("owner=%q 应当被接受，实际报错: %v", c.owner, err)
+			}
+			if got != c.want {
+				t.Fatalf("owner=%q 解析为 %d, want %d", c.owner, got, c.want)
+			}
+		})
+	}
+	// 缺路径优先报缺路径，别让 owner 的错盖住它。
+	if err := dialHelperCommand("", "0"); err == nil || !strings.Contains(err.Error(), "dial-helper-connect") {
+		t.Fatalf("缺套接字路径时应说清缺什么: %v", err)
+	}
+	if err := dialHelperCommand("/tmp/wps/s", ""); err == nil || !strings.Contains(err.Error(), "dial-helper-owner") {
+		t.Fatalf("缺 owner 时应说清缺什么: %v", err)
+	}
+}
+
 // TestGuiDefaultMatchesBuildTag 确认这份测试二进制自己的默认模式符合预期：
 // 无标签构建必须是纯命令行，否则 systemd 部署路径会被 GUI 依赖污染。
 func TestGuiDefaultMatchesBuildTag(t *testing.T) {

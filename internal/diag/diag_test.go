@@ -372,7 +372,10 @@ func TestReportNormalResolvConfIsQuiet(t *testing.T) {
 	t.Cleanup(func() { resolvConfPath = old })
 
 	out := run(t, cfgWith(t, filepath.Join(t.TempDir(), "missing.mmdb")))
-	if strings.Contains(out, "残留") || strings.Contains(out, "没人能解析") {
+	// 只看解析这一节的措辞：报告里别的节（比如「默认路由指向 tun」）说的是**这台机器此刻**
+	// 有没有人在接管，与这份临时 resolv.conf 无关——拿整份报告里有没有「残留」当判据，
+	// 会让一条本来正确的用例在「有人正跑着严格模式面板」时红掉（2026-10-29 实际踩过）。
+	if strings.Contains(out, "DNS 劫持的残留") || strings.Contains(out, "没人能解析") {
 		t.Errorf("一份正常的 resolv.conf 不该引出任何告警:\n%s", out)
 	}
 }
@@ -486,5 +489,25 @@ func TestReportListsEveryFileTheEngineRead(t *testing.T) {
 	}
 	if !strings.Contains(out, extra) {
 		t.Errorf("清单里没有 #include 进来的那份（%s）", extra)
+	}
+}
+
+// TestSplitBlockedConclusionDistinguishesHelper 守住“报告不许替 helper 那条路下结论”。
+// 2026-11-02 的实测里，-diag 说两张卡都退回默认路由，而 ss 显示面板的连接
+// 已经钉在 wlx/wlp 上——差别只在面板配了 tun.helper，而报告没把这条算进去。
+func TestSplitBlockedConclusionDistinguishesHelper(t *testing.T) {
+	with := splitBlockedConclusion(true)
+	if !strings.Contains(with, "tun.helper") || !strings.Contains(with, "未验证") {
+		t.Fatalf("配了 helper 时应当说明未验证 helper，实际: %q", with)
+	}
+	if strings.Contains(with, "按系统默认路由走") {
+		t.Fatalf("配了 helper 时不能断言退回默认路由，实际: %q", with)
+	}
+	without := splitBlockedConclusion(false)
+	if !strings.Contains(without, "按系统默认路由走") {
+		t.Fatalf("没配 helper 时应当说明退回默认路由，实际: %q", without)
+	}
+	if strings.Contains(without, "tun.helper") {
+		t.Fatalf("没配 helper 时不该提 helper，实际: %q", without)
 	}
 }

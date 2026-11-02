@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"wps_app/internal/sudoown"
 )
 
 // 后端标识，出现在配置、状态文件与界面里。
@@ -234,7 +236,16 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := os.Chmod(name, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	// root 面板替桌面用户写文件时（见 sudoown 包注释），账必须记在
+	// 桌面用户手里：改动是借 sudo 落在用户身上的，账若留在 root 手里，
+	// 普通权限实例读不懂，「欠不欠还原」就没人答得上来，孤儿检查全废。
+	// 这里 best-effort：chown 失败不推翻这次写入——桌面改动已经落了，
+	// 此刻报错只会让调用方撤账，造出「改了桌面却没记账」的真孤儿。
+	_ = sudoown.ToDesktopUser(path)
+	return nil
 }
 
 // resolvePath 在桌面用户的家目录下拼路径。

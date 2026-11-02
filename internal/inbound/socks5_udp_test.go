@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"wps_app/internal/metrics"
 	"wps_app/internal/outbound"
 	"wps_app/internal/router"
 	"wps_app/internal/rules"
@@ -280,6 +282,69 @@ func TestSOCKS5UDPAssociateSurvivesOutboundWithoutUDP(t *testing.T) {
 	socksConnectRequest(t, c, cmdUDPAssociate, atypIPv4, []byte{127, 0, 0, 1}, 0)
 	if rep := readSocksReply(t, c); rep != repSuccess {
 		t.Fatalf("UDP ASSOCIATE 应答 = %#x, want %#x", rep, repSuccess)
+	}
+}
+
+// TestSOCKS5UDPRefusalIsRecordedOnce 是被拒的 UDP 也进连接表这一条的 SOCKS5 半边。
+//
+// 客户端拿不到任何错误：UDP 没有"拒绝"这个表达方式，重试是它唯一会做的事。
+// 于是两件事必须同时成立——① 表里要有一行带原因的记录，
+// ② 只能有一行。②靠的是「出站由第一个报文定下来」（decided），
+// 不是靠这里另设一个标志：所以这条断言真正守的是"别把重试的包再拨一次号"，
+// 改成每包各自判定那一刻，它就会红。
+func TestSOCKS5UDPRefusalIsRecordedOnce(t *testing.T) {
+	reg := metrics.NewRegistry(16, 16)
+	s := NewSOCKS5(newTestRouter(t, rulesDirect), "", "", reg)
+	addr := serve(t, func(ln net.Listener) { _ = s.Serve(ln) })
+
+	ctl, relay := assocOpenUDP(t, addr)
+	defer func() { _ = ctl.Close() }()
+	uc, err := net.DialUDP("udp", nil, mustUDPAddr(t, relay))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = uc.Close() }()
+
+	// 10.0.0.0/8 命中 IP-CIDR…DIRECT，而直连出站明确不带 UDP。
+	pkt := assocPacket(t, "ping", atypIPv4, []byte{10, 0, 0, 1}, 53)
+	for i := 0; i < 3; i++ {
+		if _, err := uc.Write(pkt); err != nil {
+			t.Fatalf("发第 %d 个报文: %v", i+1, err)
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+
+	var row metrics.ConnView
+	deadline := time.Now().Add(3 * time.Second)
+	var snap metrics.Snapshot
+	for time.Now().Before(deadline) {
+		snap = reg.Snapshot()
+		for _, h := range append(append([]metrics.ConnView(nil), snap.Active...), snap.History...) {
+			if h.Inbound == "socks5-udp" && h.Err != "" {
+				row = h
+			}
+		}
+		if row.ID != 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if row.ID == 0 {
+		t.Fatalf("被拒的 UDP 在连接表里没有任何痕迹（active=%d history=%d）",
+			len(snap.Active), len(snap.History))
+	}
+	if !strings.Contains(row.Err, "UDP") {
+		t.Errorf("失败原因没说是 UDP 带不动: %q", row.Err)
+	}
+	if row.Host != "10.0.0.1" || row.Port != "53" {
+		t.Errorf("失败行指错了目标: %+v", row)
+	}
+	if row.Up+row.Down != 0 {
+		t.Errorf("一条根本没建起来的关联不该有字节: %+v", row)
+	}
+	if snap.TotalFailed != 1 {
+		t.Errorf("发了三个被拒的报文，「拨不通」计了 %d 条，want 1（每次重试都记一行会把表淹掉）",
+			snap.TotalFailed)
 	}
 }
 

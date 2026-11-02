@@ -39,6 +39,8 @@ type Router struct {
 	dialTO time.Duration
 	// onFault 是拨号失败的观察者，见 SetFaultObserver。
 	onFault atomic.Pointer[FaultObserver]
+	// onOK 是拨号成功的观察者，见 SetRecoverObserver。
+	onOK atomic.Pointer[RecoverObserver]
 	// iface 回答某个策略的出站被钉在哪张网卡上，见 SetIfaceResolver。
 	iface atomic.Pointer[IfaceResolver]
 }
@@ -84,6 +86,31 @@ func (r *Router) SetFaultObserver(obs FaultObserver) {
 		return
 	}
 	r.onFault.Store(&obs)
+}
+
+// RecoverObserver 收到一次「拨号成功」。
+//
+// 它是「节点又通了」唯一的信号。失败观察者只能告诉我们坏了几次，
+// 光靠它判断不了什么时候该把故障断网保护的闸门放开——
+// 那道闸门一旦关上就可能永远关着，而表现是「网络一直断着」。
+type RecoverObserver func(d outbound.Dialer)
+
+// SetRecoverObserver 装上（或传 nil 清掉）拨号成功的观察者。
+// 与 SetFaultObserver 同理走 atomic：它要读服务层的状态，构造期会绕成环。
+func (r *Router) SetRecoverObserver(obs RecoverObserver) {
+	if obs == nil {
+		r.onOK.Store(nil)
+		return
+	}
+	r.onOK.Store(&obs)
+}
+
+// reportOK 把一次拨号成功转交给观察者。
+// 与 reportFault 不同，这里不传 target：成功的判据只跟「走的是哪只出站」有关。
+func (r *Router) reportOK(d outbound.Dialer) {
+	if obs := r.onOK.Load(); obs != nil {
+		(*obs)(d)
+	}
 }
 
 // New 创建路由器并加载首份规则。
@@ -204,6 +231,7 @@ func (r *Router) DialHost(ctx context.Context, addr, hint string) (net.Conn, Res
 		r.reportFault(target, d, err)
 		return nil, res, fmt.Errorf("dial %s via %s: %w", target, d.Name(), err)
 	}
+	r.reportOK(d)
 	return conn, res, nil
 }
 
@@ -226,6 +254,7 @@ func (r *Router) DialUDPHost(ctx context.Context, addr, hint string) (outbound.P
 		}
 		return nil, res, fmt.Errorf("udp %s via %s: %w", target, d.Name(), err)
 	}
+	r.reportOK(d)
 	return pc, res, nil
 }
 

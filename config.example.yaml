@@ -70,10 +70,13 @@ tun:
     strict_route: false
     # 桌面推荐姿势：面板以普通用户身份跑（托盘正常），把建网卡与改路由交给 helper。
     # 用绝对路径，并给该用户配免密 sudo（写法见 README §4.3 的 sudoers 例子）。
+    # 注意这个路径要指着**面板自己那个二进制**：2026-10-29 起只有一个产物
+    # （./wps_app-gui），面板与 helper 是同一个文件——helper 那条指着别处，
+    # 启用时就会去叫一个不是这份程序的文件。
     # helper:
     #     - sudo
     #     - "-n"
-    #     - "/usr/local/bin/wps_app"
+    #     - "/usr/local/bin/wps_app-gui"
     #     - "--tun-helper"
 
 dns:

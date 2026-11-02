@@ -25,6 +25,8 @@ type Server struct {
 	conn  *net.UDPConn
 	delay time.Duration
 	ip    net.IP
+	// muted 为真时只收不答，见 Mute。
+	muted bool
 
 	mu     sync.Mutex
 	count  int
@@ -74,6 +76,10 @@ func (f *Server) serve() {
 		}
 		f.qnames[q.Name.String()+"/"+q.Type.String()]++
 		f.mu.Unlock()
+		if f.isMuted() {
+			// 装死：收下了、计过数了，就是不回。客户端那边只剩超时一条路。
+			continue
+		}
 		if f.delay > 0 {
 			time.Sleep(f.delay)
 		}
@@ -133,6 +139,24 @@ func (f *Server) answer() net.IP {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.ip
+}
+
+// Mute 让这台上游"收到但装死"：查询照常计数，只是不回话。
+//
+// 要演「挂了 → 又通了」只能这样：真正的上游挂了在客户端眼里的样子就是不应答，
+// 而不是换一种答案。换一个地址得重建解析器（那是另一次进程启动），
+// 而"恢复"这件事要的恰恰是**同一个解析器**在不重启的情况下自己好起来。
+// 计数保留是故意的：用例要能确认真的问过，而不是超时因为包根本没发出去。
+func (f *Server) Mute(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.muted = on
+}
+
+func (f *Server) isMuted() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.muted
 }
 
 // Questions 返回上游收到过的每个「问题名+类型」各被问过几次。

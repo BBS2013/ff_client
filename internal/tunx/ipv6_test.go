@@ -508,6 +508,9 @@ func newTUNForV6(t *testing.T, failOn string) (*TUN, *recordingRunner) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 这一组验的是「v6 那一组命令」的成败与回滚，前提自然是这台机器有 v6 出口：
+	// 没有出口时我们根本不发假 v6（那条分支见 v6_egress_test.go）。
+	plan.Gateway6, plan.Interface6 = "fe80::5", "wlp3s0f0"
 	tun.plan = plan
 	return tun, r
 }

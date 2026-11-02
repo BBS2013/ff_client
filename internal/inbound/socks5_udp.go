@@ -116,7 +116,6 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 		rec     *metrics.Conn
 		client  atomic.Pointer[net.UDPAddr]
 		decided bool
-		refused bool
 	)
 	defer func() {
 		if pc != nil {
@@ -135,12 +134,13 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 			p, res, err := s.router.DialUDPHost(ctx, d.addr, "")
 			cancel()
 			if err != nil {
-				if !refused {
-					refused = true
-					// 「这条路本来就不通」必须说得像一句人话：应用侧只看得见
-					// 自己的报文石沉大海，唯一能解释这件事的地方只有这里。
-					logx.Warnf("socks5 %s: UDP 未转发（首个报文发往 %s）：%v", ctl.RemoteAddr(), d.addr, err)
-				}
+				// 「这条路本来就不通」必须说得像一句人话：应用侧只看得见
+				// 自己的报文石沉大海——UDP 传不回任何错误码，重试是它唯一的表达方式。
+				logx.Warnf("socks5 %s: UDP 未转发（首个报文发往 %s）：%v", ctl.RemoteAddr(), d.addr, err)
+				// 与 TUN 那一侧同一个理由：只留日志等于没解释，进连接表。
+				// 一次关联只会记这一条，因为出站是**第一个报文**定下来的（decided 之后
+				// 再来的包根本不再拨号）——客户端重试十次也就只有一行，表不会被刷屏。
+				s.reg.Refuse("socks5-udp", ctl.RemoteAddr().String(), d.addr, res, err.Error())
 				continue
 			}
 			pc = p

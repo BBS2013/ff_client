@@ -58,19 +58,36 @@ type record struct {
 	v6  netip.Addr
 }
 
+// DNSReply 是一次应答的结果：报文，外加「这一条是不是 SERVFAIL」。
+//
+// 分开是有原因的：SERVFAIL 也算"应答过了"，而那个计数（面板上「已应答 DNS N 次」）
+// 唯一的用途是证明劫持确实在工作。上游全挂的时候把一百次失败报成一百次成功，
+// 那个数字说的是反话。
+type DNSReply struct {
+	Packet   []byte
+	ServFail bool
+}
+
 // Serve 处理一条 DNS 查询报文，返回应答报文。
+// 不关心 RCODE 的调用方用它；要分开计数的用 Reply。
 func (s *dnsServer) Serve(ctx context.Context, query []byte) ([]byte, error) {
+	rep, err := s.Reply(ctx, query)
+	return rep.Packet, err
+}
+
+// Reply 是 Serve 的完整版：报文 + 这一条到底答上了没有。
+func (s *dnsServer) Reply(ctx context.Context, query []byte) (DNSReply, error) {
 	var p dnsmessage.Parser
 	h, err := p.Start(query)
 	if err != nil {
-		return nil, fmt.Errorf("parse dns header: %w", err)
+		return DNSReply{}, fmt.Errorf("parse dns header: %w", err)
 	}
 	qs, err := p.AllQuestions()
 	if err != nil {
-		return nil, fmt.Errorf("parse dns questions: %w", err)
+		return DNSReply{}, fmt.Errorf("parse dns questions: %w", err)
 	}
 	if len(qs) == 0 {
-		return nil, fmt.Errorf("dns query without question")
+		return DNSReply{}, fmt.Errorf("dns query without question")
 	}
 
 	var (
@@ -92,10 +109,14 @@ func (s *dnsServer) Serve(ctx context.Context, query []byte) ([]byte, error) {
 		RecursionAvailable: true,
 	}
 	if failed != nil {
+		// 上游解析不动这条查询：回 SERVFAIL，让应用自己去试别的（或者退回 hosts）。
+		// 这里必须同时把"失败了"告诉调用方，见 DNSReply.ServFail。
 		head.RCode = dnsmessage.RCodeServerFailure
-		return encode(head, qs, nil)
+		pkt, err := encode(head, qs, nil)
+		return DNSReply{Packet: pkt, ServFail: true}, err
 	}
-	return encode(head, qs, records)
+	pkt, err := encode(head, qs, records)
+	return DNSReply{Packet: pkt}, err
 }
 
 // answer 为单个 question 生成答案。返回空切片表示 NODATA（合法但无记录）。
@@ -271,61 +292,65 @@ const dnsTCPIdle = 60 * time.Second
 // 所以只支持一条也能骗过它——那正是这类缺陷藏得住的原因。）
 //
 // idle 为空转收连的等待；生产传 dnsTCPIdle，测试传短值以便真的走到那条分支上。
-// 返回已应答的条数。读到 EOF、连接被关或空闲到点都算正常收尾，不报错。
-func serveDNSOverTCP(c net.Conn, serve func(context.Context, []byte) ([]byte, error), idle time.Duration) (int, error) {
+// 返回两个计数：答上的条数与回 SERVFAIL 的条数（为什么要分开，见 DNSReply）。
+// 读到 EOF、连接被关或空闲到点都算正常收尾，不报错。
+func serveDNSOverTCP(c net.Conn, serve func(context.Context, []byte) (DNSReply, error), idle time.Duration) (served, failed int, err error) {
 	// 读写各配一个缓冲：stdlib 把长度前缀和正文放在同一次 Write 里
 	// （dnsclient_unix.go:89-92 先把前缀写进 tcpReq 头两字节），
 	// 但也有客户端先写长度再写正文；有缓冲两种都接得住，不会逐字节打散成系统调用。
 	br := bufio.NewReader(c)
 	bw := bufio.NewWriter(c)
-	served := 0
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(idle))
 		var size uint16
-		err := binary.Read(br, binary.BigEndian, &size)
-		if err != nil {
+		if err := binary.Read(br, binary.BigEndian, &size); err != nil {
 			switch {
 			case errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed):
-				return served, nil
+				return served, failed, nil
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
-				return served, nil
+				return served, failed, nil
 			}
-			return served, fmt.Errorf("读 dns 长度前缀: %w", err)
+			return served, failed, fmt.Errorf("读 dns 长度前缀: %w", err)
 		}
 		if size == 0 {
-			return served, errors.New("dns over tcp 收到长度为 0 的报文")
+			return served, failed, errors.New("dns over tcp 收到长度为 0 的报文")
 		}
 		if size > dnsTCPMaxQuery {
-			return served, fmt.Errorf("dns over tcp 报文过长: %d 字节", size)
+			return served, failed, fmt.Errorf("dns over tcp 报文过长: %d 字节", size)
 		}
 		query := make([]byte, size)
 		if _, err := io.ReadFull(br, query); err != nil {
-			return served, fmt.Errorf("读 dns 报文正文: %w", err)
+			return served, failed, fmt.Errorf("读 dns 报文正文: %w", err)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		resp, err := serve(ctx, query)
+		rep, err := serve(ctx, query)
 		cancel()
 		if err != nil {
-			return served, fmt.Errorf("应答 dns 查询: %w", err)
+			return served, failed, fmt.Errorf("应答 dns 查询: %w", err)
 		}
 		// 应答也必须带长度前缀：否则对端把报文头的前两字节当长度读，
 		// 后面整条流就错位了，表现是「解析超时」而不是「解析出错」。
-		if len(resp) > dnsTCPOneMessageMax {
-			return served, fmt.Errorf("dns 应答 %d 字节，超出 tcp 长度字段", len(resp))
+		if len(rep.Packet) > dnsTCPOneMessageMax {
+			return served, failed, fmt.Errorf("dns 应答 %d 字节，超出 tcp 长度字段", len(rep.Packet))
 		}
-		if err := binary.Write(bw, binary.BigEndian, uint16(len(resp))); err != nil {
-			return served, fmt.Errorf("写应答长度: %w", err)
+		if err := binary.Write(bw, binary.BigEndian, uint16(len(rep.Packet))); err != nil {
+			return served, failed, fmt.Errorf("写应答长度: %w", err)
 		}
-		if _, err := bw.Write(resp); err != nil {
-			return served, fmt.Errorf("写应答: %w", err)
+		if _, err := bw.Write(rep.Packet); err != nil {
+			return served, failed, fmt.Errorf("写应答: %w", err)
 		}
 		if err := bw.Flush(); err != nil {
-			return served, fmt.Errorf("刷应答: %w", err)
+			return served, failed, fmt.Errorf("刷应答: %w", err)
 		}
-		served++
+		// 计在 Flush 之后：没送到对端的答案不算"应答过"。
+		if rep.ServFail {
+			failed++
+		} else {
+			served++
+		}
 	}
 }
 
