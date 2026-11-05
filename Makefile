@@ -153,8 +153,11 @@ latency:
 ## （gui.go 写了为什么不能换），软件光栅下的帧时与加速渲染下不是一回事。
 ## 前置与用法见 scripts/panel-paint.py 的抬头；数字与判据见 README §9.4。
 ## 追加参数：make paint ARGS="--css oldLook"（盖回改之前那版样式做 A/B）。
+## 演示数据不进面板二进制。量帧时单独打一份带 VITE_DEMO 的产物到 frontend/dist-paint，
+## 静态伺服要指这个目录，而不是 frontend/dist。
 PAINT_ARGS ?=
 paint:
+	cd frontend && VITE_DEMO=1 npx vite build --outDir dist-paint
 	./scripts/panel-paint.py $(PAINT_ARGS)
 
 race:

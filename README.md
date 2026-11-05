@@ -498,7 +498,7 @@ make install-helper          # 装到 /usr/local/libexec/wps_app/wps_app-gui
 # 只放行这一条完整 argv，不要写成 `--tun-helper --tun-helper-connect=*`：
 # sudoers 的通配符能匹配空格，于是那个 `*` 等于允许在 --tun-helper-connect
 # 后面再追加任意参数。面板每次都会自动补上套接字路径，规则里不需要通配。
-cery ALL=(root) NOPASSWD: /usr/local/libexec/wps_app/wps_app-gui --tun-helper
+chery ALL=(root) NOPASSWD: /usr/local/libexec/wps_app/wps_app-gui --tun-helper
 ```
 
 `config.yaml` 里对应改成：

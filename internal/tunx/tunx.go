@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
@@ -1337,31 +1338,74 @@ const defaultRelayGrace = 10 * time.Second
 // relayGrace 读当前宽限。
 func relayGrace() time.Duration { return time.Duration(tunRelayGrace.Load()) }
 
-// idleConn 在每次成功收发后把对应的 deadline 往后推。
+// idleConn 把空闲截止时间往后推，但不是每读一块就推一次。
+// 两次之间至少隔 idle/4，避免忙碌连接每个 32KB 都做一次 setsockopt。
 type idleConn struct {
 	net.Conn
-	idle time.Duration
+	idle    time.Duration
+	touched atomic.Int64
+	reads   atomic.Int64
 }
 
 func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
+	ic := &idleConn{Conn: c, idle: idle}
+	ic.touched.Store(time.Now().UnixNano())
 	_ = c.SetDeadline(time.Now().Add(idle))
-	return &idleConn{Conn: c, idle: idle}
+	return ic
+}
+
+func (c *idleConn) bump(n int) {
+	metrics.BumpDeadline(&c.touched, c.idle/4, c.idle, n, c.Conn.SetDeadline)
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
+	c.reads.Add(1)
 	n, err := c.Conn.Read(p)
-	if n > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
-	}
+	c.bump(n)
 	return n, err
 }
 
 func (c *idleConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
+	c.bump(n)
+	return n, err
+}
+
+func (c *idleConn) Unwrap() net.Conn { return c.Conn }
+
+func (c *idleConn) CountRead(n int64) { metrics.CountRead(c.Conn, n) }
+
+func (c *idleConn) ReadFrom(r io.Reader) (int64, error) {
+	src, _ := r.(net.Conn)
+	if metrics.TCPOf(c.Conn) == nil || metrics.TCPOf(src) == nil {
+		return metrics.CopyPooled(c, r)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	if fd, ok := metrics.DupTCP(c.Conn); ok {
+		go func() {
+			defer close(done)
+			metrics.WatchTCPWrite(fd, c.idle/4, func() {
+				c.touched.Store(time.Now().UnixNano())
+				_ = c.Conn.SetDeadline(time.Now().Add(c.idle))
+			}, stop)
+			_ = syscall.Close(fd)
+		}()
+	} else {
+		close(done)
+	}
+	n, _, err := metrics.CopySplice(c.Conn, r)
+	close(stop)
+	<-done
 	if n > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+		c.touched.Store(time.Now().UnixNano())
+		_ = c.Conn.SetDeadline(time.Now().Add(c.idle))
 	}
 	return n, err
+}
+
+func (c *idleConn) SyscallConn() (syscall.RawConn, error) {
+	return metrics.RawConn(c.Conn)
 }
 
 // CloseWrite 把半关闭能力透传给底层。

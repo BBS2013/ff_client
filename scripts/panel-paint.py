@@ -21,13 +21,15 @@ agent-browser（Chromium，GPU 加速）里。数字一直很干净：默认数�
 也就是说：**"稳态干净"这一格此前量的是加速渲染下的干净**，
 软件光栅下同一份界面并不干净。这个脚本换到同一个引擎里量。
 
-它只加载 `frontend/dist` + `?demo=`（纯前端演示桥），
+它只加载带演示数据的前端产物 + `?demo=`（纯前端演示桥），
 不碰后端、不碰 config.yaml、不碰桌面系统代理。
+演示数据不打进面板二进制：`make paint` 会把带 VITE_DEMO 的产物放到
+`frontend/dist-paint`，不要拿 `frontend/dist` 来量。
 
 前置
 ----
-  make frontend                        产物要与磁盘一致
-  frontend/dist 上起静态伺服           python3 -m http.server 5199
+  make paint                           会先构建 frontend/dist-paint
+  在 frontend/dist-paint 上起静态伺服  python3 -m http.server 5199
   python3-gi + gir1.2-webkit2-4.0      本机装的是 WebKitGTK 2.50
   xvfb-run                             不想在真桌面上弹窗时用它
 

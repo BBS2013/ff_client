@@ -168,24 +168,34 @@ func TestResolverRecoversAfterEveryUpstreamFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 失败会进 30 秒负缓存。这里把窗口压到很短，才能在用例里等到它过期。
+	r.negTTL = 40 * time.Millisecond
 	srv.Mute(true)
-	for i := 0; i < 2; i++ {
-		if addrs, err := r.LookupIP(context.Background(), "heals.example"); err == nil {
-			t.Fatalf("上游装死时第 %d 次解析却成功了: %v", i+1, addrs)
-		}
+	if addrs, err := r.LookupIP(context.Background(), "heals.example"); err == nil {
+		t.Fatalf("上游装死时解析却成功了: %v", addrs)
 	}
 	// 这条判据防的是"静默空跑"：装死要是让包根本没发出去，
 	// 那失败就不是在测上游无响应，而是在测一个没人听的 socket。
 	if srv.Queries() == 0 {
 		t.Fatal("装死期间一个查询都没到达上游：这条用例没在测恢复")
 	}
+	afterFail := srv.Queries()
+	if _, err := r.LookupIP(context.Background(), "heals.example"); err == nil {
+		t.Fatal("负缓存期间不该再成功")
+	}
+	if got := srv.Queries(); got != afterFail {
+		t.Fatalf("负缓存没挡住重试：查询数 %d -> %d", afterFail, got)
+	}
 
-	// 上游回来。同一个解析器、同一个域名，必须立刻答得出——
-	// 做不到就是失败被缓存住了，而这正是那条"只有重启才好"的故障。
+	// 负缓存过期之前，上游即使已经恢复也不该被问到。
 	srv.Mute(false)
+	if _, err := r.LookupIP(context.Background(), "heals.example"); err == nil {
+		t.Fatal("负缓存还没过期就成功了")
+	}
+	time.Sleep(r.negTTL + 20*time.Millisecond)
 	addrs, err := r.LookupIP(context.Background(), "heals.example")
 	if err != nil {
-		t.Fatalf("上游恢复了，解析却没恢复（失败被记进缓存了）: %v", err)
+		t.Fatalf("负缓存过期、上游也恢复了，解析却没恢复: %v", err)
 	}
 	if len(addrs) == 0 || !addrs[0].Is4() {
 		t.Fatalf("恢复后拿到的不是那条 A 记录: %v", addrs)

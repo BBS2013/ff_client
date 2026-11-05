@@ -2,7 +2,9 @@
 package dnsx
 
 import (
+	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -23,9 +25,15 @@ const graceWindow = 250 * time.Millisecond
 // 没有上界就会一直涨下去。
 const maxCacheEntries = 4096
 
+// negCacheTTL 是失败结果的缓存时间。成功答案用配置里的 TTL（默认 5 分钟），
+// 失败只压 30 秒：挡住应用的成百次重试，又不会在网络恢复之后一直拿着旧错误。
+const negCacheTTL = 30 * time.Second
+
 type cacheEntry struct {
 	addrs  []netip.Addr
+	err    error
 	expire time.Time
+	el     *list.Element
 }
 
 type call struct {
@@ -89,9 +97,12 @@ type Resolver struct {
 	// 规则判定拿不到 IP 会退到兜底策略，那比「隧道没起来所以整个分流不干活」好。
 	tunnel atomic.Pointer[TunnelDial]
 
-	mu       sync.Mutex
-	cache    map[string]*cacheEntry
-	inflight map[string]*call
+	mu         sync.Mutex
+	cache      map[string]*cacheEntry
+	order      *list.List // 队头是最近用过的，满了从队尾丢
+	inflight   map[string]*call
+	negTTL     time.Duration
+	maxEntries int
 	// tunnelEpoch 用来让「换节点」能作废隧道路径的缓存：
 	// 不同地区的节点问同一个上游会得到不同答案（尤其 GEOIP 相关的域名），
 	// 切完节点还抱着旧答案，判定的依据就是上一个节点的视角。
@@ -148,7 +159,10 @@ func NewWithInternal(servers, internalServers, domainSuffixes []string, timeout,
 		domainSuffixes:  cleanSuffix,
 		timeout:         timeout,
 		ttl:             ttl,
+		negTTL:          negCacheTTL,
+		maxEntries:      maxCacheEntries,
 		cache:           make(map[string]*cacheEntry),
+		order:           list.New(),
 		inflight:        make(map[string]*call),
 	}, nil
 }
@@ -325,7 +339,13 @@ func (r *Resolver) probe(ctx context.Context, host string, path Path, fresh bool
 	}
 	key := r.key(path, h)
 	if !fresh {
-		if addrs, ttl, ok := r.cacheHit(key); ok {
+		if addrs, fail, ttl, ok := r.cacheHit(key); ok {
+			if fail != nil {
+				return ProbeResult{
+					Host: h, Path: path, Cached: true, TtlMs: ttl,
+					Ms: time.Since(start).Milliseconds(),
+				}, fail
+			}
 			return ProbeResult{
 				Host: h, Path: path, Addrs: addrs, Cached: true, TtlMs: ttl,
 				Ms: time.Since(start).Milliseconds(),
@@ -335,8 +355,8 @@ func (r *Resolver) probe(ctx context.Context, host string, path Path, fresh bool
 	addrs, err := r.resolve(ctx, h, path, fresh)
 	out := ProbeResult{Host: h, Path: path, Addrs: addrs, Ms: time.Since(start).Milliseconds()}
 	// 刚写进去的那份，剩余时间就是整条 TTL：这一格要说的是"多久之后它会自己变"，
-	// 不是"我这次花了多久"。
-	if _, ttl, ok := r.cacheHit(key); ok {
+	// 不是"我这次花了多久"。失败的短缓存同样把剩余时间交出来。
+	if _, _, ttl, ok := r.cacheHit(key); ok {
 		out.TtlMs = ttl
 	}
 	return out, err
@@ -360,7 +380,11 @@ func (r *Resolver) resolve(ctx context.Context, host string, path Path, bypassCa
 	key := r.key(path, h)
 
 	if !bypassCache {
-		if addrs := r.fromCache(key); addrs != nil {
+		if addrs, cachedErr, ok := r.cached(key); ok {
+			if cachedErr != nil {
+				logx.Debugf("dns: %s(%s) 命中负缓存: %v", h, path, cachedErr)
+				return nil, cachedErr
+			}
 			logx.Debugf("dns: %s(%s) 命中缓存 -> %v", h, path, addrs)
 			return addrs, nil
 		}
@@ -389,8 +413,17 @@ func (r *Resolver) resolve(ctx context.Context, host string, path Path, bypassCa
 
 	r.mu.Lock()
 	delete(r.inflight, key)
-	if c.err == nil && len(c.addrs) > 0 {
-		r.putLocked(key, c.addrs)
+	switch {
+	case c.err == nil && len(c.addrs) > 0:
+		r.putLocked(key, c.addrs, nil, r.ttl)
+	case c.err != nil && !errors.Is(c.err, context.Canceled):
+		// 取消是调用方自己不看了，不是这个名字的答案。超时和 NXDOMAIN 要压一小段，
+		// 否则一个打不开的域名会被每个连接重新问一遍上游。
+		ttl := r.negTTL
+		if ttl <= 0 {
+			ttl = negCacheTTL
+		}
+		r.putLocked(key, nil, c.err, ttl)
 	}
 	r.mu.Unlock()
 	close(c.done)
@@ -399,52 +432,88 @@ func (r *Resolver) resolve(ctx context.Context, host string, path Path, bypassCa
 }
 
 // putLocked 写缓存并维持上限。调用方必须持有 mu。
-func (r *Resolver) putLocked(h string, addrs []netip.Addr) {
-	r.cache[h] = &cacheEntry{addrs: addrs, expire: time.Now().Add(r.ttl)}
-	if len(r.cache) <= maxCacheEntries {
+// 最近写入的放在队头；满了先丢掉已经过期的，再从队尾（最久没用）丢。
+func (r *Resolver) putLocked(h string, addrs []netip.Addr, fail error, ttl time.Duration) {
+	if r.order == nil {
+		r.order = list.New()
+	}
+	if old, ok := r.cache[h]; ok {
+		r.unlinkLocked(old)
+	}
+	e := &cacheEntry{addrs: addrs, err: fail, expire: time.Now().Add(ttl)}
+	e.el = r.order.PushFront(h)
+	r.cache[h] = e
+	r.evictLocked()
+}
+
+func (r *Resolver) unlinkLocked(e *cacheEntry) {
+	if e != nil && e.el != nil && r.order != nil {
+		r.order.Remove(e.el)
+		e.el = nil
+	}
+}
+
+func (r *Resolver) dropLocked(k string) {
+	e, ok := r.cache[k]
+	if !ok {
 		return
 	}
-	// 先清过期项，通常就够了。
+	r.unlinkLocked(e)
+	delete(r.cache, k)
+}
+
+func (r *Resolver) evictLocked() {
+	limit := r.maxEntries
+	if limit <= 0 {
+		limit = maxCacheEntries
+	}
+	if len(r.cache) <= limit {
+		return
+	}
 	now := time.Now()
 	for k, e := range r.cache {
 		if now.After(e.expire) {
-			delete(r.cache, k)
+			r.dropLocked(k)
 		}
 	}
-	// 还超就继续淘汰。缓存没有「哪个更该留」的先验，
-	// 随机丢到上限即可——这只是一层加速，不参与正确性。
-	for k := range r.cache {
-		if len(r.cache) <= maxCacheEntries {
+	for len(r.cache) > limit {
+		if r.order == nil {
 			break
 		}
-		delete(r.cache, k)
+		back := r.order.Back()
+		if back == nil {
+			break
+		}
+		k, _ := back.Value.(string)
+		r.dropLocked(k)
 	}
 }
 
-func (r *Resolver) fromCache(h string) []netip.Addr {
-	addrs, _, ok := r.cacheHit(h)
-	if !ok {
-		return nil
-	}
-	return addrs
+func (r *Resolver) cached(h string) ([]netip.Addr, error, bool) {
+	addrs, err, _, ok := r.cacheHit(h)
+	return addrs, err, ok
 }
 
-// cacheHit 返回缓存里那份答案，以及**它还剩多少毫秒有效**。
+// cacheHit 返回缓存里那份答案、失败（负缓存）、以及**它还剩多少毫秒有效**。
 // 剩余时间必须一起给：只报"命中缓存"而不说它还有多久会自己过期，
 // 人就无法判断"再等一会儿会不会变"和"我必须手动重问"这两种情况的区别。
-func (r *Resolver) cacheHit(key string) ([]netip.Addr, int64, bool) {
+// 命中时把这条挪到队头，淘汰时优先丢掉最久没人用的。
+func (r *Resolver) cacheHit(key string) ([]netip.Addr, error, int64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.cache[key]
 	if !ok {
-		return nil, 0, false
+		return nil, nil, 0, false
 	}
 	left := time.Until(e.expire)
 	if left <= 0 {
-		delete(r.cache, key)
-		return nil, 0, false
+		r.dropLocked(key)
+		return nil, nil, 0, false
 	}
-	return e.addrs, left.Milliseconds(), true
+	if r.order != nil && e.el != nil {
+		r.order.MoveToFront(e.el)
+	}
+	return e.addrs, e.err, left.Milliseconds(), true
 }
 
 // UpstreamAnswer 是**一个上游**对同一个名字的回话。
@@ -575,7 +644,7 @@ func (r *Resolver) prime(key string, addrs []netip.Addr) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.putLocked(key, addrs)
+	r.putLocked(key, addrs, nil, r.ttl)
 }
 
 func (r *Resolver) hasServer(want string) bool {

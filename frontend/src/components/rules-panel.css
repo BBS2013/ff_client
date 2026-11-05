@@ -1,0 +1,364 @@
+/* 规则表的筛选行。放在组件里而不是全局 style.css：
+   连接表早就有自己的一套 .filter（scoped），全局同名规则会串过去改它的间距。 */
+.rules-view .filter {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: var(--sp-2) 0 0;
+}
+.rules-view .filter input {
+  flex: 1;
+  min-width: 0;
+}
+/* 拦截名单做成一枚枚 chip：域名和它的删除动作是一体的，
+   原来那种"文字靠左、删除靠最右"的网格，名单一短就满屏都是飘着的红字。 */
+.rules-view .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  margin-top: var(--sp-1);
+}
+
+.rules-view .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-pill);
+  background: var(--warn-bg);
+  color: var(--warn-bright);
+  font-size: var(--fs-caption);
+}
+
+.rules-view .chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(251, 191, 36, 0.16);
+  color: var(--warn-bright);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+
+.rules-view .chip-x svg {
+  width: 8px;
+  height: 8px;
+}
+
+.rules-view .chip-x:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.34);
+}
+
+.rules-view .chip-x:active:not(:disabled) {
+  transform: scale(0.88);
+}
+
+.rules-view .chip-x:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rules-view .add .value {
+  flex: 1 1 200px;
+}
+
+/* 最近拦截留痕：一行一条，文字在左、动作在右且垂直居中。 */
+.rules-view .hits {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+
+.rules-view .hits h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-caption);
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.rules-view .hits ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: var(--sp-2);
+  max-height: 220px;
+  overflow: auto;
+}
+
+.rules-view .hit {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.rules-view .hit-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.rules-view .hits li .btn {
+  flex: 0 0 auto;
+}
+
+.rules-view .line1 {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-sm);
+}
+
+.rules-view .rule {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+}
+
+.rules-view .probe {
+  flex: 1 1 260px;
+}
+
+.rules-view .probe-out {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-sm);
+}
+
+/* 「最近取过」那一列：一行一次尝试。
+   必须 flex-wrap + overflow-wrap——一长串 URL 在 flex 里的 min-content 是"整个 token"，
+   不写这两条就会把 558px 宽的那一栏撑破（§10.4 记过同一类坑，中文那边是"一个字"，
+   英文 token 这边是"一整串"，两头都得防）。 */
+.rules-view .hist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-sm);
+}
+
+.rules-view .hist li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.rules-view .hist .mono {
+  overflow-wrap: anywhere;
+}
+
+.rules-view .hist .why {
+  color: var(--err-bright);
+  overflow-wrap: anywhere;
+}
+
+.rules-view .row-act {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+/* 序：这一列的数字就是命中优先级。数字和移动按钮放同一格，
+   是因为"它排第几"与"挪一挪"是同一件事的两半，拆开会让人找不到入口。 */
+.rules-view .ord {
+  white-space: nowrap;
+}
+
+.rules-view .ord > .pos {
+  display: inline-block;
+  min-width: 20px;
+  margin-right: var(--sp-2);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.rules-view .ord-act {
+  display: inline-flex;
+  gap: 2px;
+  vertical-align: middle;
+}
+
+.rules-view .ord-act > .btn {
+  min-width: 26px;
+  padding: 0 6px;
+}
+
+/* 这一盒里面是"一句结论 + 分类 + 逐条"三段，只有这里真的需要 flex：竖着排。
+   （`.alert` 本身从 flex 改回普通块，就是因为横着排会把一句话拆成几栏——
+   中文在 flex 里的 min-content 是一个字，900px 下第一栏被挤成"这份名单/里有 2 条/"
+   那种一字一行，整盒高到 229px。2026-10-20 截图为证。） */
+.rules-view .dead-box {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.rules-view .dead-box p {
+  margin: 0;
+}
+
+.rules-view .pin-select {
+  min-width: 108px;
+}
+
+/* 停用的那一行：整行压暗一档，再配一个明确的"已停用"标记。
+   只有暗没有字是不够的——深色主题下 60% 亮度很容易被看成"就是这么个颜色"。 */
+.rules-view tbody tr.off td {
+  opacity: 0.55;
+}
+
+.rules-view tbody tr.off td.mono,
+.rules-view tbody tr.off td .mono {
+  text-decoration: line-through;
+}
+
+.rules-view .off-pill {
+  margin-left: var(--sp-1);
+  border-color: var(--muted);
+  background: transparent;
+  color: var(--muted);
+}
+
+/* .window-row 那一组已挪到全局 style.css：日志流也用窗口渲染，两处不能长两个样。 */
+
+.rules-view .pin-tag {
+  margin-left: var(--sp-1);
+  padding: 1px 6px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-pill);
+  background: var(--accent-bg);
+  color: var(--accent-bright);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+
+/* 钉的节点已经不在配置里：这一格用危险色，而不是和好的钉住项长得一样。
+   危险色不是"提醒注意"，是"这一格说的事情不成立"。 */
+.rules-view .pin-tag.broken {
+  border-color: var(--err-line);
+  background: var(--err-bg);
+  color: var(--err-bright);
+  text-decoration: line-through;
+}
+
+/* 表里那个就地换节点的下拉：尺寸要贴着旁边那颗 pill，不然一行里
+   会有一半高度是被控件撑出来的。坏掉的那一条同样标红。 */
+.rules-view .pin-select.inline {
+  margin-left: var(--sp-1);
+  padding: 1px 4px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-pill);
+  background: var(--accent-bg);
+  color: var(--accent-bright);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  min-width: 0;
+  max-width: 168px;
+}
+
+.rules-view .pin-select.inline.broken {
+  border-color: var(--err-line);
+  background: var(--err-bg);
+  color: var(--err-bright);
+}
+
+.rules-view .batch-toggle {
+  margin-top: var(--sp-2);
+  align-items: center;
+}
+
+.rules-view .batch {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.rules-view .batch-text {
+  width: 100%;
+  min-height: 110px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.rules-view .batch-out {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: var(--fs-sm);
+}
+
+.rules-view .batch-out p {
+  margin: 0;
+}
+
+.rules-view .reject,
+.rules-view .dead {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-5);
+}
+
+/* 分类那一小段：紧跟在结论句后面，用点列而不是整段文字，
+   读的人要的是"哪几类、各几条"，不是又一句散文。 */
+.rules-view .kinds {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-5);
+  list-style: disc;
+}
+
+.rules-view .kinds li {
+  margin: 2px 0;
+  font-size: var(--fs-sm);
+}
+
+/* 用户写的那一行与后端给的理由之间要断得开：两段都是中文，
+   挤在一起会读成一句话，而前半段是要拿去文件里搜的字面串。 */
+.rules-view .dead li .mono {
+  margin-right: var(--sp-2);
+}
+
+.rules-view .reject li,
+.rules-view .dead li {
+  margin: 2px 0;
+  font-size: var(--fs-sm);
+}
+
+.rules-view .mut {
+  color: var(--muted);
+}

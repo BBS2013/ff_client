@@ -1,6 +1,6 @@
 package ui
 
-// 演示词表守卫：frontend/src/api.ts 里那些"照抄后端字面量"的位置，
+// 演示词表守卫：frontend/src/demo.ts 里那些"照抄后端字面量"的位置，
 // 必须与 Go 侧真能产出的那一套**双向对上**——每个后端取值演示里都要有，
 // 演示写出的每个取值后端也都得能产出。
 //
@@ -33,7 +33,7 @@ import (
 
 func demoSource(t *testing.T) string {
 	t.Helper()
-	return frontendFile(t, "api.ts")
+	return frontendFile(t, "demo.ts")
 }
 
 // frontendFile 读 frontend/src 下的一个文件。守卫要跨语言比对，只能读源码。

@@ -26,9 +26,22 @@ import (
 // 一条纪律：只有「变化落定了」才动手（与网卡监视器同源，见 service/ifacewatch.go）。
 // 丢一次 DHCP 就会短暂地「没网关」，那种抖动不该换来两次重建。
 
-// routeWatchInterval 是看一次网络的时间。5 秒与网卡监视器一致：
-// 「换网之后不用管它」与「不变成常驻轮询」之间的折中。
+// routeWatchInterval 是 netlink 订不上时的退路：每隔这么久主动看一次路由。
+// 订上之后不再按这个节奏 fork `ip route`，只在路由事件之后看。
 const routeWatchInterval = 5 * time.Second
+
+// routeFallbackInterval 是订上 netlink 之后的慢速兜底。
+// 系统 DNS（resolv.conf）不走路由事件，丢包导致的 ENOBUFS 也可能漏一条，
+// 所以仍然定期对一下，但不必再每 5 秒起两个 ip 进程。
+const routeFallbackInterval = 60 * time.Second
+
+// routeCoalesce 是连续路由事件里，安静这么久才认为变化落定。
+// routeConfirm 是落定后再看的第二眼：去抖要求连续两份快照相同才重钉。
+const (
+	routeCoalesce  = 1 * time.Second
+	routeConfirm   = 2 * time.Second
+	routeSettleCap = 8 * time.Second
+)
 
 // routeState 是「网络现在长什么样」的快照。
 type routeState struct {
@@ -288,15 +301,69 @@ func (t *TUN) stopNetWatchLocked() {
 }
 
 func (t *TUN) netWatchLoop(ctx context.Context) {
-	ticker := time.NewTicker(routeWatchInterval)
+	events := openRouteEvents(ctx)
+	interval := routeFallbackInterval
+	if events == nil {
+		// 订不上就退回原来的 5 秒。nil 通道在 select 里永远不会就绪。
+		interval = routeWatchInterval
+		logx.Debugf("TUN: 没有路由事件，改为每 %s 看一次默认路由", interval)
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-events:
+			if !waitRouteSettle(ctx, events, routeCoalesce) {
+				return
+			}
+			t.checkNetworkChanged(ctx)
+			if !waitCtx(ctx, routeConfirm) {
+				return
+			}
+			t.checkNetworkChanged(ctx)
 		case <-ticker.C:
 			t.checkNetworkChanged(ctx)
 		}
+	}
+}
+
+// waitRouteSettle 等到 quiet 这么久没有新事件。
+// 事件如果一直来，最多等到 routeSettleCap，避免 DHCP 风暴把重钉无限期推迟。
+func waitRouteSettle(ctx context.Context, more <-chan struct{}, quiet time.Duration) bool {
+	timer := time.NewTimer(quiet)
+	defer timer.Stop()
+	deadline := time.NewTimer(routeSettleCap)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return true
+		case <-more:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(quiet)
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+func waitCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

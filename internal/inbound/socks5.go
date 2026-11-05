@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"wps_app/internal/logx"
@@ -356,30 +357,79 @@ func relay(client, remote net.Conn) {
 const tunnelIdleTimeout = 30 * time.Minute
 
 func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
+	ic := &idleConn{Conn: c, idle: idle}
+	ic.touched.Store(time.Now().UnixNano())
 	_ = c.SetDeadline(time.Now().Add(idle))
-	return &idleConn{Conn: c, idle: idle}
+	return ic
 }
 
-// idleConn 在每次成功收发后把对应的 deadline 往后推。
+// idleConn 把空闲截止时间往后推，但不是每读一块就推一次。
+// 两次之间至少隔 idle/4：一条忙连接不再每个 32KB 都做 setsockopt，
+// 真正闲下来时，最初设下的截止时间仍然会到点。
 type idleConn struct {
 	net.Conn
-	idle time.Duration
+	idle    time.Duration
+	touched atomic.Int64
+	// reads 只给测试用：splice 接上之后这里应当保持为 0。
+	reads atomic.Int64
+}
+
+func (c *idleConn) bump(n int) {
+	metrics.BumpDeadline(&c.touched, c.idle/4, c.idle, n, c.Conn.SetDeadline)
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
+	c.reads.Add(1)
 	n, err := c.Conn.Read(p)
-	if n > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
-	}
+	c.bump(n)
 	return n, err
 }
 
 func (c *idleConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
+	c.bump(n)
+	return n, err
+}
+
+// Unwrap 让 splice 剥到里面的 *TCPConn。
+func (c *idleConn) Unwrap() net.Conn { return c.Conn }
+
+// CountRead 把 splice 搬过的字节补记到里面的计数包装上。
+func (c *idleConn) CountRead(n int64) { metrics.CountRead(c.Conn, n) }
+
+// ReadFrom 两端都是 TCP 时走内核 splice。源不是 TCP（QUIC、TLS）就退回用户态拷贝。
+func (c *idleConn) ReadFrom(r io.Reader) (int64, error) {
+	src, _ := r.(net.Conn)
+	if metrics.TCPOf(c.Conn) == nil || metrics.TCPOf(src) == nil {
+		return metrics.CopyPooled(c, r)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	if fd, ok := metrics.DupTCP(c.Conn); ok {
+		go func() {
+			defer close(done)
+			metrics.WatchTCPWrite(fd, c.idle/4, func() {
+				c.touched.Store(time.Now().UnixNano())
+				_ = c.Conn.SetDeadline(time.Now().Add(c.idle))
+			}, stop)
+			_ = syscall.Close(fd)
+		}()
+	} else {
+		close(done)
+	}
+	n, _, err := metrics.CopySplice(c.Conn, r)
+	close(stop)
+	<-done
 	if n > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+		c.touched.Store(time.Now().UnixNano())
+		_ = c.Conn.SetDeadline(time.Now().Add(c.idle))
 	}
 	return n, err
+}
+
+// SyscallConn 把底层 fd 交出去。包装层不转发的话，再套一层就拿不到。
+func (c *idleConn) SyscallConn() (syscall.RawConn, error) {
+	return metrics.RawConn(c.Conn)
 }
 
 // CloseWrite 透传给底层连接：relay 用类型断言决定能不能只关掉这一个方向，
