@@ -57,6 +57,9 @@ type logBuffer struct {
 	entries []LogEntry // 固定长度，按写入顺序循环覆盖
 	next    int        // 下一次写入的槽位；entries[next] 同时也是最老的一条
 	seq     int64      // 已分配的最大序号
+	// mask 在 clip 之后对单条消息做掩码（与 ExportLogs / 诊断报告同一套规则）。
+	// 为 nil 时只存 clip 后的原文（测试里 direct add 仍可按导出路径验掩码）。
+	mask func(string) string
 }
 
 func newLogBuffer(capacity int) *logBuffer {
@@ -71,11 +74,15 @@ func (b *logBuffer) add(level logx.Level, msg string, at time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.seq++
+	msg = clipMsg(msg)
+	if b.mask != nil {
+		msg = b.mask(msg)
+	}
 	b.entries[b.next] = LogEntry{
 		Seq:   b.seq,
 		Time:  at.Format("15:04:05"),
 		Level: level.String(),
-		Msg:   clipMsg(msg),
+		Msg:   msg,
 	}
 	b.next = (b.next + 1) % len(b.entries)
 }
