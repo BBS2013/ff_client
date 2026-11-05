@@ -39,9 +39,9 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      # geoip.mmdb 因许可不入库；internal/rules 性能闸需要它（README §3）。
-      - name: Fetch GeoIP for Go tests
-        run: ./scripts/fetch-assets.sh
+      # geoip.mmdb / gfw 种子因许可不入库；internal/rules 性能闸需要它们（README §3）。
+      - name: Fetch test assets for Go tests
+        run: ./scripts/fetch-assets.sh --seed
 
       - name: make gate-pr
         run: make gate-pr
