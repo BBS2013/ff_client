@@ -24,7 +24,7 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui gate-pr frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper cover
+.PHONY: all build build-gui gate-gui gate-pr frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet vet-nogui vet-gui fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper cover
 
 all: build
 
@@ -165,9 +165,15 @@ race:
 
 ## vet 两种构建都要跑。只跑默认构建会漏掉 `//go:build gui` 下的文件——
 ## gui.go 里一个没用到的 import 就是这么溜过去、直到 make build-gui 才红的。
-vet:
+## vet-nogui 不拉 GTK/WebKit pkg-config，给 gate-pr / 无 dev 包环境用；
+## vet-gui 需要 libgtk-3-dev 与 webkit 开发包（与 gate-gui 同档）。
+vet-nogui:
 	go vet ./...
+
+vet-gui:
 	go vet -tags "$(GUI_TAGS)" ./...
+
+vet: vet-nogui vet-gui
 
 fmt:
 	gofmt -l .
@@ -200,9 +206,9 @@ fmt-check:
 ## 现在这几条都带上了前提检查：解析器在编答案时它们会**带原因地跳过**而不是红
 ## （`switch_test.go::fakeDNSActive`、`diag_test.go::TestReportNormalResolvConfIsQuiet` 已收窄判据）；
 ## 但跳过等于这一格没验，所以门禁轮次仍应在面板停着的时候跑。
-## gate-pr 是 PR / CI 快路径：格式、vet、Go 单测、前端构建（含 vue-tsc 与 dist 自洽）、前端单测。
-## 不含 race / test-offline / test-netns-fw / fuzz-smoke / gate-gui（后者见 .github/workflows/nightly.yml）。
-gate-pr: fmt-check vet test frontend frontend-test
+## gate-pr 是 PR / CI 快路径：格式、vet-nogui、Go 单测、前端构建（含 vue-tsc 与 dist 自洽）、前端单测。
+## 不含 vet-gui / race / test-offline / test-netns-fw / fuzz-smoke / gate-gui（后者见 .github/workflows/nightly.yml）。
+gate-pr: fmt-check vet-nogui test frontend frontend-test
 	@echo "PR 门禁通过（未含 race / 离线 netns / fuzz / gate-gui；本地全套仍用 make gate）"
 
 gate: fmt-check vet test race test-offline test-netns-fw fuzz-smoke frontend frontend-test gate-gui

@@ -93,5 +93,7 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+      - name: make vet-gui
+        run: make vet-gui
       - name: make gate-gui
         run: make gate-gui

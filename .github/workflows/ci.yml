@@ -1,6 +1,6 @@
 # PR / push 到 main 的快路径门禁（对应 make gate-pr）。
-# 刻意不含：race（~6min）、test-offline / test-netns-fw（unshare + 挂载 netns）、
-# fuzz-smoke（多目标模糊测试）、gate-gui（GTK/WebKit 链接，apt 装 dev 包也偏慢）。
+# 刻意不含：vet-gui / gate-gui（GTK/WebKit pkg-config 与链接）、race（~6min）、
+# test-offline / test-netns-fw（unshare + 挂载 netns）、fuzz-smoke（多目标模糊测试）。
 # 上述步骤在 nightly.yml 里跑；本地全套仍用 `make gate`。
 name: CI
 
