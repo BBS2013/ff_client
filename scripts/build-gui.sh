@@ -18,7 +18,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${WPS_GUI_OUT:-$ROOT/wps_app-gui}"
 # gui 是我们的隔离标签（把 GTK/WebKit 运行时关在默认构建之外），
 # production 是 Wails 自己的。两个都要给，缺一个都编不出可用产物。
+# Ubuntu 24.04+ / GitHub Actions 往往只有 webkit2gtk-4.1 开发包，Wails 用 webkit2_41 标签切换 pkg-config。
 TAGS="gui production"
+if ! pkg-config --exists webkit2gtk-4.0 2>/dev/null; then
+  if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+    TAGS="gui production webkit2_41"
+  fi
+fi
 # 与 Makefile/package.sh 共用同一份注入：版本、源码指纹、构建时刻。
 LDFLAGS="$("$ROOT/scripts/build-ldflags.sh")"
 

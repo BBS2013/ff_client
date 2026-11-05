@@ -1,0 +1,99 @@
+# 补全 `make gate` 里 PR 快路径刻意跳过的步骤（约十余分钟量级）。
+# 定时 + 手动触发；失败会发 nightly 邮件（若仓库已开通知）。
+name: Nightly gate (heavy)
+
+on:
+  schedule:
+    # 每天 UTC 03:15
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make race
+        run: make race
+
+  test-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # test-offline 需要 unshare -rn 与 ip(8) 起 lo；ubuntu-latest 默认有 user ns，但需 iproute2。
+      - name: Install iproute2
+        run: sudo apt-get update && sudo apt-get install -y iproute2
+      - name: make test-offline
+        run: make test-offline
+
+  test-netns-fw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 需要 unshare -rnm 并在私有 netns 里 mount tmpfs 到 /run（iptables 锁）。
+    # 部分受限 runner 可能禁止 mount；失败时保留日志，不阻塞其它 nightly job。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install iproute2
+        run: sudo apt-get update && sudo apt-get install -y iproute2
+      - name: make test-netns-fw
+        run: make test-netns-fw
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make fuzz-smoke
+        run: make fuzz-smoke
+
+  gate-gui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # 只验证链接与 //go:build gui 产物，不启动 X11/Wayland 窗口。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install GTK / WebKit build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-dev \
+            libepoxy-dev
+          # 22.04 多为 4.0-dev；24.04 多为 4.1-dev（build-gui.sh 会自动加 webkit2_41 标签）
+          sudo apt-get install -y libwebkit2gtk-4.0-dev || \
+            sudo apt-get install -y libwebkit2gtk-4.1-dev
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: make vet-gui
+        run: make vet-gui
+      - name: make gate-gui
+        run: make gate-gui
