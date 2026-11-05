@@ -312,8 +312,27 @@ func (h *HelperServer) doUp(ctx context.Context, plan RoutePlan) (HelperReply, i
 	}
 	mtu, err := h.mtu(plan.Device)
 	if err != nil {
+		// 这一步失败时**必须**先回滚已经装上去的东西再报错。
+		//
+		// 地址、路由、v6 接管、还有最要紧的 iptables :53 劫持，此刻都已经在系统里了。
+		// 只关 fd 是不够的：关 fd 会让 tun 网卡随引用计数消失，挂在它上面的路由一起没，
+		// 但 nat 表里的 wps_app_dns、OUTPUT 跳转、POSTROUTING 的 SNAT 不会——
+		// 它们继续把本机所有 :53 查询 DNAT 到一个已经不存在的地址。
+		// 症状是「TUN 没起来，整机 DNS 全超时」，而面板上只有一句读 MTU 失败。
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcancel()
+		_, down, _ := plan.Plan()
+		if _, v6down, verr := plan.PlanV6Route(); verr == nil {
+			down = append(v6down, down...)
+		}
+		if _, v6down, verr := plan.PlanV6(); verr == nil {
+			down = append(v6down, down...)
+		}
+		for _, c := range down {
+			_, _ = h.runner().Run(dctx, c)
+		}
 		_ = unix.Close(fd)
-		return HelperReply{}, -1, fmt.Errorf("读取 %s 的 MTU: %w", plan.Device, err)
+		return HelperReply{}, -1, fmt.Errorf("读取 %s 的 MTU: %w（已回滚已装上的路由与劫持规则）", plan.Device, err)
 	}
 	// Applied 回传给面板显示：GUI 里那串「实际跑过哪些步骤」是排障的主要线索，
 	// 走 helper 之后它来自 root 侧，不能因为换了执行者就丢掉。
@@ -369,7 +388,25 @@ func (h *HelperServer) doDown(ctx context.Context, plan RoutePlan) (HelperReply,
 }
 
 // reply 把应答（以及 up 时的 tun fd）发回面板。
+//
+// 发完（无论成败）都关掉本进程持有的那份 fd 副本。这一步以前漏了，而它在
+// **常驻** helper（--dial-helper）里是实打实的泄漏：一次性 helper 进程马上退出
+// 所以看不出来，常驻进程则每建一条分流连接就漏一个 fd。
+//
+// 更糟的一层是"关不掉"：把同一个 socket 的 fd 传给对端之后，内核里是两个独立
+// 引用。面板侧 Close() 只释放它那一个，root 进程里这份不关，socket 就一直活着
+// ——连接不会真的断开，对端看到的是"对端还在、只是不发数据了"。
 func (h *HelperServer) reply(conn *net.UnixConn, r HelperReply, fds []int) error {
+	// 无论下面走哪条路，本地这份副本都在返回时关掉。
+	// WriteMsgUnix 成功后 fd 已经挂进对端接收队列，关本地副本不会影响对端。
+	defer func() {
+		for _, fd := range fds {
+			if fd >= 0 {
+				_ = unix.Close(fd)
+			}
+		}
+	}()
+
 	payload, err := encodeReply(r)
 	if err != nil {
 		return err
@@ -383,9 +420,6 @@ func (h *HelperServer) reply(conn *net.UnixConn, r HelperReply, fds []int) error
 	frame := make([]byte, headerLen+len(payload))
 	binary.BigEndian.PutUint32(frame[:headerLen], uint32(len(payload)))
 	copy(frame[headerLen:], payload)
-	// Sendmsg 一旦成功，fd 就已经挂进对端 socket 的接收队列：
-	// 之后我们关掉自己这份副本不会让对端那个失效——这正是 Android VpnService
-	// 把 tun fd 交给无权限 app 的同一条内核机制。
 	if _, _, err := conn.WriteMsgUnix(frame, unix.UnixRights(fds...), nil); err != nil {
 		return fmt.Errorf("发回 helper 应答与 fd: %w", err)
 	}

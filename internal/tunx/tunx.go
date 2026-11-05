@@ -550,7 +550,14 @@ func (t *TUN) cleanupStale(ctx context.Context) []string {
 	if t.helperMismatchKnown() {
 		// 已知对面会因为版本拒收：这一趟注定白跑，而且它留下的日志与「第一次失败」
 		// 长得一模一样，看日志的人分不清是在重试还是在恶化。
-		logx.Debugf("TUN: 跳过经 helper 清残留（已知协议版本对不上，刷新二进制或重启面板之前不会再变）")
+		//
+		// 但跳过**不是免费的**：上一轮留下的 DNS 劫持（把本机 :53 全 DNAT 到一个
+		// 已消失的地址）与 kill-switch 的 DROP 链都还在系统里，而这次是唯一会去扫
+		// 它们的时机。所以这句日志必须点明后果与出路，而不是只说"跳过了"——
+		// 否则用户看到的是"程序正常启动"，实际上一开机整机 DNS 就是挂的。
+		logx.Warnf("TUN: 协议版本对不上，本次无法经 helper 清残留（上一轮的 DNS 劫持与断网保护可能仍在，" +
+			"症状是本机解析超时或出站全被拦）。刷新 tun.helper 指向的二进制或重启面板后会自动清；" +
+			"急用可跑：sudo ./wps_app-gui -tun-reset")
 		return nil
 	}
 	reply, _, err := t.helper.Run(ctx, CleanupRequest(t.uid, t.conf.Device, t.conf.Address))
@@ -1182,20 +1189,94 @@ func countDown(rec *metrics.Conn, n int) {
 // relay 双向搬运，与 SOCKS5/HTTP 入站同一套半关闭语义：
 // 一个方向读到 EOF 后只做 CloseWrite，另一方向还能把剩下的数据发完，
 // 两侧都收尾才整体结束。不做半关闭的话，一端先关会让另一端永远挂在 Read 上。
+//
+// 但只有半关闭是不够的：hysteria2 的流**没有 CloseWrite**（见 vendor 里
+// client.tcpConn 的方法集，只有 Close），于是 closeWrite 那次类型断言静默落空，
+// 对端收不到 FIN，下载方向的 goroutine 会一直堵在 Read 上，直到 QUIC 自己
+// 因空闲超时收掉这条连接。这期间它占着两个 goroutine、一条 QUIC 流、
+// 一条 gVisor 连接——一条这样的连接就是一处泄漏。
+//
+// 所以这里补上与 SOCKS 侧同档的两道兜底：
+//
+//  1. 空闲 deadline：两侧都套 idleConn，每次成功收发把窗口往后推。
+//     长连接只要还有流量就不会被打断，真正闲置的才回收。
+//  2. 一侧收尾后的宽限：等另一方向把剩余数据送完，最多 relayGrace。
+//     trojan 返回的是 *tls.Conn（有 CloseWrite），走的是正常半关闭；
+//     hysteria 只能靠这一档。
+//
+// 刻意**不**把"没有 CloseWrite"直接变成 Close()：HTTP 明文那条路踩过这个坑——
+// 收到请求就关写侧会让服务端以为请求不完整，应答被截断。
 func relay(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	ai := newIdleConn(a, tunRelayIdleTimeout)
+	bi := newIdleConn(b, tunRelayIdleTimeout)
+	done := make(chan struct{}, 2)
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		closeWrite(a)
+		_, _ = io.Copy(ai, bi)
+		closeWrite(ai)
+		done <- struct{}{}
 	}()
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		closeWrite(b)
+		_, _ = io.Copy(bi, ai)
+		closeWrite(bi)
+		done <- struct{}{}
 	}()
-	wg.Wait()
+	<-done
+	select {
+	case <-done:
+	case <-time.After(tunRelayGrace):
+	}
+	_ = ai.Close()
+	_ = bi.Close()
+}
+
+// tunRelayIdleTimeout 是 TUN 连接的兜底回收窗口，与 SOCKS 侧的
+// tunnelIdleTimeout 同档：正常长连接不会被它碰上，它只收拾真正闲置的隧道。
+const tunRelayIdleTimeout = 30 * time.Minute
+
+// tunRelayGrace 是一侧 EOF 之后等另一侧收尾的宽限，与 SOCKS 侧一致。
+// 超过它就整条关掉：对端不认半关闭时（hysteria2 的流）只能靠这一档退出。
+//
+// 声明成变量而不是常量，是为了让用例能把宽限压到几十毫秒去验这条路径——
+// 拿真实 10 秒去测等于每次跑门禁都多等十秒。
+var tunRelayGrace = 10 * time.Second
+
+// idleConn 在每次成功收发后把对应的 deadline 往后推。
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
+	_ = c.SetDeadline(time.Now().Add(idle))
+	return &idleConn{Conn: c, idle: idle}
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	}
+	return n, err
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	}
+	return n, err
+}
+
+// CloseWrite 把半关闭能力透传给底层。
+//
+// 这一条必须显式写：包装之后 io.Copy 的目标是 *idleConn，而 closeWrite 靠
+// 类型断言找 CloseWrite。不透传的话，即使底层是 *tls.Conn（trojan）也会
+// 被判定成"不支持半关闭"，于是 trojan 那条正常通路也跟着退化。
+func (c *idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func closeWrite(c net.Conn) {

@@ -3,6 +3,7 @@ package inbound
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -29,6 +30,8 @@ const rulesProxy = "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\nFINAL,PROXY"
 // 才算真的在验证它。
 type udpEchoOutbound struct {
 	dials atomic.Int32
+	// failDials 让前 N 次 DialUDP 直接失败，用来演"首包拨号失败、之后恢复"。
+	failDials atomic.Int32
 
 	mu   sync.Mutex
 	sent []string
@@ -42,11 +45,15 @@ func (e *udpEchoOutbound) DialContext(context.Context, string) (net.Conn, error)
 func (e *udpEchoOutbound) Close() error { return nil }
 
 func (e *udpEchoOutbound) DialUDP(context.Context) (outbound.PacketConn, error) {
-	e.dials.Add(1)
+	n := e.dials.Add(1)
+	if e.failDials.Add(-1) >= 0 {
+		return nil, errors.New("模拟拨号失败（测试用）")
+	}
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		return nil, err
 	}
+	_ = n
 	return &echoPacket{conn: pc, owner: e}, nil
 }
 
@@ -289,9 +296,12 @@ func TestSOCKS5UDPAssociateSurvivesOutboundWithoutUDP(t *testing.T) {
 //
 // 客户端拿不到任何错误：UDP 没有"拒绝"这个表达方式，重试是它唯一会做的事。
 // 于是两件事必须同时成立——① 表里要有一行带原因的记录，
-// ② 只能有一行。②靠的是「出站由第一个报文定下来」（decided），
-// 不是靠这里另设一个标志：所以这条断言真正守的是"别把重试的包再拨一次号"，
-// 改成每包各自判定那一刻，它就会红。
+// ② 同一个目标只能有一行。
+//
+// ② 现在靠的是「按目标去重」（refused 那张 map），不是「整条关联只拨一次号」。
+// 后者更省事，但它把"首包拨号失败"变成了永久判决：一次瞬时失败之后，
+// 这条关联在剩下 10 分钟里再也不拨号，后续每个包都掉进 pc == nil 被静默丢弃，
+// 而表里只有一行、日志里只有一句——用户看到的是"UDP 全哑了，面板说没问题"。
 func TestSOCKS5UDPRefusalIsRecordedOnce(t *testing.T) {
 	reg := metrics.NewRegistry(16, 16)
 	s := NewSOCKS5(newTestRouter(t, rulesDirect), "", "", reg)
@@ -513,4 +523,100 @@ func mustHostPort(t *testing.T, hostport string) (string, int) {
 		t.Fatalf("端口 %q 不是数字: %v", p, err)
 	}
 	return h, n
+}
+
+// TestSOCKS5UDPPayloadIsNotAliasedToReadBuffer 锁住"入队前必须拷贝"。
+//
+// 读循环只有一块 64KB 的 buf，parseAssocPacket 返回的正文是它的子切片。
+// 以前那个切片直接进队列交给另一个 goroutine 发送：只要排队（深度 64）
+// 或者下游还在 WriteTo 里拷，下一次 ReadFromUDP 就把字节改写了。
+//
+// 症状是 UDP 载荷串包——音视频花屏、QUIC 握手随机失败，而日志里一切正常，
+// 因为转发"成功"了，只是内容不对。
+//
+// 这里不靠时序去撞那个窗口（撞不稳），而是直接钉住不变量：
+// 入队的那份数据不能与解析它的那块缓冲共享底层数组。
+func TestSOCKS5UDPPayloadIsNotAliasedToReadBuffer(t *testing.T) {
+	// 一包足够大的正文，确保它躺在读缓冲的深处（前面还有头）。
+	body := strings.Repeat("A", 4096)
+	pkt := assocPacket(t, body, atypIPv4, []byte{127, 0, 0, 1}, 5353)
+
+	buf := make([]byte, udpAssocBuffer)
+	copy(buf, pkt)
+
+	addr, payload, ok := parseAssocPacket(buf[:len(pkt)])
+	if !ok || addr == "" {
+		t.Fatal("解析失败，测试前提不成立")
+	}
+	data := append([]byte(nil), payload...)
+
+	// 模拟下一次 ReadFromUDP：整块缓冲被新报文覆盖。
+	for i := range buf {
+		buf[i] = 'B'
+	}
+
+	if string(data) != body {
+		t.Fatalf("入队的数据被后续读改写了（长度 %d，首字节 %q）——"+
+			"这就是 UDP 串包", len(data), data[:1])
+	}
+	// 反向确认：如果不拷贝，上面那个覆盖确实会改到它。这条断言是给读代码的人看的：
+	// 它证明"不拷贝"这个写法真的会坏，而不是我多虑。
+	if string(payload) == body {
+		t.Fatal("解析结果与读缓冲没有共享底层数组？那这条用例就没在测它想测的东西")
+	}
+}
+
+// TestSOCKS5UDPRecoversAfterFirstDialFails 锁住"首包拨号失败不是永久判决"。
+//
+// 以前 decided 在拨号**之前**就置真：首包失败之后，这条关联在剩下 10 分钟里
+// 再也不拨号，后续每个包都被静默丢弃。而首包失败恰恰最常复现——
+// DIRECT 明确不支持 UDP、会话数到 512、一次瞬时超时。
+//
+// 正确行为：失败的那个目标记一行（不刷屏），但下一个包仍会再试。
+// 这里用"第一次拨号失败、第二次成功"的假出站把它演完。
+func TestSOCKS5UDPRecoversAfterFirstDialFails(t *testing.T) {
+	echoAddr := startUDPEcho(t)
+	proxyAddr, echo := startSOCKS5UDP(t, rulesProxy)
+	echo.failDials.Store(1) // 第一次 DialUDP 失败
+	_, relay := assocOpenUDP(t, proxyAddr)
+
+	uc, err := net.DialUDP("udp", nil, mustUDPAddr(t, relay))
+	if err != nil {
+		t.Fatalf("连中继: %v", err)
+	}
+	defer func() { _ = uc.Close() }()
+
+	host, port := mustHostPort(t, echoAddr)
+	pkt := assocPacket(t, "retry-me", atypIPv4, net.ParseIP(host).To4(), uint16(port))
+
+	// 第一包：拨号失败，收不到回声。
+	if _, err := uc.Write(pkt); err != nil {
+		t.Fatalf("发第 1 包: %v", err)
+	}
+	expectNoAssocReply(t, uc, 400*time.Millisecond)
+
+	// 第二包：必须重新拨号并真的转发出去。以前这里会被永久丢掉。
+	if _, err := uc.Write(pkt); err != nil {
+		t.Fatalf("发第 2 包: %v", err)
+	}
+	_, payload := readAssoc(t, uc)
+	if string(payload) != "retry-me" {
+		t.Fatalf("第二个包的回声正文 = %q", payload)
+	}
+	if n := echo.dials.Load(); n != 2 {
+		t.Fatalf("拨号 %d 次, want 2（首包失败后应当再试一次）", n)
+	}
+}
+
+// expectNoAssocReply 断言在这段时间内读不到回声。
+func expectNoAssocReply(t *testing.T, uc *net.UDPConn, d time.Duration) {
+	t.Helper()
+	if err := uc.SetReadDeadline(time.Now().Add(d)); err != nil {
+		t.Fatalf("设读超时: %v", err)
+	}
+	buf := make([]byte, 1500)
+	if n, _, err := uc.ReadFromUDP(buf); err == nil {
+		t.Fatalf("本该收不到回声，却收到了 %d 字节", n)
+	}
+	_ = uc.SetReadDeadline(time.Time{})
 }

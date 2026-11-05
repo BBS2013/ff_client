@@ -97,8 +97,15 @@ func readAssocPackets(uc *net.UDPConn, clientIP net.IP, in chan<- datagram) {
 		if !ok {
 			continue
 		}
+		// 必须拷一份再入队。payload 是上面那块**循环复用**的 buf 的子切片，
+		// 而读循环与 pumpAssoc 是两个 goroutine：只要这一包在队列里排队
+		// （深度 64），或者下游还在 WriteTo 里拷，下一次 ReadFromUDP 就会
+		// 把它的字节直接改写掉。症状是 UDP 载荷串包——音视频花屏、
+		// QUIC 握手随机失败，而日志里一切正常。
+		// TUN 那一侧没有这个问题：它在同一个 goroutine 里读完立刻发。
+		data := append([]byte(nil), payload...)
 		select {
-		case in <- datagram{addr: addr, data: payload, from: from}:
+		case in <- datagram{addr: addr, data: data, from: from}:
 		default:
 			logx.Debugf("socks5: UDP 关联队列已满，丢弃发往 %s 的一包", addr)
 		}
@@ -117,6 +124,17 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 		client  atomic.Pointer[net.UDPAddr]
 		decided bool
 	)
+	// refused 记住已经进过连接表的失败目标。
+	//
+	// 为什么不能像以前那样"一次关联只记一行"：那条判据挂在一个**布尔值**上，
+	// 而首包拨号失败恰恰是最会复现的失败（DIRECT 明确不支持 UDP、会话数到 512、
+	// 一次瞬时超时）。decided 一置真，整条关联在剩下 10 分钟里就再也不拨号了，
+	// 后续每个包都掉进 `pc == nil` 直接丢弃，而表里只有一行、日志里只有一句——
+	// 用户看到的是"UDP 全哑了，但面板说没问题"。
+	//
+	// 改成按目标去重：同一个目标只记一行（客户端狂重试也不刷屏），
+	// 但换一个目标就会重新拨号、重新判定。
+	refused := make(map[string]struct{}, 2)
 	defer func() {
 		if pc != nil {
 			_ = pc.Close()
@@ -129,20 +147,23 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 		// 记最近一次看到的来源：客户端换了源口发包，跟着它走才不会石沉大海。
 		client.Store(d.from)
 		if !decided {
-			decided = true
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			p, res, err := s.router.DialUDPHost(ctx, d.addr, "")
 			cancel()
 			if err != nil {
 				// 「这条路本来就不通」必须说得像一句人话：应用侧只看得见
 				// 自己的报文石沉大海——UDP 传不回任何错误码，重试是它唯一的表达方式。
-				logx.Warnf("socks5 %s: UDP 未转发（首个报文发往 %s）：%v", ctl.RemoteAddr(), d.addr, err)
-				// 与 TUN 那一侧同一个理由：只留日志等于没解释，进连接表。
-				// 一次关联只会记这一条，因为出站是**第一个报文**定下来的（decided 之后
-				// 再来的包根本不再拨号）——客户端重试十次也就只有一行，表不会被刷屏。
-				s.reg.Refuse("socks5-udp", ctl.RemoteAddr().String(), d.addr, res, err.Error())
+				logx.Warnf("socks5 %s: UDP 未转发（报文发往 %s）：%v", ctl.RemoteAddr(), d.addr, err)
+				// 记一行就够（同一目标不重复记），但**不要把 decided 置真**：
+				// 拨号失败不等于"这条关联的出站已经定下来了"。让下一个包再试一次，
+				// 一次瞬时失败就不会把整条关联废掉 10 分钟。
+				if _, seen := refused[d.addr]; !seen {
+					refused[d.addr] = struct{}{}
+					s.reg.Refuse("socks5-udp", ctl.RemoteAddr().String(), d.addr, res, err.Error())
+				}
 				continue
 			}
+			decided = true
 			pc = p
 			rec = s.reg.Begin("socks5-udp", ctl.RemoteAddr().String(), res)
 			logx.Infof("socks5-udp %s -> %s [%s | %s]", ctl.RemoteAddr(), d.addr, res.Outbound, res.Matched)
@@ -153,7 +174,12 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 		}
 		if err := pc.WriteTo(d.data, d.addr); err != nil {
 			logx.Debugf("socks5: UDP 发往 %s 失败: %v", d.addr, err)
+			continue
 		}
+		// 上行必须计数，否则这条连接在面板上永远是"只下行"，
+		// 而按节点/按规则的账在 End 时把 Up 并进去，于是节点用量少算一截。
+		// TUN 那一侧一直是两侧都计（countUp/countDown），这里是对齐。
+		countUp(rec, len(d.data))
 	}
 }
 
@@ -174,6 +200,12 @@ func (s *SOCKS5) relayAssocReplies(uc *net.UDPConn, pc outbound.PacketConn, clie
 		if _, err := uc.WriteToUDP(pkt, client.Load()); err != nil {
 			return
 		}
+	}
+}
+
+func countUp(rec *metrics.Conn, n int) {
+	if rec != nil {
+		rec.Up.Add(uint64(n))
 	}
 }
 
