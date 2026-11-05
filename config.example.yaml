@@ -46,12 +46,18 @@ active: "hy2-示例"
 mode: rule
 
 inbounds:
+    # 默认只监听回环：本机应用走系统代理或手动填 127.0.0.1 即可，不会对局域网暴露。
     - type: socks5
       listen: "127.0.0.1:7891"
     - type: http
       listen: "127.0.0.1:7892"
-    # 要让局域网别人也用，改成 "0.0.0.0:7893" 并配上用户名密码（两者必须成对填写）
+    # 若要让局域网其他设备也用 SOCKS5，必须二选一（否则启动/保存时 Validate 会拒绝）：
+    #   1) 非回环地址 + 成对的 username/password（RFC 1929 认证）；
+    #   2) 显式 allow_lan: true（表示你接受「无认证代理对网段开放」的风险）。
+    # HTTP 入站不支持用户名密码，对局域网开放只能走 allow_lan: true，风险同上。
     # - { type: socks5, listen: "0.0.0.0:7893", username: "alice", password: "change-me" }
+    # - { type: socks5, listen: "0.0.0.0:7894", allow_lan: true }  # 无认证，仅在你完全信任该网段时用
+    # - { type: http, listen: "0.0.0.0:7895", allow_lan: true }   # HTTP 无认证，风险更大
 
 geoip:
     # 缺失只是 GEOIP 规则不生效，启动时告警一句，不影响其余功能

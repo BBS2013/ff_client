@@ -245,7 +245,7 @@ onMounted(load)
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(inb, i) in form.inbounds" :key="i">
+              <tr v-for="(inb, i) in form.inbounds" :key="`${i}-${inb.type}-${inb.listen}-${inb.allowLan}`">
                 <td>
                   <select v-model="inb.type" aria-label="入站协议">
                     <option value="socks5">SOCKS5</option>
@@ -269,6 +269,10 @@ onMounted(load)
         </div>
         <p v-if="form.inbounds.length === 0" class="alert tail">
           至少要保留一个入站，否则保存会被后端拒绝。
+        </p>
+        <p class="alert warn tail">
+          监听地址不要用 0.0.0.0 / :: 或局域网 IP，除非 SOCKS5 已填写用户名与口令，或在 YAML 里显式写了
+          <code>allow_lan: true</code>。否则保存会被拒绝——对网段开放的无认证代理等于把本机流量出口借给整段局域网。
         </p>
       </section>
 

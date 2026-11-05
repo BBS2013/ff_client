@@ -396,6 +396,8 @@ export interface InboundForm {
   /** 未设置凭据时为空串，设置了则是 ******** */
   username: string
   password: string
+  /** 与 YAML allow_lan 对应；非回环且无 socks5 认证时须在配置里显式打开 */
+  allowLan?: boolean
 }
 
 export interface TUNForm {
