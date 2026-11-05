@@ -115,7 +115,7 @@ func New(cfgPath string) *App {
 // sysProxyTarget 取配置里的系统代理意图（后端 + 两个入站地址）。
 // 配置读不到时全空，由 sysproxy 按本机默认入站兜底。
 func (a *App) sysProxyTarget() (backend, http, socks string) {
-	if cfg, err := config.Load(a.svc.ConfigPath()); err == nil {
+	if cfg := a.svc.DiskConfig(); cfg != nil {
 		return cfg.SystemProxyTarget()
 	}
 	return "", "", ""
@@ -770,30 +770,31 @@ func (a *App) disableSystemProxyOnly() error {
 // why 只用在日志上：界面上「停止」和「退出」是两件事，话要说对。
 func (a *App) releaseSystemProxy(why string) error {
 	statePath := sysproxy.StatePath(a.svc.ConfigPath())
-	led, _ := sysproxy.ReadLedger(statePath)
 	ours := a.desktopPointsAtUs()
-	if !led.Exists && !ours {
-		return nil
-	}
-	backend := a.sysProxyBackend()
+	var res sysproxy.ReleaseResult
 	err := withTimeout(func(ctx context.Context) error {
-		return sysproxy.Disable(ctx, sysxRunner, statePath, backend)
+		var rerr error
+		res, rerr = sysproxy.Release(ctx, sysxRunner, statePath, a.desktopExpect())
+		return rerr
 	})
-	if err != nil {
+	if err != nil && !res.Unreadable {
 		logx.Errorf("%s时关闭桌面系统代理失败，桌面可能仍指向即将关闭的端口（可跑 -sysproxy off 手工关掉）: %v", why, err)
 		return err
 	}
+	if res.Unreadable {
+		logx.Warnf("%s时读不到桌面代理设置，保持原样: %v", why, err)
+		return nil
+	}
 	if ours {
 		// 停止之前桌面是指着我们的，那"启动"就该把它接回去。
-		// 只看记账在不在是不够的：账记的是改动前的原状，照着它还完就等于
-		// 用户按一次停止之后再也回不到代理状态，界面上开关还是黑的。
 		a.setSysProxyPaused(true)
-		if led.Exists {
-			logx.Infof("已按记账把桌面系统代理还原回原样，流量改为直连")
-		} else {
-			logx.Infof("已把桌面系统代理切回关闭，流量改为直连（没有记账，只能关掉）")
-		}
-	} else {
+	}
+	switch {
+	case res.Restored && ours:
+		logx.Infof("已按记账把桌面系统代理还原回原样，流量改为直连")
+	case res.Disabled:
+		logx.Infof("已把桌面系统代理切回关闭，流量改为直连（没有记账，只能关掉）")
+	case res.Restored:
 		logx.Infof("已按记账还原桌面系统代理（桌面当前并未指向本程序）")
 	}
 	return nil

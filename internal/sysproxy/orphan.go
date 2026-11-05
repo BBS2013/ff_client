@@ -70,6 +70,54 @@ func LikesOurs(st Status, c Config) bool {
 	return st.HTTP == e.HTTP() && st.HTTPS == e.HTTPS() && st.SOCKS == e.SOCKS()
 }
 
+// ReleaseResult 是退出时收掉桌面指针的结果。
+//
+// 三种结局必须分开报：调用方要据此写不同的日志，而「还原成改动前」与
+// 「没有记账、只能关掉」对用户是两件完全不同的事。
+type ReleaseResult struct {
+	// Restored 为真表示按记账把桌面写回了改动前的样子。
+	Restored bool
+	// Disabled 为真表示没有记账、但桌面读数正好是本客户端的入站，于是切回关闭。
+	Disabled bool
+	// Unreadable 为真表示读不到桌面，什么都没改。
+	// 读不到就动手，可能把用户自己配的代理改掉。
+	Unreadable bool
+}
+
+// Release 是退出时收掉「指向本客户端」那根桌面指针的唯一入口。
+//
+// 命令行与面板以前各写一遍，而且比的地址来源不同：命令行用配置里的
+// listen 字符串，面板用实际监听端口。`listen: 127.0.0.1:0` 时命令行
+// 认不出桌面指着的正是自己，于是进程退出后桌面还停在一个没人听的端口。
+//
+// expect 由调用方给出「桌面该长什么样」（实际监听地址优先，拿不到再用配置）。
+// 顺序：
+//
+//	有记账 -> 按记账还原（用户原来可能自己配了别的代理，不能无脑置空）
+//	没记账、读到了、正是我们 -> 关掉（留着就是死指针）
+//	没记账、读不到         -> 不动（什么都不能断定）
+//	其余                   -> 不动（桌面不归我们管）
+func Release(ctx context.Context, r Runner, statePath string, expect Config) (ReleaseResult, error) {
+	led, ledErr := ReadLedger(statePath)
+	if led.Exists && ledErr == nil {
+		if err := Restore(ctx, r, statePath); err != nil {
+			return ReleaseResult{}, err
+		}
+		return ReleaseResult{Restored: true}, nil
+	}
+	st, err := ReadWith(ctx, r, expect.Backend)
+	if err != nil {
+		return ReleaseResult{Unreadable: true}, err
+	}
+	if !LikesOurs(st, expect) {
+		return ReleaseResult{}, nil
+	}
+	if err := Disable(ctx, r, statePath, expect.Backend); err != nil {
+		return ReleaseResult{}, err
+	}
+	return ReleaseResult{Disabled: true}, nil
+}
+
 // OrphanHint 是给日志与终端的一句话：先说清后果，再给两条能照着做的路。
 func OrphanHint(statePath string) string {
 	return fmt.Sprintf("系统代理正指着本客户端的入站，但记账文件 %s 不存在：本进程退出时不会还原桌面。"+

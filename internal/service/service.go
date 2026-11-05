@@ -258,6 +258,12 @@ func (s *Service) Metrics() *metrics.Registry { return s.reg }
 // ConfigPath 返回配置文件路径。
 func (s *Service) ConfigPath() string { return s.cfgPath }
 
+// DiskConfig 读磁盘上的配置（按 mtime+size 缓存）。
+//
+// 导出来是因为系统代理状态每 5 秒要知道「配置里指定的后端」，
+// 而那不该每次都完整 Load+Validate 一份 YAML。缓存的失效条件在 diskConfig 里。
+func (s *Service) DiskConfig() *config.Config { return s.diskConfig() }
+
 // Router 返回当前路由器；未装配时为 nil。
 func (s *Service) Router() *router.Router {
 	s.mu.Lock()
@@ -698,30 +704,36 @@ func (s *Service) stop() error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.rt != nil {
-		_ = s.rt.Close()
-		s.rt = nil
-	}
+	rt := s.rt
+	geoRef := s.geoRef
+	lock := s.lock
+	s.rt = nil
 	// rt.Close 已经连带关掉了出站，这里只丢句柄。
 	// 必须置 nil：快照靠它判断连接态，留着已关闭的出站会一直显示「未连接」，
 	// 而停止后本来就应该显示未连接。
 	s.proxy = nil
-	if s.geoRef != nil {
-		// Swap(nil) 会关闭底层 mmdb，避免反复启停泄漏文件句柄。
-		s.geoRef.Swap(nil)
-		s.geoRef = nil
-	}
+	s.geoRef = nil
 	s.geoOK = false
 	s.resolve = nil
 	s.cfg = nil
+	s.lock = nil
+	s.mu.Unlock()
+
+	// Close、关 mmdb、放锁、写日志都不在 s.mu 里：关隧道是网络 I/O，
+	// 持着状态锁做会让面板轮询和拨号失败记账一起等它结束。
+	if rt != nil {
+		_ = rt.Close()
+	}
+	if geoRef != nil {
+		// Swap(nil) 会关闭底层 mmdb，避免反复启停泄漏文件句柄。
+		geoRef.Swap(nil)
+	}
 	// 注意 s.tun 不在这里无条件置 nil：stopTUN 已经按拆除结果决定去留。
 	// 拆不干净就留着句柄，界面才有机会重试，也才看得见 TUN 仍在运行。
 	//
 	// 端口一释放就该允许别的实例接手，所以锁跟着 Stop 走而不是等进程退出。
-	if s.lock != nil {
-		s.lock.release()
-		s.lock = nil
+	if lock != nil {
+		lock.release()
 	}
 	logx.Infof("wps_app 已停止")
 	return nil
@@ -733,11 +745,19 @@ func (s *Service) stop() error {
 // 读规则集与打开 mmdb 都是磁盘 I/O，因此不放在 s.mu 里：
 // 这条路径正是 `kill -HUP` 会走的，攥着锁做全套磁盘读会让面板同时失去响应。
 func (s *Service) Reload() error {
+	// 与 Start/Stop 共用 opMu：重载与关闭同时进行时，一边在换引擎、
+	// 一边在 Close，看到的是同一份路由器。排队比交错安全。
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
 	s.mu.Lock()
 	rt, cfg, geoRef, resolve := s.rt, s.cfg, s.geoRef, s.resolve
 	s.mu.Unlock()
 	if rt == nil || geoRef == nil || cfg == nil {
 		return fmt.Errorf("服务未运行，无法重载")
+	}
+	if disk := s.diskConfig(); disk != nil && dnsConfigChanged(disk, cfg) {
+		logx.Warnf("DNS 配置与当前运行的不一致：热重载只换规则与 GeoIP，解析器要重启代理后才换")
 	}
 	logx.Infof("重载 GeoIP 与规则")
 	if next, err := rules.OpenGeoIP(cfg.GeoIP.Path); err != nil {
@@ -1014,4 +1034,29 @@ func inboundAddrs(cfg *config.Config) []string {
 		}
 	}
 	return out
+}
+
+// dnsConfigChanged 报告两份配置的 DNS 段是否不同。
+//
+// 热重载不换解析器（见 Reload）。不说出来的话，用户改了 internal_servers
+// 再按重载，界面说成功，查询仍走旧上游。
+func dnsConfigChanged(a, b *config.Config) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return !sameStringList(a.DNS.Servers, b.DNS.Servers) ||
+		!sameStringList(a.DNS.InternalServers, b.DNS.InternalServers) ||
+		!sameStringList(a.DNS.InternalDomains, b.DNS.InternalDomains)
+}
+
+func sameStringList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

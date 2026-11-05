@@ -410,29 +410,17 @@ func run(configPath string, checkOnly bool, checkHosts, checkFetch []string, mod
 	defer func() {
 		rctx, rcancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer rcancel()
-		statePath := sysproxy.StatePath(configPath)
-		target := sysProxyTarget(configPath)
-		if err := sysproxy.Restore(rctx, nil, statePath); err != nil {
-			logx.Errorf("退出时还原系统代理失败（桌面可能仍指向本客户端的已关闭端口，可手工跑 -sysproxy restore）: %v", err)
-			return
-		}
-		// 没有记账时上面那句是空操作，而桌面完全可能指着这些端口——上一轮的账被
-		// 别的实例吃掉了。退出前必须再兜一次，否则进程没了、桌面还留着，
-		// 全机应用一起去连一个已经不存在的端口，只报一句「代理连接被拒绝」。
-		// 面板退出在 internal/ui 里做同样一层，两条路都得收干净。
-		orphan, err := sysproxy.IsOrphan(rctx, nil, statePath, target)
-		if err != nil {
+		res, err := sysproxy.Release(rctx, nil, sysproxy.StatePath(configPath), liveProxyExpect(svc, configPath))
+		switch {
+		case err != nil && res.Unreadable:
 			logx.Warnf("退出时确认桌面代理归属失败，保持原样: %v", err)
-			return
+		case err != nil:
+			logx.Errorf("退出时还原系统代理失败（桌面可能仍指向本客户端的已关闭端口，可手工跑 -sysproxy restore）: %v", err)
+		case res.Restored:
+			logx.Infof("已按记账把桌面系统代理还原回原样")
+		case res.Disabled:
+			logx.Infof("桌面系统代理指着本客户端却没有记账，退出时已切回关闭")
 		}
-		if !orphan {
-			return
-		}
-		if err := sysproxy.Disable(rctx, nil, statePath, target.Backend); err != nil {
-			logx.Errorf("退出时关掉桌面系统代理失败（可用 -sysproxy off 手工关掉）: %v", err)
-			return
-		}
-		logx.Infof("桌面系统代理指着本客户端却没有记账，退出时已切回关闭")
 	}()
 	logx.Infof("发送 SIGHUP 重载规则与 GeoIP，SIGINT/SIGTERM 退出")
 
@@ -560,6 +548,40 @@ func sysProxyTarget(configPath string) sysproxy.Config {
 		return target // 配置读不到就用本机默认入站：与 sysproxy 自己的兜底同一套
 	}
 	target.Backend, target.HTTPAddr, target.SOCKSAddr = cfg.SystemProxyTarget()
+	return target
+}
+
+// liveProxyExpect 是退出时「桌面该长什么样」。
+//
+// 优先用正在监听的地址：配置写 `listen: 127.0.0.1:0` 时，真正的端口是内核分配的，
+// 拿配置原文去比会认不出桌面指着的正是自己。服务没在听时退回配置。
+func liveProxyExpect(svc *service.Service, configPath string) sysproxy.Config {
+	target := sysProxyTarget(configPath)
+	if svc == nil {
+		return target
+	}
+	var httpAddr, socksAddr string
+	for _, in := range svc.Snapshot().Inbounds {
+		if !in.Active {
+			continue
+		}
+		switch in.Type {
+		case "http":
+			if httpAddr == "" {
+				httpAddr = in.Addr
+			}
+		case "socks5":
+			if socksAddr == "" {
+				socksAddr = in.Addr
+			}
+		}
+	}
+	if httpAddr != "" {
+		target.HTTPAddr = httpAddr
+	}
+	if socksAddr != "" {
+		target.SOCKSAddr = socksAddr
+	}
 	return target
 }
 

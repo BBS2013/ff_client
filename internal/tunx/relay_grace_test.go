@@ -63,9 +63,8 @@ func (c *eofConn) Read([]byte) (int, error) { return 0, io.EOF }
 //
 // 这条用例把 relay 的宽限压到很短来验：正常实现会在宽限后整条关掉。
 func TestRelayGivesUpAfterOneSideHalfCloses(t *testing.T) {
-	prev := tunRelayGrace
-	tunRelayGrace = 80 * time.Millisecond
-	t.Cleanup(func() { tunRelayGrace = prev })
+	prev := tunRelayGrace.Swap(int64(80 * time.Millisecond))
+	t.Cleanup(func() { tunRelayGrace.Store(prev) })
 
 	// 一侧立刻 EOF，另一侧永不返回、也不认半关闭。
 	a := newEOFConn()

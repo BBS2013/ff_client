@@ -175,7 +175,10 @@ type TUN struct {
 	// 留成字段是为了让用例不必真等 75 秒。
 	blockedHold time.Duration
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// published 是 Status() 读的那份快照，受上面这把锁的**写**保护，
+	// 但读不需要锁（见 Status 的注释：面板每秒轮一次，而启停全程持锁十几秒）。
+	published atomic.Pointer[Status]
 	dev       linkDevice
 	stack     *tunstack.Stack
 	fake      *FakeStore
@@ -304,7 +307,14 @@ func New(opt Options) (*TUN, error) {
 // 不会留下「网卡起来了但栈没起来」这种半活状态。
 func (t *TUN) Start(ctx context.Context) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	// 无论从哪条路返回（成功、各类失败、panic 之外的提前 return），
+	// 退出时都发布一份快照：Status() 不拿锁，读的就是这份。
+	// 只用一个 defer 而不是在每个 return 前写一遍，是因为这里的失败路径
+	// 有七八条，漏一处就表现为"界面上的状态永远停在上一轮"。
+	defer func() {
+		t.publishStatusLocked()
+		t.mu.Unlock()
+	}()
 	if t.running {
 		return nil
 	}
@@ -598,7 +608,10 @@ func (t *TUN) Stop(ctx context.Context) error {
 	t.watchWG.Wait()
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.publishStatusLocked()
+		t.mu.Unlock()
+	}()
 	if !t.running && t.dev == nil {
 		return nil
 	}
@@ -660,10 +673,71 @@ func (t *TUN) teardownLocked(ctx context.Context) error {
 }
 
 // Status 返回当前状态快照。
+//
+// 它**不拿 t.mu**，读的是最近一次发布的那份。
+//
+// 为什么必须这样：面板每秒轮一次状态，而 TUN 的 Start/Stop 全程持有 t.mu
+// （里面要跑 helper、ip、iptables、resolvectl，最长二十秒）。以前 Status()
+// 自己去拿这把锁，于是「正在启停 TUN」这十几秒里，面板的每一次轮询都会
+// 攥着 service 的 s.mu 干等（调用链是 Snapshot → Status），
+// 连带拨号失败记账、切节点、关监听一起卡住——界面看着就是"卡死了"。
+//
+// 代价是快照有延迟：启停过程中读到的仍是上一次的结论。这是对的——
+// 那十几秒里"正在启动"本来就是唯一确定的答案，而它由 LastError
+// 与 StartedAt 表达得更准。
+//
+// 唯一的例外是"从没发布过"（New 之后、Start 之前）：那时现场组装一份。
+// 那条路径不持锁也没关系——此刻还没有任何并发写。
 func (t *TUN) Status() Status {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if p := t.published.Load(); p != nil {
+		return *p
+	}
+	if t.mu.TryLock() {
+		defer t.mu.Unlock()
+		return t.buildStatusLocked()
+	}
+	// 极窄的窗口：Start 正在跑第一次发布，而我们从没拿到过锁。
+	// 这时给一份只有静态配置的零值，比阻塞十几秒好。
+	return Status{
+		Enabled:     t.conf.Enable,
+		Device:      t.conf.Device,
+		Address:     t.conf.Address,
+		DNS:         t.dnsAddress(),
+		FakeIPRange: t.conf.FakeIPRange,
+		HijackDNS:   t.conf.DNSHijackEnabled(),
+		StrictRoute: t.conf.StrictRoute,
+		IPv6:        t.conf.IPv6On(),
+		Privilege:   "self",
+		HelperCmd:   t.helper.Argv,
+		Applied:     []string{},
+	}
+}
 
+// PublishStatus 立即发布一份快照。调用方**不能**持有 t.mu。
+//
+// 生产代码里只有 Start/Stop 需要它（它们在持锁的 defer 里调
+// publishStatusLocked）。导出版本是给那些"改了内部状态之后要被界面看见"
+// 的路径用的——尤其是测试：它们直接摆弄 t.resolver / t.kill 之后要验
+// Status() 的投影，而那条投影现在读的是发布值。
+func (t *TUN) PublishStatus() {
+	t.mu.Lock()
+	st := t.buildStatusLocked()
+	t.mu.Unlock()
+	t.published.Store(&st)
+}
+
+// publishStatus 在持有 t.mu 时组装一份快照并发布出去。
+//
+// 调用点在 Start 结束（成功或失败）与 Stop 结束：那两处恰好是字段变化的边界。
+// 不在每个字段变化时发布——那样等于把锁里的活搬到热路径上，而面板要看的
+// 是"现在是什么状态"，不是"它变过几次"。
+func (t *TUN) publishStatusLocked() {
+	st := t.buildStatusLocked()
+	t.published.Store(&st)
+}
+
+// buildStatusLocked 组装快照。调用方必须持有 t.mu。
+func (t *TUN) buildStatusLocked() Status {
 	// 接管那两格读的是监视器贴出来的内核读数；读不到或过期了就走记忆那一档。
 	// 这里一次进程都不 fork：面板每 1–2 秒问一次，而路由表每 5 秒已经被读过一次。
 	takeoverV4, takeoverV6, takeoverFrom := t.takeoverReading()
@@ -693,7 +767,7 @@ func (t *TUN) Status() Status {
 		TakeoverFrom: takeoverFrom,
 		RouteFixes:   t.routeFixes.Load(),
 		LastRouteFix: t.lastFixAt.Load(),
-		// 直接读 t.kill：这里已经持有 mu，而 Kill() 也要拿它（Go 的 Mutex 不可重入）。
+		// 直接读 t.kill：调用方已持有 mu，而 Kill() 也要拿它（Mutex 不可重入）。
 		KillArmed:   t.kill.Armed,
 		KillV4:      t.kill.V4,
 		KillV6:      t.kill.V6,
@@ -1238,7 +1312,7 @@ func relay(a, b net.Conn) {
 	<-done
 	select {
 	case <-done:
-	case <-time.After(tunRelayGrace):
+	case <-time.After(relayGrace()):
 	}
 	_ = ai.Close()
 	_ = bi.Close()
@@ -1251,9 +1325,17 @@ const tunRelayIdleTimeout = 30 * time.Minute
 // tunRelayGrace 是一侧 EOF 之后等另一侧收尾的宽限，与 SOCKS 侧一致。
 // 超过它就整条关掉：对端不认半关闭时（hysteria2 的流）只能靠这一档退出。
 //
-// 声明成变量而不是常量，是为了让用例能把宽限压到几十毫秒去验这条路径——
-// 拿真实 10 秒去测等于每次跑门禁都多等十秒。
-var tunRelayGrace = 10 * time.Second
+// 用 atomic 存而不是普通变量：它是包级状态，而测试要把宽限压到几十毫秒去验
+// 这条路径（拿真实 10 秒去测等于每次跑门禁都多等十秒），同时别的用例
+// （TestRelayTCPUnblockedStillProxies 之类）正在并发跑 relay。
+var tunRelayGrace atomic.Int64
+
+func init() { tunRelayGrace.Store(int64(defaultRelayGrace)) }
+
+const defaultRelayGrace = 10 * time.Second
+
+// relayGrace 读当前宽限。
+func relayGrace() time.Duration { return time.Duration(tunRelayGrace.Load()) }
 
 // idleConn 在每次成功收发后把对应的 deadline 往后推。
 type idleConn struct {
