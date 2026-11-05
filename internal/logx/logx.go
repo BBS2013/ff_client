@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -66,12 +67,21 @@ func Clip(s string, max int) string {
 }
 
 var (
-	mu      sync.Mutex
-	level             = LevelInfo
-	output  io.Writer = os.Stdout
-	hooks   []hookEntry
-	hookSeq uint64
+	mu sync.Mutex
+	// level 用 atomic 读：Debug 关掉时（默认就是 info）热路径上的每次
+	// Debugf 都不该去抢这把全局锁。以前是先 Lock 再比级别，于是"关掉
+	// Debug"只省了写盘，省不掉加锁与 fmt.Sprintf——而调用点包括每条连接、
+	// 每次 DNS 命中。
+	level  atomic.Int32
+	output io.Writer = os.Stdout
+	hooks  []hookEntry
+	// hookSeq 用 atomic 自增，避免为了拿一个 id 去抢 mu。
+	hookSeq atomic.Uint64
 )
+
+func init() {
+	level.Store(int32(LevelInfo))
+}
 
 // hookEntry 带一个自增 ID，注销时按 ID 删而不是按函数值删——
 // 同一个函数可能被注册两次，按值删会一次干掉两个。
@@ -96,10 +106,9 @@ func AddHook(h Hook) (remove func()) {
 	if h == nil {
 		return noop
 	}
+	id := hookSeq.Add(1)
 	mu.Lock()
-	hookSeq++
-	e := hookEntry{id: hookSeq, fn: h}
-	hooks = append(hooks, e)
+	hooks = append(hooks, hookEntry{id: id, fn: h})
 	mu.Unlock()
 
 	var once sync.Once
@@ -108,7 +117,7 @@ func AddHook(h Hook) (remove func()) {
 			mu.Lock()
 			defer mu.Unlock()
 			for i, cur := range hooks {
-				if cur.id == e.id {
+				if cur.id == id {
 					hooks = append(hooks[:i], hooks[i+1:]...)
 					return
 				}
@@ -118,11 +127,16 @@ func AddHook(h Hook) (remove func()) {
 }
 
 // SetLevel 设置全局日志级别。
-func SetLevel(l Level) {
-	mu.Lock()
-	defer mu.Unlock()
-	level = l
-}
+//
+// 用 atomic 存而不是靠 mu：Debugf 的判断在锁外做（见 logf），
+// 而 SetLevel 与写日志同时发生是完全正常的（面板改设置）。
+func SetLevel(l Level) { level.Store(int32(l)) }
+
+// LevelNow 返回当前级别，给"这个级别要不要打"这类判断用。
+func LevelNow() Level { return Level(level.Load()) }
+
+// Enabled 报告这个级别此刻会不会被写出去。
+func Enabled(l Level) bool { return l >= Level(level.Load()) }
 
 // SetOutput 替换日志输出目标，测试用。
 func SetOutput(w io.Writer) {
@@ -147,10 +161,19 @@ func callHook(h Hook, l Level, msg string, t time.Time) {
 }
 
 // logf 是唯一的写日志入口。
+//
+// 两件事刻意放在锁外，因为它们在热路径上（每条连接、每次 DNS 命中）：
+//
+//  1. **级别判断**：Debug 关掉时连 mu 都不碰。以前是先 Lock 再比级别，
+//     "关掉 Debug"只省了写盘，锁与 fmt.Sprintf 照付。
+//  2. **格式化与落盘**：以前把 Fprintf 包在 mu 里，于是所有 goroutine 的日志
+//     排队等一次 write(2)。GUI 的 stdout 若是一个启动器给的管道，管道对端
+//     卡住就会让整个进程的日志（连同调用方）一起停在那里。
+//
+// 代价是不同 goroutine 的整行顺序不再严格等于时间顺序——但每一行自身仍然是
+// 完整的（一次 write），而"谁先谁后"在毫秒级并发下本来就没有意义。
 func logf(l Level, format string, args ...any) {
-	mu.Lock()
-	if l < level {
-		mu.Unlock()
+	if l < Level(level.Load()) {
 		return
 	}
 	// 消息里混着大量外部可控文本：SOCKS5 客户端自报的域名、节点名、
@@ -160,15 +183,23 @@ func logf(l Level, format string, args ...any) {
 	// 重画面板甚至操纵终端。
 	msg := sanitize(fmt.Sprintf(format, args...))
 	now := time.Now()
-	fmt.Fprintf(output, "%s [%s] %s\n", now.Format("2006-01-02 15:04:05"), l, msg)
-	// 必须在解锁后再调钩子：钩子自己完全可能再打一条日志（UI 侧就会），
-	// 持锁调用会直接自锁。
+	line := fmt.Sprintf("%s [%s] %s\n", now.Format("2006-01-02 15:04:05"), l, msg)
+
+	mu.Lock()
+	w := output
 	active := make([]Hook, len(hooks))
 	for i, e := range hooks {
 		active[i] = e.fn
 	}
+	// 写盘同样在锁外：output 是一个 io.Writer（文件 + 可选 stdout），
+	// 它的写是并发安全的（logx/file.go 的 writer 自带互斥）。
 	mu.Unlock()
 
+	if w != nil {
+		_, _ = io.WriteString(w, line)
+	}
+	// 钩子必须在解锁之后调：钩子自己完全可能再打一条日志（UI 侧就会），
+	// 持锁调用会直接自锁。
 	fireHook(active, l, msg, now)
 }
 

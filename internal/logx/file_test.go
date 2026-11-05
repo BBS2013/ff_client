@@ -1,9 +1,11 @@
 package logx
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -66,6 +68,26 @@ func TestSetFileOutputKeepsOldWriterAndRestores(t *testing.T) {
 	defer restore()
 	setLevel(t, LevelDebug)
 
+	// capture() 换掉的是一个 bytes.Buffer——**不是终端**。按现在的语义，
+	// 那时日志只写文件，不再抄一份到"非终端的原输出"（理由见 SetFileOutput
+	// 的注释：那个副本没有轮转、没有 0600，内容是访问过哪些域名）。
+	// 所以这条用例先用一个假终端把它要守的"人在终端里能看到"演出来。
+	fakeTTY := &ttyProbe{}
+	prevTTY := isTerminalFn
+	isTerminalFn = func(w io.Writer) bool {
+		f, ok := w.(*ttyProbe)
+		return ok && f == fakeTTY
+	}
+	t.Cleanup(func() { isTerminalFn = prevTTY })
+	mu.Lock()
+	output = fakeTTY
+	mu.Unlock()
+	t.Cleanup(func() {
+		mu.Lock()
+		output = buf
+		mu.Unlock()
+	})
+
 	path := filepath.Join(t.TempDir(), "app.log")
 	closer, err := SetFileOutput(path, 1<<20, 1)
 	if err != nil {
@@ -76,8 +98,8 @@ func TestSetFileOutputKeepsOldWriterAndRestores(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(buf.String(), "写到文件也写到原输出") {
-		t.Errorf("原输出没收到日志: %q", buf.String())
+	if !strings.Contains(fakeTTY.String(), "写到文件也写到原输出") {
+		t.Errorf("终端里没看到日志: %q", fakeTTY.String())
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -88,8 +110,32 @@ func TestSetFileOutputKeepsOldWriterAndRestores(t *testing.T) {
 	}
 
 	// Close 之后必须恢复原输出，否则后续测试会继续往临时文件里写。
+	// 这里的"原输出"是上面装进去的假终端（capture 的 buf 被它替掉了）。
 	Infof("Close 之后应回到原输出")
-	if !strings.Contains(buf.String(), "Close 之后应回到原输出") {
-		t.Errorf("Close 后输出没有恢复: %q", buf.String())
+	if !strings.Contains(fakeTTY.String(), "Close 之后应回到原输出") {
+		t.Errorf("Close 后输出没有恢复: %q", fakeTTY.String())
 	}
+}
+
+// ttyProbe 是一个"看起来像终端"的 writer。
+//
+// isTerminal 的判据是 *os.File 且是字符设备，而 bytes.Buffer 两条都不满足。
+// 要在单测里演"人在终端里看"，就得有一个满足判据、又能在内存里检查的东西。
+// 这里用 /dev/ptmx 那种真设备太重；改成让 isTerminal 可注入——
+// 见下面那行的 seam。
+type ttyProbe struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (p *ttyProbe) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.Write(b)
+}
+
+func (p *ttyProbe) String() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.String()
 }

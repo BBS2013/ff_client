@@ -51,6 +51,16 @@ type Options struct {
 	// 同一套路，都在配置文件旁边，重定向配置文件就一起搬家。
 	// 留空即不落盘——内存里那份账仍够 Stop 还原，只是兜不住 kill -9。
 	ConfigPath string
+	// OnNetworkRecovered 在网络**从坏变好**时被调用一次（不是每 5 秒）。
+	//
+	// 它存在的理由只有一条：出口节点那边的退避是「节点可能有毛病」的语义，
+	// 而网络恢复不属于那件事——那时节点一直是好的，只是我们连不出去。
+	// 不通知的话，恢复之后最长要干等 30 秒才重试，用户看到的是
+	// 「网回来了但代理还要等半分钟」。
+	//
+	// 由 service 注入（它才知道出站是谁）；为 nil 时什么也不做，
+	// 于是这个包不必知道 hysteria 的存在。
+	OnNetworkRecovered func()
 }
 
 // Status 是 TUN 的只读状态投影，直接交给 GUI。
@@ -156,6 +166,8 @@ type TUN struct {
 	upstreams []string
 	// configPath 交给 resolver 那一段推导状态文件位置。
 	configPath string
+	// onNetRecovered 在网络从坏变好时被调一次（见 Options.OnNetworkRecovered）。
+	onNetRecovered func()
 	// resolver 是「系统解析器的查询到底进不进 tun」这一段的状态，受 mu 保护。
 	resolver resolverState
 	helper   HelperClient
@@ -279,11 +291,12 @@ func New(opt Options) (*TUN, error) {
 		// 但 root 面板已经原生具备 CAP_NET_ADMIN，再绕一层 sudo 只会多一个
 		// 在无 tty 环境里可能卡住 PAM/pipe 的子进程（2026-11-03 关窗时 TUN
 		// 停用因此超时，nat 里的 DNS 劫持规则留了下来）。root 直接走本进程。
-		helper:     HelperClient{Argv: helperArgvFor(uid, opt.Conf.Helper)},
-		upstreams:  upstreams,
-		configPath: opt.ConfigPath,
-		fake:       fake,
-		dns:        &dnsServer{decide: opt.Router, lookup: opt.Lookup, fake: fake},
+		helper:         HelperClient{Argv: helperArgvFor(uid, opt.Conf.Helper)},
+		upstreams:      upstreams,
+		configPath:     opt.ConfigPath,
+		onNetRecovered: opt.OnNetworkRecovered,
+		fake:           fake,
+		dns:            &dnsServer{decide: opt.Router, lookup: opt.Lookup, fake: fake},
 	}, nil
 }
 
@@ -958,7 +971,9 @@ func (t *TUN) relayTCP(c adapter.TCPConn) {
 			t.dropBlocked(c, src, dialTarget, res)
 			return
 		}
-		logx.Warnf("tun tcp %s -> %s 失败: %v", src, dialTarget, err)
+		// tun 上的连接量最大（浏览器、系统组件、任何不认代理的程序都从这里过），
+		// 逐条打 WARN 是一天几万行里最主要的那一半。按「目标 + 原因」聚合。
+		logx.NoteFailure("tun "+dialTarget, tunFailureReason(err), err)
 		// 拨不通也要在这一页留一行：用户点开流量页的原因往往就是"这个站打不开"，
 		// 而"被拦的看得见、拨不通的看不见"会让人以为代理没在工作。
 		t.reg.Refuse("tun", src, dialTarget, res, err.Error())
@@ -970,7 +985,7 @@ func (t *TUN) relayTCP(c adapter.TCPConn) {
 	defer t.active.Add(-1)
 	rec := t.reg.Begin("tun", src, res)
 	defer t.reg.End(rec)
-	logx.Infof("tun tcp %s -> %s [%s | %s]", src, dialTarget, res.Outbound, res.Matched)
+	logx.Debugf("tun tcp %s -> %s [%s | %s]", src, dialTarget, res.Outbound, res.Matched)
 	relay(metrics.Wrap(c, upOf(rec)), metrics.Wrap(conn, downOf(rec)))
 }
 
@@ -1111,7 +1126,7 @@ func (t *TUN) relayUDP(c udpFlow, dst netip.AddrPort, srcAddr netip.AddrPort, sr
 		}
 		// 「这条路本来就不通」（节点协议不带 UDP、会话数打满）不是节点故障，
 		// 但也不能静默丢掉——应用的表现会是干等到超时，而超时从不说为什么。
-		logx.Warnf("tun udp %s -> %s 未转发: %v", src, dialTarget, err)
+		logx.NoteFailure("tun udp "+dialTarget, tunFailureReason(err), err)
 		// 与 relayTCP 同一句话的理由：拨不通要在流量页留一行。
 		// UDP 这一侧尤其需要，因为它连个错误都传不回应用（丢包是唯一能表达的）——
 		// 界面上不出现，用户手上就什么都没有：QUIC 站点打不开，而连接表一片干净。
@@ -1124,7 +1139,7 @@ func (t *TUN) relayUDP(c udpFlow, dst netip.AddrPort, srcAddr netip.AddrPort, sr
 	defer t.active.Add(-1)
 	rec := t.reg.Begin("tun", src, res)
 	defer t.reg.End(rec)
-	logx.Infof("tun udp %s -> %s [%s | %s]", src, dialTarget, res.Outbound, res.Matched)
+	logx.Debugf("tun udp %s -> %s [%s | %s]", src, dialTarget, res.Outbound, res.Matched)
 
 	back := &net.UDPAddr{IP: srcAddr.Addr().AsSlice(), Port: int(srcAddr.Port())}
 	t.pumpUDP(c, pc, dialTarget, back, rec)

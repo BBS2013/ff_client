@@ -109,6 +109,9 @@ func (s *Service) checkIfaceChanged() {
 	// 日志就与同一秒那句「发不出包」互相打脸。
 	logx.Infof("检测到网卡变化：直连走 %s，代理走 %s（%s）",
 		devOr(eff.direct, "系统默认路由"), devOr(eff.proxy, "系统默认路由"), set.Describe())
+	// 出口网卡换了 = 网络环境变了。让出口节点把重连退避清零：
+	// 之前连不上多半是因为那张卡没了，而不是节点有毛病。
+	s.resetOutboundBackoff()
 }
 
 // ifaceSettled 回答「这一轮的结果能不能动手」。

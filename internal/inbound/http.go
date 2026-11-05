@@ -108,14 +108,22 @@ func (h *HTTPProxy) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 			h.blocked.drop(c, c.RemoteAddr().String(), target, res)
 			return
 		}
-		logx.Warnf("http CONNECT -> %s 失败: %v", target, err)
+		// 失败按「目标 + 原因类别」聚合：浏览器对一个打不开的站会重试几十次，
+		// 而每一次的原因里都带着不同的超时毫秒数——逐条打出来的结果是一天
+		// 几万行同一条消息（现场实测 22139 行 / 3.7 万行），真正有用的那几行
+		// 被埋在里面。同 key 60 秒内只打第一条，其余汇总。
+		logx.NoteFailure("http CONNECT "+target, failureReason(err), err)
 		h.reg.Refuse("http", c.RemoteAddr().String(), target, res, err.Error())
 		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer remote.Close()
 
-	logx.Infof("http CONNECT %s [%s | %s]", target, res.Policy, res.Matched)
+	// 成功那条降到 Debug：浏览器开一个页面就是几十条 CONNECT，
+	// 每条都打一行 Info 的结果是一天几万行，而排障时没人会去看
+	// "刚才打开了哪些站"。连接表里有完整的一行（路径、命中、字节），
+	// 那才是"这个站走了哪条路"该去的地方。
+	logx.Debugf("http CONNECT %s [%s | %s]", target, res.Policy, res.Matched)
 	if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}

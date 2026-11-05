@@ -26,15 +26,9 @@ func capture(t *testing.T) (*bytes.Buffer, func()) {
 // setLevel 临时改级别，t.Cleanup 里恢复。
 func setLevel(t *testing.T, l Level) {
 	t.Helper()
-	mu.Lock()
-	old := level
-	level = l
-	mu.Unlock()
-	t.Cleanup(func() {
-		mu.Lock()
-		level = old
-		mu.Unlock()
-	})
+	old := LevelNow()
+	SetLevel(l)
+	t.Cleanup(func() { SetLevel(old) })
 }
 
 func TestHookReceivesFormattedLine(t *testing.T) {

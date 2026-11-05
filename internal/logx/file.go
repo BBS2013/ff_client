@@ -135,6 +135,19 @@ func (s *fileSink) Close() error {
 //
 // 文件先写：面板的 stdout 是启动器给的 socket，启动器退出后它可能不可写，
 // 不能因为控制台坏了就把文件日志也一起丢掉。
+//
+// **stdout 不是终端时不再抄一份。**
+//
+// 那个副本只有两个归宿，而两个都不需要它：
+//   - GUI 面板的 stdout 是启动器给的管道/socket（start_wps_app-gui.sh 曾经
+//     把它追加到仓库根的 wps_app-gui.out，0644、无上限）；
+//   - systemd 部署时它进 journal，而 <config>.log 已经是同一份内容。
+//
+// 也就是说它是"同一批日志的第二份拷贝"，而且这一份没有轮转、没有 0600。
+// 现场量过一次：wps_app-gui.out 8MB 与 config.yaml.log 前 8MB 逐行相同，
+// 里面全是访问过哪些域名。多写一遍既费 IO，又多留一处没人管的访问记录。
+//
+// 交互终端（有人在终端里手工跑）仍然照抄：那是人在看，不是落盘。
 func SetFileOutput(path string, maxBytes int64, backups int) (io.Closer, error) {
 	w, err := newRotatingFile(path, maxBytes, backups)
 	if err != nil {
@@ -142,11 +155,34 @@ func SetFileOutput(path string, maxBytes int64, backups int) (io.Closer, error) 
 	}
 	mu.Lock()
 	old := output
-	if old == nil {
+	switch {
+	case old == nil:
 		output = w
-	} else {
+	case isTerminalFn(old):
 		output = io.MultiWriter(w, old)
+	default:
+		// 非终端：只写文件。
+		output = w
 	}
 	mu.Unlock()
 	return &fileSink{old: old, file: w}, nil
+}
+
+// isTerminalFn 是 isTerminal 的接缝：单测要演"人在终端里看"时换掉它。
+// 用真 *os.File 去造终端需要 pty，代价远大于这条判断本身。
+var isTerminalFn = isTerminal
+
+// isTerminal 判断这个 writer 是不是一个真的终端（包括 os.Stdout 被重定向前的形状）。
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		// 多路复用器（io.MultiWriter）之类：保守起见当成"不是终端"，
+		// 因为那说明输出已经被包过一层，多半也不是人在看。
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

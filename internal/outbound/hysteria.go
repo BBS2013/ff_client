@@ -485,21 +485,40 @@ func (h *Hysteria) client(ctx context.Context) (client.Client, error) {
 // 报错，而那些迟到的错误针对的是旧客户端。若不加判断就无条件清空，
 // 旧流的错误会把刚握手成功的新连接再拆一遍——一次流故障就此滚成持续重连，
 // 而每次重连又打断一批正在传输的连接。
-func (h *Hysteria) invalidateCurrent(gen client.Client) {
+func (h *Hysteria) invalidateCurrent(gen client.Client) bool {
 	if gen == nil {
-		return
+		return false
 	}
 	h.mu.Lock()
 	if h.cli != gen {
 		h.mu.Unlock()
-		return
+		return false
 	}
 	h.cli = nil
 	h.mu.Unlock()
 	_ = gen.Close()
+	return true
 }
 
-// recordFailure 递增失败计数并安排下次重试时间。
+// ResetBackoff 把"正在退避"这件事作废，让下一次拨号立刻尝试握手。
+//
+// 什么时候该调：**网络本身恢复了**（换了 Wi-Fi、网关重钉成功、网线插回去）。
+// 退避的语义是"节点可能有毛病，别拿重试把它打穿"，而网络恢复不属于那件事——
+// 那时节点一直是好的，只是我们连不出去。不调的话，恢复之后最长要干等
+// backoffMax（30 秒）才重试，用户看到的是"网回来了但代理还要等半分钟"。
+//
+// 只清 retryAt 与失败计数，不动已建立的连接：如果此刻 h.cli 非空，
+// 说明隧道本来就是通的，这次调用是空操作。
+func (h *Hysteria) ResetBackoff() {
+	h.mu.Lock()
+	was := h.failures
+	h.failures = 0
+	h.retryAt = time.Time{}
+	h.mu.Unlock()
+	if was > 0 {
+		logx.Infof("hysteria: 网络已恢复，退避清零（此前连续失败 %d 次），下一次拨号立即重试", was)
+	}
+}
 func (h *Hysteria) recordFailure() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -606,8 +625,18 @@ func (c *trackedConn) noteError(err error) {
 	}
 	c.broken = true
 	c.mu.Unlock()
-	logx.Warnf("hysteria: 隧道故障，丢弃共享连接以便重连: %v", err)
-	c.h.invalidateCurrent(c.gen)
+	// 只有真的换掉了当前连接才打 WARN。
+	//
+	// 一条 QUIC 连接坏掉时，挂在它上面的每条流都会报一次「连接级错误」，
+	// 而它们全都在报同一件事。以前每一条都打一行，于是日志里是几十条
+	// "隧道故障"——排障的人会以为隧道在反复抖动，实际只坏了一次。
+	// 真正值得记的是"第几次换了连接"和"换掉的那次原因"。
+	if c.h.invalidateCurrent(c.gen) {
+		logx.Warnf("hysteria: 隧道故障，丢弃共享连接以便重连: %v", err)
+		return
+	}
+	// 没能换掉（旧代次，或已经被别人换过）：这条只关涉它自己那条流。
+	logx.Debugf("hysteria: 旧代次的流报错（共享连接已由别的流换掉）: %v", err)
 }
 
 // isConnectionFatal 判断错误是否意味着「整条 QUIC 连接已经不能再用」。

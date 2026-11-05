@@ -360,6 +360,12 @@ func (t *TUN) checkNetworkChanged(ctx context.Context) {
 		// 恢复也要说一次，而且只说一次：否则读日志的人只看见「断了」，
 		// 永远不知道它什么时候回来的——那正是最难判断的一段。
 		logx.Infof("TUN: 网络回来了（%s），断的那阵子绕行路由一直保持原样", now.describe())
+		// 让出口那边把退避清零：网络刚恢复时节点本来就没问题，
+		// 继续按"节点可能有毛病"的退避等下去是纯浪费。
+		// 放在重钉之前——重钉失败（helper 版本不对之类）不该连带把这件事吞掉。
+		if t.onNetRecovered != nil {
+			t.onNetRecovered()
+		}
 	}
 	if err := t.repinRoutes(ctx, now); err != nil {
 		// 已知版本对不上时是我们自己没发这一趟，WARN 每 5 秒刷一条毫无新增信息的东西，

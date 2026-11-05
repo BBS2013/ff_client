@@ -107,6 +107,9 @@ type Service struct {
 	// 规则文件热重载：监视器状态 + 它的退出句柄（见 ruleswatch.go）。
 	rwatch           rulesWatch
 	rulesWatchCancel context.CancelFunc
+	// 失败日志的汇总循环（见 failureflush.go）。它的退出句柄与上面几个同形，
+	// 这样 stop() 里"取消所有后台循环"那段保持一致的写法。
+	failureFlushCancel context.CancelFunc
 
 	running   bool
 	startedAt time.Time
@@ -552,6 +555,9 @@ func (s *Service) Start() error {
 	// 规则集订阅可能刚刚重载过，基线以引擎当前打开的文件为准。
 	s.noteRulesReloaded()
 	s.startRulesWatch()
+	// 失败日志按 60 秒汇总（见 failureflush.go）：逐条打的结果是一天几万行
+	// 同一条消息，而真正有用的那几行被埋在中间。
+	s.startFailureFlush()
 	// 网卡变化要有人盯：USB 卡被拔掉的那一刻起，钉在它上面的隧道就不再是加分项。
 	s.syncSplitWatch()
 	return nil
@@ -655,6 +661,10 @@ func (s *Service) stop() error {
 	s.rulesWatchCancel = nil
 	cancelIface := s.ifaceWatchCancel
 	s.ifaceWatchCancel = nil
+	// 失败日志的汇总循环也在这里收：停止时会做最后一次 flush，
+	// 于是"最后 60 秒里累计的失败"不会因为进程退出就消失。
+	cancelFlush := s.failureFlushCancel
+	s.failureFlushCancel = nil
 	s.mu.Unlock()
 	// 常驻提权 helper 是 root 进程，面板没了它就该收工。helper 自己也盯着父进程，
 	// 但主动收更干净——不必等到它下一次心跳才发现主人没了。
@@ -670,6 +680,9 @@ func (s *Service) stop() error {
 	}
 	if cancelIface != nil {
 		cancelIface()
+	}
+	if cancelFlush != nil {
+		cancelFlush()
 	}
 
 	// 订阅循环要趁监听器刚关就停：它可能在拉一份新规则集，

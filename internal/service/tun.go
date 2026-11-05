@@ -53,6 +53,8 @@ func (s *Service) startTUN(cfg *config.Config) error {
 		// 而这份清单（公网+内网上游）正是劫持收不到查询时要去核对的那一半，
 		// 两者由同一个配置推导，不该在两个地方各写一遍。
 		ConfigPath: s.ConfigPath(),
+		// 网络从坏变好时把出口的退避清零：见 Options.OnNetworkRecovered。
+		OnNetworkRecovered: s.resetOutboundBackoff,
 	})
 	if err != nil {
 		return err
@@ -71,6 +73,25 @@ func (s *Service) startTUN(cfg *config.Config) error {
 	s.tun, s.killOp = t, t
 	s.mu.Unlock()
 	return nil
+}
+
+// resetOutboundBackoff 在网络恢复时把出口节点的重连退避清零。
+//
+// 只清"当前生效的那一个"出站的退避——没在用的节点退避着也无所谓，
+// 真用到它时自然会重连。也不动已建立的连接：隧道本来通着的话这次是空操作。
+//
+// 为什么这件事归 service：只有它知道当前生效的是哪个出站（会随节点切换变），
+// 而 tunx/netwatch 不该知道 hysteria 长什么样。
+func (s *Service) resetOutboundBackoff() {
+	s.mu.Lock()
+	d := s.proxy
+	s.mu.Unlock()
+	if d == nil {
+		return
+	}
+	if r, ok := d.(interface{ ResetBackoff() }); ok {
+		r.ResetBackoff()
+	}
 }
 
 // stopTUN 拆掉 TUN。不持有 s.mu：拆除要等协议栈把连接走完并执行

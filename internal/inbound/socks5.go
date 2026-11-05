@@ -113,13 +113,15 @@ func (s *SOCKS5) handle(c net.Conn) {
 			s.blocked.drop(c, c.RemoteAddr().String(), req.addr, res)
 			return
 		}
-		logx.Warnf("socks5 %s -> %s 失败: %v", c.RemoteAddr(), req.addr, err)
+		logx.NoteFailure("socks5 "+req.addr, failureReason(err), err)
 		s.reg.Refuse("socks5", c.RemoteAddr().String(), req.addr, res, err.Error())
 		_ = reply(c, repHostUnreachable)
 		return
 	}
 	defer remote.Close()
-	logx.Infof("socks5 %s -> %s [%s | %s]", c.RemoteAddr(), req.addr, res.Policy, res.Matched)
+	// 成功那条降到 Debug：理由见 http.go 里同一处（一天几万行，连接表才是
+	// 查"这个站走了哪条路"的地方）。
+	logx.Debugf("socks5 %s -> %s [%s | %s]", c.RemoteAddr(), req.addr, res.Policy, res.Matched)
 
 	if err := reply(c, repSuccess); err != nil {
 		return

@@ -153,7 +153,7 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 			if err != nil {
 				// 「这条路本来就不通」必须说得像一句人话：应用侧只看得见
 				// 自己的报文石沉大海——UDP 传不回任何错误码，重试是它唯一的表达方式。
-				logx.Warnf("socks5 %s: UDP 未转发（报文发往 %s）：%v", ctl.RemoteAddr(), d.addr, err)
+				logx.NoteFailure("socks5-udp "+d.addr, failureReason(err), err)
 				// 记一行就够（同一目标不重复记），但**不要把 decided 置真**：
 				// 拨号失败不等于"这条关联的出站已经定下来了"。让下一个包再试一次，
 				// 一次瞬时失败就不会把整条关联废掉 10 分钟。
@@ -166,7 +166,7 @@ func (s *SOCKS5) pumpAssoc(ctl net.Conn, uc *net.UDPConn, in <-chan datagram) {
 			decided = true
 			pc = p
 			rec = s.reg.Begin("socks5-udp", ctl.RemoteAddr().String(), res)
-			logx.Infof("socks5-udp %s -> %s [%s | %s]", ctl.RemoteAddr(), d.addr, res.Outbound, res.Matched)
+			logx.Debugf("socks5-udp %s -> %s [%s | %s]", ctl.RemoteAddr(), d.addr, res.Outbound, res.Matched)
 			go s.relayAssocReplies(uc, p, &client, rec)
 		}
 		if pc == nil {
