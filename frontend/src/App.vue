@@ -438,14 +438,10 @@ async function poll(): Promise<void> {
       void prev.catch(() => {})
     }
     try {
-      // Status 每秒都要；Traffic 会 Snapshot 整个 metrics 注册表，与数据面争锁。
-      // 只有停在「流量」页时才按原频率拉 Traffic，其它视图不碰它。
-      const wantTraffic = view.value === 'traffic'
-      const settled = await Promise.allSettled(
-        wantTraffic ? [status(), traffic()] : [status()]
-      )
-      const s = settled[0]
-      const t = wantTraffic ? settled[1] : undefined
+      // 三个读数各拿各的。Promise.all 的语义是"一个坏全作废"：
+      // 流量拉失败会把还活着的 Status 一起冻在旧值上，而顶栏照样写"运行中"。
+      // 总览/侧栏上下行、节点 byNode、规则拦截数都靠 Traffic 快照，必须每秒拉。
+      const [s, t] = await Promise.allSettled([status(), traffic()])
       const bad: string[] = []
       if (s.status === 'fulfilled') {
         // markRaw：快照是只读投影，做成深层响应式会让几百条连接每秒都被代理一遍。
@@ -454,12 +450,10 @@ async function poll(): Promise<void> {
       } else {
         bad.push(`状态 ${errorText(s.reason)}`)
       }
-      if (t !== undefined) {
-        if (t.status === 'fulfilled') {
-          if (seq === pollSeq) tr.value = markRaw(t.value)
-        } else {
-          bad.push(`流量 ${errorText(t.reason)}`)
-        }
+      if (t.status === 'fulfilled') {
+        if (seq === pollSeq) tr.value = markRaw(t.value)
+      } else {
+        bad.push(`流量 ${errorText(t.reason)}`)
       }
       if (view.value === 'logs') {
         try {
