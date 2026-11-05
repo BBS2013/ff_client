@@ -194,14 +194,31 @@ func desktopPrefix() (args []string, env []string) {
 	if user == "" {
 		return nil, nil
 	}
-	if id, err := userUID(user); err == nil && id != uid {
-		bus := "/run/user/" + strconv.Itoa(id) + "/bus"
-		if _, statErr := os.Stat(bus); statErr == nil {
-			env = []string{"DBUS_SESSION_BUS_ADDRESS=unix:path=" + bus, "DISPLAY=:0"}
-			return []string{"sudo", "-n", "-u", user}, env
-		}
+	id, err := userUID(user)
+	if err != nil || id == uid {
+		return nil, nil
 	}
-	return nil, env
+	return desktopPrefixAs(user, id, "/run/user/"+strconv.Itoa(id)+"/bus")
+}
+
+// desktopPrefixAs 是 desktopPrefix 的可测版本：身份与总线路径都由参数给。
+//
+// 总线地址必须由 env 在 sudo 之内重新设上，不能只交给子进程的环境：
+// sudo 默认 env_reset，会把 DBUS_SESSION_BUS_ADDRESS 与 XDG_RUNTIME_DIR 丢掉。
+// 拿不到会话总线的 gsettings 会写进 dconf 的兜底影子库（~/.cache/dconf/user），
+// 退出码照样是 0 —— 写"成功"了，桌面却一点没变；随后从影子库读回来的是 none，
+// 于是面板上的开关点开就自己弹回关闭，而日志里只留一句"开启成功"。
+//
+// 这条前缀还顺带救了环境变量后端：systemctl --user 同样需要 XDG_RUNTIME_DIR
+// 才找得到桌面用户的 systemd --user 实例，之前那一路也是静默失败的。
+func desktopPrefixAs(user string, uid int, busPath string) (args []string, env []string) {
+	if _, statErr := os.Stat(busPath); statErr != nil {
+		return nil, nil
+	}
+	return []string{"sudo", "-n", "-u", user, "env",
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=" + busPath,
+		"XDG_RUNTIME_DIR=/run/user/" + strconv.Itoa(uid),
+	}, nil
 }
 
 // writeFileAtomic 先写临时文件、fsync、再 rename。

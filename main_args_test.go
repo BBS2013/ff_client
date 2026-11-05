@@ -109,12 +109,17 @@ func TestParseArgs(t *testing.T) {
 		{
 			name: "位置参数在最前、后面跟两个 flag",
 			argv: []string{"config.yaml", "-check", "-check-host", "www.baidu.com:443"},
-			want: options{configPath: "config.yaml", checkOnly: true, checkHosts: []string{"www.baidu.com:443"}},
+			want: options{configPath: "config.yaml", checkOnly: true, checkHostSeen: true, checkHosts: []string{"www.baidu.com:443"}},
 		},
 		{
 			name: "flag 与位置参数交错",
 			argv: []string{"-check", "config.yaml", "-check-host", "1.1.1.1:443"},
-			want: options{configPath: "config.yaml", checkOnly: true, checkHosts: []string{"1.1.1.1:443"}},
+			want: options{configPath: "config.yaml", checkOnly: true, checkHostSeen: true, checkHosts: []string{"1.1.1.1:443"}},
+		},
+		{
+			name: "只给 -check-host 也必须是自检，不能启动服务",
+			argv: []string{"config.yaml", "-check-host", "www.baidu.com:443"},
+			want: options{configPath: "config.yaml", checkOnly: true, checkHostSeen: true, checkHosts: []string{"www.baidu.com:443"}},
 		},
 		{
 			name: "-c 与位置参数给同一个路径不算冲突",
@@ -379,6 +384,9 @@ func TestParseArgsCheckHosts(t *testing.T) {
 			got, err := parseArgs(append([]string{"config.yaml"}, c.argv...))
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !got.checkOnly {
+				t.Errorf("给了巡检目标却没有进入自检模式（会静默启动服务）")
 			}
 			if len(got.checkHosts) != len(c.want) {
 				t.Fatalf("目标数 %d 个 %v，期望 %v", len(got.checkHosts), got.checkHosts, c.want)

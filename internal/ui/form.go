@@ -2,11 +2,14 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"wps_app/internal/config"
+	"wps_app/internal/logx"
+	"wps_app/internal/sudoown"
 )
 
 // MaskedSecret 是密码类字段回给前端时的占位符。
@@ -224,7 +227,21 @@ func writeForm(path string, f ConfigForm) error {
 		next.TUN.IPv6 = keep.IPv6
 	}
 
-	return config.Save(path, &next)
+	if err := config.Save(path, &next); err != nil {
+		return err
+	}
+	// root 面板保存的配置要把属主还给桌面用户：留在 root 手里的话，
+	// 用户身份跑的实例与 -sysproxy 这类命令读不到配置，
+	// 日志里那句 "open ./config.yaml: permission denied" 就是它。
+	for _, f := range []string{path, path + config.OrigSuffix} {
+		if _, statErr := os.Stat(f); statErr != nil {
+			continue
+		}
+		if err := sudoown.ToDesktopUser(f); err != nil {
+			logx.Warnf("配置属主未能还给桌面用户（%s）: %v", f, err)
+		}
+	}
+	return nil
 }
 
 // findInbound 按类型与监听地址找回原配置，用于还原被掩码的入站凭据。

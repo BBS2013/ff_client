@@ -834,3 +834,16 @@ func TestCIDROf(t *testing.T) {
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }
+
+// root 面板自己就有 CAP_NET_ADMIN，绝不能再绕 tun.helper：
+// 2026-11-03 关窗时 TUN 停用正是卡在无 tty 的 sudo/PAM 上，
+// 超时后 nat 里的 DNS 劫持规则留了下来，整机解析挂掉。
+func TestHelperArgvSkippedForRoot(t *testing.T) {
+	if got := helperArgvFor(0, []string{"sudo", "-n", "/x"}); got != nil {
+		t.Fatalf("root 不该走 helper，得到 %v", got)
+	}
+	conf := []string{"sudo", "-n", "/x"}
+	if got := helperArgvFor(1000, conf); len(got) != len(conf) {
+		t.Fatalf("普通用户仍应走 helper，得到 %v", got)
+	}
+}

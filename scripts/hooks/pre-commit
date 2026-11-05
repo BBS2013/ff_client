@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# 提交前的最小守卫。设计原则：只拦“提交之后就一定是坏的”那几种，不替开发者跑整套门禁。
+#
+# 为什么需要它：本仓库的 frontend/dist 是被 go:embed 进二进制的，而它同时
+# 又是构建产物。2026-11-02 已经因为“只提交已跟踪文件”白屏过一次；
+# 2026-11-05 又出现同一形状（index.html 指向未入库的哈希资源）。
+# 这类错误提交进去之后，只有在别人干净检出、或者自己重新构建时才会暴露，
+# 而且症状是白屏，与原因隔得很远。放在提交前拦，代价是几十毫秒。
+#
+# 安装：make hooks（把本文件复制到 .git/hooks/pre-commit）。
+#
+# 刻意不跑 go test：那要几分钟，会把人逼去用 --no-verify，
+# 于是这道门连同它守的东西一起失效。测试留给 make gate。
+set -uo pipefail
+cd "$(dirname "$0")/../.." 2>/dev/null || exit 0
+[[ -d .git ]] || exit 0
+
+fail=0
+
+# 1) 嵌入界面的自洽性（磁盘 + git 索引两条都查）。
+if git diff --cached --name-only | grep -qE '^(frontend/dist/|frontend/src/|scripts/check-dist.sh)'; then
+  if ! ./scripts/check-dist.sh; then
+    fail=1
+  fi
+fi
+
+# 2) 已跟踪的 Go 代码若引用了未跟踪的源码，提交出来的树编不过。
+#    典型的坏形状：新增 file.go 却只 git add 了改动的调用方。
+untracked_go=$(git ls-files --others --exclude-standard -- '*.go' '*.ts' '*.vue' 2>/dev/null || true)
+if [[ -n "$untracked_go" ]]; then
+  # 只有确实有 Go/Vue 改动要提交时才抱怨，避免“工作区里有草稿”就拦人。
+  if git diff --cached --name-only | grep -qE '\.(go|ts|vue)$'; then
+    echo "pre-commit: 这些源码文件还没被跟踪，而本次提交改了被它们定义的调用方：" >&2
+    echo "$untracked_go" | sed 's/^/  /' >&2
+    echo "  提交一个引用了不存在符号的树，干净检出会直接编不过。" >&2
+    echo "  修法：git add <上面这些文件>（或先把它们移到仓库外）。" >&2
+    fail=1
+  fi
+fi
+
+# 3) 真正构建一次是唯一能证明“这棵树编得过”的检查。
+#    用 -o /dev/null 保证不覆盖正在被面板 / tun.helper 使用的 ./wps_app-gui。
+if git diff --cached --name-only | grep -qE '\.go$'; then
+  if ! go build -o /dev/null ./... 2>/tmp/wps_app-precommit-build.$$; then
+    echo "pre-commit: go build 失败，提交出来的树编不过：" >&2
+    sed 's/^/  /' /tmp/wps_app-precommit-build.$$ >&2
+    fail=1
+  fi
+  rm -f /tmp/wps_app-precommit-build.$$
+fi
+
+exit "$fail"

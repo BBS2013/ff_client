@@ -37,12 +37,19 @@ const defaultConfigPath = "./config.yaml"
 // defaultCheckHost 是没写 -check-host 时唯一被巡检的目标。
 const defaultCheckHost = "www.gstatic.com:443"
 
+// runTrayHelper 由 gui 构建在 init 里注入：非 GUI 产物没有托盘助手，
+// 收到 --tray-helper 时给出明确错误，而不是静默当普通启动。
+var runTrayHelper func(string) error
+
 // targetsFlag 让 -check-host 既能重复给、也能逗号分隔，攒成一个列表。
 //
 // 它刻意不带默认值：默认目标在 parseArgs 末尾统一补。
 // 把默认值当列表第一项的话，用户点名要查三个站，结果第一条永远是 gstatic，
 // 汇总里的 ok 数也对不上他给的目标数。
-type targetsFlag struct{ dst *[]string }
+type targetsFlag struct {
+	dst  *[]string
+	seen *bool
+}
 
 func (t targetsFlag) String() string {
 	if t.dst == nil {
@@ -52,6 +59,9 @@ func (t targetsFlag) String() string {
 }
 
 func (t targetsFlag) Set(s string) error {
+	if t.seen != nil {
+		*t.seen = true
+	}
 	for _, part := range strings.Split(s, ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			*t.dst = append(*t.dst, p)
@@ -94,15 +104,16 @@ func splitArgs(in []string) (flagArgs, positional []string) {
 
 // options 是命令行选项的解析结果。
 type options struct {
-	configPath string
-	checkOnly  bool
-	checkHosts []string
-	checkFetch []string
-	gui        bool
-	cliOnly    bool
-	mode       string
-	tunReset   bool
-	sysProxy   string
+	configPath    string
+	checkOnly     bool
+	checkHosts    []string
+	checkHostSeen bool
+	checkFetch    []string
+	gui           bool
+	cliOnly       bool
+	mode          string
+	tunReset      bool
+	sysProxy      string
 	// diag 打印一份离线诊断报告后退出：不抢实例锁、不启停任何东西。
 	diag bool
 	// version 打印版本、源码指纹与构建时刻后退出；不读配置、不碰网络。
@@ -122,6 +133,7 @@ type options struct {
 	dialHelper        bool
 	dialHelperConnect string
 	dialHelperOwner   string
+	trayHelper        string
 }
 
 // newFlagSet 构造命令行选项集合。
@@ -131,13 +143,13 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.BoolVar(&o.checkOnly, "check", false, "只做连通性自检：连上服务端并逐个拨号后退出")
 	fs.Var(targetsFlag{dst: &o.checkFetch}, "check-fetch",
 		"经隧道真的取一个页面（http/https URL，逗号分隔）：状态码不是 2xx/3xx 即判失败")
-	fs.Var(targetsFlag{dst: &o.checkHosts}, "check-host",
-		"自检使用的目标地址，可重复给也可逗号分隔（默认 "+defaultCheckHost+"）")
+	fs.Var(targetsFlag{dst: &o.checkHosts, seen: &o.checkHostSeen}, "check-host",
+		"自检使用的目标地址，可重复给也可逗号分隔（默认 "+defaultCheckHost+"）；给了它就等于 -check")
 	fs.BoolVar(&o.gui, "gui", false, "启动桌面控制面板与系统托盘（需用 gui 构建标签编译）")
 	fs.BoolVar(&o.cliOnly, "cli", false, "强制命令行模式：只跑代理服务不开界面（gui 构建下也有效）")
 	fs.StringVar(&o.mode, "mode", "", "本次运行使用的分流模式：rule | global | direct（不写回配置文件）")
 	fs.BoolVar(&o.tunReset, "tun-reset", false, "清理 TUN 遗留的 iptables 劫持规则与网卡后退出")
-	fs.StringVar(&o.sysProxy, "sysproxy", "", "设置桌面系统代理：on | off | restore | status（写完即退出）")
+	fs.StringVar(&o.sysProxy, "sysproxy", "", "设置桌面系统代理：on | off | restore | status（写完即退出；on 需要面板正在运行）")
 	fs.BoolVar(&o.diag, "diag", false, "打印一份离线诊断报告（口令已掩码、不碰外网）后退出")
 	fs.BoolVar(&o.version, "version", false, "打印版本、源码指纹与构建时刻后退出")
 	fs.StringVar(&o.logFile, "log-file", "", "日志同时写入这个文件（0600，20MB×3 轮转）；GUI 不写时默认 <config>.log")
@@ -146,6 +158,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.BoolVar(&o.dialHelper, "dial-helper", false, "以常驻提权 helper 身份运行：替面板造钉在指定网卡上的 socket（面板通过 tun.helper 配置唤起，需要 root）")
 	fs.StringVar(&o.dialHelperConnect, "dial-helper-connect", "", "常驻 helper 要监听的套接字路径（由面板自动传入）")
 	fs.StringVar(&o.dialHelperOwner, "dial-helper-owner", "", "常驻 helper 要把套接字交给哪个 uid（由面板自动传入）")
+	fs.StringVar(&o.trayHelper, "tray-helper", "", "以桌面用户身份运行系统托盘助手（由 root 面板自动唤起）")
 	fs.StringVar(&o.tunHelperConnect, "tun-helper-connect", "", "helper 模式下要连接的套接字路径（由面板自动传入，不用手写）")
 	return fs
 }
@@ -181,16 +194,17 @@ func parseArgs(argv []string) (options, error) {
 	if o.configPath == "" {
 		o.configPath = defaultConfigPath
 	}
+	// 只要用户点名了任何一个巡检目标，这次就是巡检，不是启动服务。
+	// 特别是 -check-host：它原来只在 -check 旁边才生效，单独给会静默
+	// 走正常启动，把正在跑的面板接管掉——一个只读自检不该有这种副作用。
+	if o.checkHostSeen || len(o.checkFetch) > 0 {
+		o.checkOnly = true
+	}
 	if len(o.checkHosts) == 0 && len(o.checkFetch) == 0 {
 		// 默认目标只在"什么都没点名"时补。
 		// 点名要取页面的人不该被一条他没要求的 gstatic 拨号巡检拖走退出码——
 		// 本机直连 gstatic 经常是 reset 的，那条失败会被读成"我取的页面也没通"。
 		o.checkHosts = []string{defaultCheckHost}
-	}
-	if len(o.checkFetch) > 0 {
-		// 写了 -check-fetch 就是"我要验通不通"，不该还得手动配 -check，
-		// 否则这条命令静默变成"正常启动代理服务"。
-		o.checkOnly = true
 	}
 	return o, nil
 }
@@ -255,6 +269,12 @@ func runCLI(o options) error {
 	}
 	if o.dialHelper {
 		return dialHelperCommand(o.dialHelperConnect, o.dialHelperOwner)
+	}
+	if o.trayHelper != "" {
+		if runTrayHelper == nil {
+			return errors.New("这个构建没有托盘助手（需要带 gui 标签的产物）")
+		}
+		return runTrayHelper(o.trayHelper)
 	}
 	if o.tunReset {
 		return tunCleanup(o.configPath)
@@ -455,7 +475,9 @@ func tunCleanup(configPath string) error {
 		logx.Debugf("读配置失败，按默认网卡名清理: %v", err)
 	}
 	var cleaned []string
-	if len(helper) > 0 {
+	// root 下直接清：再叫一次 sudo 只会在关窗/收尾这种无 tty 的时刻
+	// 卡在 PAM 上，把 nat 里的 DNS 劫持规则留在机器上。
+	if len(helper) > 0 && os.Geteuid() != 0 {
 		// 配了提权命令就必须让它来清：本进程是普通用户时，
 		// 直接在下面跑 iptables 会全军覆没，而「残留没清」正是整机 DNS 挂掉那个坑。
 		reply, _, err := tunx.HelperClient{Argv: helper}.Run(ctx, tunx.CleanupRequest(os.Geteuid(), device, address))
@@ -529,7 +551,6 @@ func diagReport(configPath string) error {
 }
 
 // sysProxyTarget 从配置里凑出一次系统代理操作的意图：走哪条后端、指哪两个端口。
-//
 // 三条使用路径（-sysproxy on、状态输出、启动时的孤儿检查）共用同一个答案，
 // 判据本身在 config 里，那边能单测。
 func sysProxyTarget(configPath string) sysproxy.Config {
@@ -540,6 +561,23 @@ func sysProxyTarget(configPath string) sysproxy.Config {
 	}
 	target.Backend, target.HTTPAddr, target.SOCKSAddr = cfg.SystemProxyTarget()
 	return target
+}
+
+// desktopPointsAtTarget 读完桌面后回答「它指向的是不是我们这次的意图」。
+//
+// readable 为假表示**一次都没读到**（不是"读到了但不是我们"）。CLI 与界面
+// 都要分这两档：前者什么都不能断定，后者可以确定写入没生效。
+//
+// 与界面那一路同一个判据（sysproxy.LikesOurs），只是不需要 App 的入站投影：
+// CLI 手上只有配置推出来的那组地址，而面板跑着时用的正是同一组。
+func desktopPointsAtTarget(ctx context.Context, target sysproxy.Config) (ok bool, detail string, readable bool) {
+	st, err := sysproxy.ReadWith(ctx, nil, target.Backend)
+	if err != nil {
+		return false, "读不到桌面设置：" + err.Error(), false
+	}
+	ok = sysproxy.LikesOurs(st, target)
+	return ok, fmt.Sprintf("桌面当前 mode=%s http=%s socks=%s（本客户端应是 http=%s socks=%s）",
+		st.Mode, st.HTTP, st.SOCKS, target.HTTPAddr, target.SOCKSAddr), true
 }
 
 // sysProxyCommand 在无界面时也能开关桌面系统代理。
@@ -557,8 +595,34 @@ func sysProxyCommand(action string, configPath string) error {
 	backend := target.Backend
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "on":
+		// 一次性 CLI 不能把记账宿主写成自己：Enable 之后它还活着，
+		// 命令退出这本账就指向死 PID，下一次启动会拿它去还原用户刚打开的代理。
+		pid, exe, live := service.LiveInstance(configPath)
+		if !live {
+			return errors.New("-sysproxy on 需要面板正在运行：否则桌面会指向一个没人监听的端口。请先启动面板，或改用界面里的系统代理开关")
+		}
 		if err := sysproxy.Enable(ctx, nil, statePath, target); err != nil {
 			return err
+		}
+		// 写完必须读回一次，与界面里的开关同一条纪律。
+		//
+		// gsettings 写进别的 dconf 数据库时退出码照样是 0（sudo 的 env_reset
+		// 把会话总线丢掉就是这么发生的），桌面纹丝不动。不读回来的话，
+		// CLI 会打印一行"已开启"，而桌面还是 none——用户能看到的唯一症状
+		// 是"命令说开了，浏览器还是直连"。
+		//
+		// 两档必须分开：读到了、不是我们 → 写入没生效，撤账并报错；
+		// 读不到 → 什么都不知道，保留记账（那是退出时唯一能还原的依据）。
+		if ok, detail, readable := desktopPointsAtTarget(ctx, target); !ok {
+			if readable {
+				_ = sysproxy.Forget(statePath)
+				return fmt.Errorf("已写入系统代理设置，但读回时桌面并未指向本客户端（%s）", detail)
+			}
+			fmt.Printf("注意：设置已写入，但读回桌面时失败，尚未确认生效（%s）。记账已保留，面板退出时会照账还原。\n", detail)
+			break
+		}
+		if err := sysproxy.AdoptLedger(statePath, pid, exe); err != nil {
+			return fmt.Errorf("系统代理已写入，但把记账宿主改成运行中的面板 PID %d 失败: %w", pid, err)
 		}
 	case "off":
 		if err := sysproxy.Disable(ctx, nil, statePath, backend); err != nil {

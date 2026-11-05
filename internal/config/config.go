@@ -285,6 +285,26 @@ type DNSConfig struct {
 	Servers []string `yaml:"servers"`
 	Timeout Duration `yaml:"timeout"`
 	Cache   Duration `yaml:"cache"`
+	// InternalServers 是「内网专用」的 DNS 上游，与 Servers 分开。
+	//
+	// 为什么必须分开：两边各错一半，混在一个列表里就是拼延迟。
+	// 实测（公司内网 + 公网双栈，目标 yfjira.mychery.com）：
+	//
+	//	127.0.0.53（公司 DNS） -> 172.25.51.92   （内网真实地址）
+	//	223.5.5.5（公网）      -> 123.60.194.157 （华为云 WAF 入口，回 418 拦截页）
+	//
+	// 而两边对**外网**域名同样是各错一半：公司 DNS 把 www.google.com 答成
+	// 157.240.7.20（Facebook 段），公网 DNS 对内网域名也答不对。
+	// 混在一起时"任一成功即采用"等于谁先回来谁说了算，30 次实测内网地址只赢 20 次，
+	// 剩下 1/3 的失败还会被 TTL 缓存黏住 5 分钟。
+	//
+	// 分层之后：内网域名只问内网上游，公网域名只问公网上游，不存在竞速。
+	InternalServers []string `yaml:"internal_servers"`
+	// InternalDomains 是走内网上游的域名后缀（如 ".mychery.com"）。
+	//
+	// 必须显式给：解析器不猜"这个域名算不算内网"。若配了 internal_servers
+	// 却没有这一项，内网分层不会生效（解析器会报错，避免"以为配好了其实没生效"）。
+	InternalDomains []string `yaml:"internal_domains"`
 	// TunnelResolve 决定「IP/GEOIP 规则触发的那次解析」是否经当前节点去问上游。
 	// **默认关闭**，而且建议保持关闭——见下面那条实测。
 	//
@@ -299,6 +319,11 @@ type DNSConfig struct {
 	// 真正需要防污染的域名走的是域名规则，而判成 PROXY 的连接根本不解析——
 	// 域名原样交给节点远端解析（见 README §5），污染压根进不了那条判定。
 	TunnelResolve *bool `yaml:"tunnel_resolve"`
+}
+
+// InternalEnabled 是内网分层是否启用的读法。
+func (d DNSConfig) InternalEnabled() bool {
+	return len(d.InternalServers) > 0 && len(d.InternalDomains) > 0
 }
 
 // TunnelResolveOn 是显式开启的读法：没写或写 false 都不走隧道。
@@ -796,6 +821,17 @@ func (c *Config) applyDefaults() error {
 	if len(c.TUN.Helper) == 0 {
 		c.TUN.Helper = nil
 	}
+	// 内网分层同理：两个字段都带 omitempty，且**成对**参与判定
+	// （InternalEnabled 要求两个都非空）。归一成 nil 而不是空切片，
+	// 否则 Save→Load 之后 nil 变 []，reflect.DeepEqual 立刻失败——
+	// 而那份"前/后不等价"的报错会把真正的问题（空切片与 nil 的区别）
+	// 埋在一大坨结构体打印里。
+	if len(c.DNS.InternalServers) == 0 {
+		c.DNS.InternalServers = nil
+	}
+	if len(c.DNS.InternalDomains) == 0 {
+		c.DNS.InternalDomains = nil
+	}
 	for i := range c.Inbounds {
 		if c.Inbounds[i].Type == "socks5" && c.Inbounds[i].Listen == "" {
 			c.Inbounds[i].Listen = "127.0.0.1:7891"
@@ -975,6 +1011,29 @@ func (c *Config) Validate() error {
 	for _, s := range c.DNS.Servers {
 		if s == "" {
 			return fmt.Errorf("dns.servers contains empty entry")
+		}
+	}
+	// 内网分层只配了一半必须当场报错，而不是被装配层悄悄降级。
+	//
+	// 这条判据在 dnsx.NewWithInternal 里也有，但 newResolver 是"没启用就
+	// 直接走 dnsx.New"的写法：只配 internal_servers 时 InternalEnabled() 为假，
+	// 于是永远不会走到那句报错，内网分层按纯公网跑——用户以为配好了，
+	// 实际一次都没生效，而症状只是"某些内网服务时好时坏"。
+	// 放在 Validate 里，Load 的那一刻就挡住。
+	if len(c.DNS.InternalServers) > 0 && len(c.DNS.InternalDomains) == 0 {
+		return fmt.Errorf("dns: 配了 internal_servers 却没有 internal_domains，内网分层不会生效——补齐后缀，或把两边都删掉")
+	}
+	if len(c.DNS.InternalDomains) > 0 && len(c.DNS.InternalServers) == 0 {
+		return fmt.Errorf("dns: 配了 internal_domains 却没有 internal_servers，这些域名会照常问公网上游——补齐上游，或把两边都删掉")
+	}
+	for _, s := range c.DNS.InternalServers {
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("dns.internal_servers contains empty entry")
+		}
+	}
+	for _, s := range c.DNS.InternalDomains {
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("dns.internal_domains contains empty entry")
 		}
 	}
 	if err := c.validateSysProxy(); err != nil {

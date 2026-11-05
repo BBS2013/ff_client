@@ -1086,13 +1086,58 @@ async function onProbeDNS(fresh: boolean, upstream: string): Promise<void> {
 // 只刷监视栏就会出现最难查的一幕——监视说"刚按新文件重载过"，
 // 下面那张表却还摆着旧名单，于是界面上一切看起来都对，内容是过期的。
 let timer = 0
+/**
+ * 在途保护：一轮还没回来就不再叠一轮。
+ *
+ * 这不是为了省几个请求，而是为了顺序：这一轮会打七次后端（规则、节点、
+ * 拦截、监视、订阅、警告、命中），慢的时候超过 5 秒是可能的。
+ * 没有这把锁时两轮会叠着跑，后发的先回就先把旧名单写进表里，
+ * 于是界面在"新 → 旧 → 新"之间跳，看起来像规则自己变回去了。
+ */
+let loading = false
+/**
+ * 窗口隐藏（托盘）时停表。
+ *
+ * 这一页是 v-if 挂卸的，但用户停在规则页再点关闭窗口时组件并不会卸载
+ * （gui.go 是 HideWindowOnClose），于是那七次调用照旧每 5 秒打一次后端，
+ * 而人根本看不见这一页。隐藏期间唯一在长的东西是日志。
+ */
+let hidden = false
+
+async function tick(): Promise<void> {
+  if (loading || hidden) {
+    return
+  }
+  loading = true
+  try {
+    await load()
+  } finally {
+    loading = false
+  }
+}
+
+function onVisibility(): void {
+  const wasHidden = hidden
+  hidden = document.hidden
+  // 重新显示时立刻补一轮：隐藏期间磁盘上可能已经改过了，
+  // 让人盯着 5 秒前的旧表没意义。
+  if (wasHidden && !hidden) {
+    void tick()
+  }
+}
+
 onMounted(() => {
-  void load()
-  timer = window.setInterval(() => void load(), 5000)
+  hidden = document.hidden
+  void tick()
+  timer = window.setInterval(() => void tick(), 5000)
+  document.addEventListener('visibilitychange', onVisibility)
+  window.addEventListener('focus', onVisibility)
 })
 onBeforeUnmount(() => {
   // 这一页是 v-if 挂卸的：不摘定时器，切走之后它还在每 5 秒敲一次后端。
   window.clearInterval(timer)
+  document.removeEventListener('visibilitychange', onVisibility)
+  window.removeEventListener('focus', onVisibility)
 })
 </script>
 

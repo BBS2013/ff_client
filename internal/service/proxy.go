@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"wps_app/internal/config"
-	"wps_app/internal/dnsx"
 	"wps_app/internal/logx"
 	"wps_app/internal/outbound"
 )
@@ -39,7 +38,7 @@ func (s *Service) nodeDialer(name string) (outbound.Conn, error) {
 	if resolve == nil {
 		// 兜底与测速那条路一致：解析节点域名必须走直连 DNS，
 		// 否则 TUN 开着时会把自家网卡的假 IP 当节点地址去拨。
-		r, err := dnsx.New(cfg.DNS.Servers, cfg.DNS.Timeout.Duration, cfg.DNS.Cache.Duration)
+		r, err := newResolver(cfg)
 		if err != nil {
 			return nil, err
 		}

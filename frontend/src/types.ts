@@ -158,6 +158,22 @@ export interface TUNStatus {
   killV6: boolean
   /** 没挂上（或只挂上一族）的原因；killEnabled 为真而这里非空 = 用户以为有、实际没有 */
   killReason: string
+  /**
+   * 系统解析器的查询到底进不进 tun：
+   * yes=实测收得到；no=收不到（TUN 对不认代理环境变量的程序形同关闭）；
+   * taken-over=本来收不到、已被面板把系统解析器改接过来；
+   * unverified=验不出来（没有 resolvectl 或解析器没回答），也没动过系统。
+   *
+   * 四档而不是布尔：「没验过」与「验出没生效」是两句话，
+   * 只有后者需要用户动手，而把它们合成一格就会在最该说清楚的场合含糊。
+   */
+  resolverFeeds: string
+  /** 配着上面那句的证据：探针域名与答案，或者失败原因 */
+  resolverDetail: string
+  /** 接管过才有值：改的是哪张 link */
+  resolverLink: string
+  /** 接管过才有值：原上游。还原只能靠它——`resolvectl revert` 会把这条 link 直接掏空 */
+  resolverPrev: string[]
 }
 
 export interface SystemProxyStatus {

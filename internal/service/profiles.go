@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"wps_app/internal/config"
-	"wps_app/internal/dnsx"
 	"wps_app/internal/httpprobe"
 	"wps_app/internal/logx"
 	"wps_app/internal/outbound"
@@ -638,7 +637,7 @@ func (s *Service) testProfileCore(name, target string) ProfileTest {
 	split := s.split
 	s.mu.Unlock()
 	if resolve == nil {
-		r, rerr := dnsx.New(cfg.DNS.Servers, cfg.DNS.Timeout.Duration, cfg.DNS.Cache.Duration)
+		r, rerr := newResolver(cfg)
 		if rerr != nil {
 			res.Error = rerr.Error()
 			return res

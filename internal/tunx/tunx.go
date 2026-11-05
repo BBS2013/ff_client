@@ -47,6 +47,10 @@ type Options struct {
 	// Upstreams 是本进程用来解析的上游 DNS（IP 字面量列表）。
 	// 开劫持时必须放行它们，理由见 RoutePlan.Upstreams。
 	Upstreams []string
+	// ConfigPath 只用来推导「接管系统解析器」那笔账落在哪：与 sysproxy 的状态文件
+	// 同一套路，都在配置文件旁边，重定向配置文件就一起搬家。
+	// 留空即不落盘——内存里那份账仍够 Stop 还原，只是兜不住 kill -9。
+	ConfigPath string
 }
 
 // Status 是 TUN 的只读状态投影，直接交给 GUI。
@@ -119,6 +123,24 @@ type Status struct {
 	KillEnabled bool `json:"killEnabled"`
 	// KillReason 是「为什么没挂上 / 只挂上了一族」，挂全了为空。
 	KillReason string `json:"killReason,omitempty"`
+	// ResolverFeeds 说清系统解析器的查询到底进不进 tun：
+	// yes=实测收得到；no=收不到（TUN 对不认代理的程序形同关闭）；
+	// taken-over=本来收不到、已被我们改接过来；unverified=验不出来，也没动过系统。
+	// 四档必须分得开：「没验过」与「验出没生效」是两句话，而只有后者
+	// 需要用户改配置或接受一次接管；合成布尔值就会在最该说清楚的那一档含糊。
+	ResolverFeeds string `json:"resolverFeeds"`
+	// ResolverDetail 是配着上面那句用的证据：探针域名与答案，或失败原因。
+	ResolverDetail string `json:"resolverDetail,omitempty"`
+	// ResolverLink / ResolverPrev 只在接管过时有值：改了哪张 link、原值是什么。
+	// 出问题时用户要能不问一句就知道自己该执行什么命令写回去。
+	//
+	// ResolverPrev **不能**带 omitempty：DHCP 下发的上游清单可以合法为空
+	// （TestRestoreRevertsOnlyWhenPrevWasEmpty 造的就是这一档），而 omitempty
+	// 会让这个键在 JSON 里整个消失，前端那句 `.join(' ')` 就变成对 undefined
+	// 求方法——接管且原上游为空时总览页整页渲染失败。空数组是"接管过、
+	// 原来没有上游"，与"没接管过"要靠 ResolverLink 区分，不能靠键在不在。
+	ResolverLink string   `json:"resolverLink,omitempty"`
+	ResolverPrev []string `json:"resolverPrev"`
 }
 
 // TUN 是一块虚拟网卡加挂在它上面的用户态协议栈。
@@ -132,7 +154,11 @@ type TUN struct {
 	bypass []string
 	// upstreams 是劫持规则要放行的 DNS 上游（New 里已过滤成 IP 字面量）。
 	upstreams []string
-	helper    HelperClient
+	// configPath 交给 resolver 那一段推导状态文件位置。
+	configPath string
+	// resolver 是「系统解析器的查询到底进不进 tun」这一段的状态，受 mu 保护。
+	resolver resolverState
+	helper   HelperClient
 	// blockedHold 是被拦连接的最长挂起时间，0 表示用 rules.BlockHold。
 	// 留成字段是为了让用例不必真等 75 秒。
 	blockedHold time.Duration
@@ -199,6 +225,15 @@ type TUN struct {
 }
 
 // New 只做参数校验与假 IP 表初始化，不碰系统。
+// helperArgvFor 决定这一次要不要绕提权 helper。root 自己能做，配置里
+// 即便还留着 tun.helper（例如从普通用户模式沿用下来的配置），也不该再叫 sudo。
+func helperArgvFor(uid int, configured []string) []string {
+	if uid == 0 {
+		return nil
+	}
+	return configured
+}
+
 func New(opt Options) (*TUN, error) {
 	if opt.Router == nil {
 		return nil, errors.New("tun: router 必填")
@@ -240,10 +275,15 @@ func New(opt Options) (*TUN, error) {
 		bypass: opt.Bypass,
 		// 提权命令来自配置，不在 Options 上再开一个口子：
 		// 两条来源迟早会不一致，而「到底走哪条特权路径」是排障时最不能含糊的一件事。
-		helper:    HelperClient{Argv: opt.Conf.Helper},
-		upstreams: upstreams,
-		fake:      fake,
-		dns:       &dnsServer{decide: opt.Router, lookup: opt.Lookup, fake: fake},
+		//
+		// 但 root 面板已经原生具备 CAP_NET_ADMIN，再绕一层 sudo 只会多一个
+		// 在无 tty 环境里可能卡住 PAM/pipe 的子进程（2026-11-03 关窗时 TUN
+		// 停用因此超时，nat 里的 DNS 劫持规则留了下来）。root 直接走本进程。
+		helper:     HelperClient{Argv: helperArgvFor(uid, opt.Conf.Helper)},
+		upstreams:  upstreams,
+		configPath: opt.ConfigPath,
+		fake:       fake,
+		dns:        &dnsServer{decide: opt.Router, lookup: opt.Lookup, fake: fake},
 	}, nil
 }
 
@@ -274,6 +314,13 @@ func (t *TUN) Start(ctx context.Context) error {
 			t.lastErr = err
 			return err
 		}
+	}
+
+	// 上一次被 kill -9 的话，接管可能还挂在系统解析器上，而那块网卡早随进程消失了：
+	// 整机解析吊死在 tun 的 DNS 地址上。那个形状和「劫持没生效」完全不同，
+	// 但两者都会被当成「代理挂了」，所以先把账收回来再往下装。
+	if t.conf.DNSHijackEnabled() {
+		t.recoverResolverLedger(ctx)
 	}
 
 	// 无条件先清残留：上一次被 kill -9 的话，劫持规则还挂在 nat 表上，
@@ -314,6 +361,9 @@ func (t *TUN) Start(ctx context.Context) error {
 	t.publishTakeoverLocked(ctx)
 	if t.conf.DNSHijackEnabled() {
 		t.flushResolverCache(ctx)
+		// 装完必须验一次「别人的查询有没有进来」：劫持只在系统解析器把查询
+		// 发往一个没被豁免的地址时才成立，而那件事没人保证（理由见 resolver.go 顶部）。
+		t.checkResolverFeedsTUN(ctx)
 	}
 	logx.Infof("TUN 已启用: %s 地址 %s，假 IP %s，DNS 劫持点 %s:53",
 		t.conf.Device, t.conf.Address, t.conf.FakeIPRange, t.dnsAddress())
@@ -581,6 +631,9 @@ func (t *TUN) teardownLocked(ctx context.Context) error {
 		t.applied = nil
 		t.plan = RoutePlan{}
 	}
+	// 系统解析器是我们改的话要先写回去，再刷缓存：顺序反了会把假 IP 重新问出来
+	// 一遍，缓存里留下的还是那些进不了 tun 的地址。
+	t.restoreResolver(ctx)
 	// 劫持规则已经拆了，缓存里那些假 IP 现在只会把人送进一块不存在的网卡。
 	t.flushResolverCache(ctx)
 	return errors.Join(errs...)
@@ -626,6 +679,14 @@ func (t *TUN) Status() Status {
 		KillV6:      t.kill.V6,
 		KillEnabled: t.conf.KillSwitch,
 		KillReason:  t.kill.Reason,
+		// 这一格不 fork：checkResolverFeedsTUN 在 Start 的锁里已经问过系统解析器，
+		// 而面板每 1–2 秒轮一次状态——为一个展示字段再 fork 一轮 resolvectl，
+		// 等于把一次性证据变成常驻开销（与 takeover.go 同一纪律）。
+		ResolverFeeds:  t.resolver.reading(),
+		ResolverDetail: t.resolver.detail,
+	}
+	if l := t.resolver.ledger; l != nil {
+		st.ResolverLink, st.ResolverPrev = l.Link, l.Prev
 	}
 	if t.usesHelper() {
 		st.Privilege = "helper"

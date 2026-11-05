@@ -894,16 +894,17 @@ tun:
 
 开启需要特权（建网卡要 `CAP_NET_ADMIN`），有两条路：
 
-**① 面板以 root 起**——最省事，但代价是**托盘图标会消失**：
+**① 面板以 root 起**——TUN 与托盘现在都能有（2026-11-03 起）：
 
 ```bash
 sudo env DISPLAY=:0 XAUTHORITY=/run/user/1000/gnome-shell/Xauthority ./wps_app-gui config.yaml
 ```
 
-root 进程连不上普通用户的会话总线（D-Bus 策略按 uid 放行），`StatusNotifierItem` 注册不了，
-日志里是一行 `systray error: failed to connect to DBus`。
-后果不是"没图标"这么轻：`HideWindowOnClose` 让点 X 只隐藏窗口，没有托盘就等于没人能把它叫回来，
-看起来就像"关掉就没了"（进程其实还在转发）。
+root 进程自己仍然连不上普通用户的会话总线（D-Bus 策略按 uid 放行），
+但面板会拉起一个**桌面用户身份的托盘助手**（`wps_app-gui --tray-helper=...`），
+由它注册 `StatusNotifierItem`；菜单动作经本地 Unix socket 回传 root 面板。
+点 X = 隐藏到托盘：窗口消失但代理、TUN 与托盘继续跑；真正退出走托盘「退出」或 SIGTERM，
+那时才收系统代理、TUN 与入站端口并结束进程，托盘助手随 socket 关闭一起退出。
 
 **② 面板以普通用户起 + `tun.helper` 提权命令**——托盘与 TUN 兼得，这是桌面推荐姿势：
 
@@ -1938,7 +1939,7 @@ OK www.baidu.com:443 via DIRECT matched=GEOIP,CN,DIRECT
 用法: wps_app [选项] [配置文件]
   -c string            配置文件路径（也可写成唯一的位置参数）
   -check               只做连通性自检：连上服务端并逐个拨号后退出
-  -check-host value    自检目标地址，可重复给也可逗号分隔（默认 www.gstatic.com:443，见「多目标巡检」）
+  -check-host value    自检目标地址，可重复给也可逗号分隔（默认 www.gstatic.com:443，见「多目标巡检」）；给了它就等于 -check
   -check-fetch value   经隧道真的取一个页面（http/https URL，逗号分隔），状态码不是 2xx/3xx 即判失败；给了它就等于 -check
   -mode string         本次运行的分流模式：rule | global | direct（不写回配置文件）
   -sysproxy string     设置桌面系统代理：on | off | restore | status（写完即退出）
@@ -1969,7 +1970,7 @@ CLI 只有显式 `-log-file` 才写；`-pprof` 只接受回环地址，堆快照
 
 ```bash
 ./wps_app-gui config.yaml -sysproxy status   # 看当前后端、读数，以及欠不欠还原
-./wps_app-gui config.yaml -sysproxy on       # 写入
+./wps_app-gui config.yaml -sysproxy on       # 写入（需要面板正在运行，记账会交给面板）
 ./wps_app-gui config.yaml -sysproxy off      # 按改动前的读数还原
 ```
 
@@ -4088,7 +4089,7 @@ Xvfb 里开一个 WebKitGTK 窗，`hardware-acceleration-policy` 设成 `NEVER`�
   `SetTUNEnabled` 会先把 `enable` 写盘，于是 `enabled` 与 `running` 短暂错位——
   这个错位就是「关闭中…」，不需要前端另造一个状态；knob 则先按用户点下去的值显示，
   回读到了再换成真实状态。
-- 关闭窗口只是隐藏，代理与托盘继续跑；托盘「退出」或 SIGTERM 才会拆干净。
+- 点 X 隐藏到托盘：代理、TUN 与系统代理继续跑；真正退出走托盘「退出」或 SIGTERM，那时才先收系统代理指针、再拆 TUN 与入站端口，最后结束进程（2026-11-03 起，root 模式的托盘由桌面用户身份的助手代挂）。
 - **托盘菜单第一行是状态行**（禁用项，纯展示），每 2 秒刷一次，tooltip 同源：
   `运行中 7m · 规则 · 新加坡-1 · TUN wps-tun · 拦截 3` / `已停止 · 累计拦截 0` /
   `出错：装配节点失败: 认证被拒`。三条判据都是被测的（`internal/ui/statusline.go`）：
@@ -4521,7 +4522,7 @@ rule，剩下的 DIRECT 失败是那次切换之前**已经在拨**的连接，1
   桌面此刻是 `manual`。于是旧实例退出时按记账还原成 `none`，**并且把记账消费掉**——
   日志那句 `已按记账把桌面系统代理还原回原样，流量改为直连` 就是它。
   **后果**：浏览器现在是直连，要用户在面板里把「系统代理」拨一次（关→开）才恢复，
-  而且只有走这条路记账才归新实例自己持有。**别用 `./wps_app-gui -sysproxy on` 补**（那会把宿主记成 CLI）。
+  而且只有走这条路记账才归新实例自己持有。**2026-11-03 修**：`-sysproxy on` 现在要求面板正在运行，并把记账宿主交给面板（`sysproxy.AdoptLedger`），不会再记成 CLI。
 
 时间线：13:53:15 新实例起 → 13:53:16 `检测到旧实例 PID 272553…已发 SIGTERM` → 同一秒 `已接管` →
 13:53:22 `hysteria: 已连接`（**隧道断了 6 秒**）→ 期间真实流量已经在过（`http CONNECT play.googleapis.com [PROXY | DOMAIN-SUFFIX,googleapis.com,PROXY]`）。
@@ -5160,7 +5161,13 @@ Start 这条路（`service.go`）与运行期的 `applyPlan` 共用同一个判�
 **④ 那条通道后来又做成了"常驻"（2026-10-30 11:2x）**。一次性的 helper 每条流都要付一次
 `sudo` + 进程起落（实测 0.08~0.11s，其中 sudo 自己 0.04s），一分钟几十条就是几十次起落。
 于是 helper 改成**常驻子进程**（`wps_app-gui --dial-helper`，新增 `--dial-helper-connect`
-与 `--dial-helper-owner`）：面板保持一条 unix 连接，按需要"钉住的 socket"，一次都不再起进程。
+与 `--dial-helper-owner`）：进程只拉一次，每次拨号开一条短 unix 连接向它要 socket，
+一次都不再起进程。**（2026-11-03 修）** 最初这里让面板只保持一条连接、整次往返抱在
+一把互斥锁里，结果一条走不通的直连会把后面所有代理拨号一起堵到 25s 预算花完——
+现场用 `ccm-frontier-hl.feishu.cn`（直连）加 `www.google.com`（代理）复现：两条一起
+30s 超时。现在一次拨号一条连接，helper 侧本来就是每条连接一个 goroutine；
+`TestPersistentHelperDoesNotSerializeDials` 与 `TestPersistentHelperHonorsCallerDeadline`
+把这层钉住。
 三条边界照旧：**root 只造 socket，不终结 TLS**（面板与节点之间仍是端到端 TLS，root 看不到明文）；
 **目标必须是已解析的 ip:port 且在名单里**；**helper 盯着父进程**，面板一走它就收工
 （实测侧跑结束后 6 秒内自行退出，机器上不留 root 进程）。
@@ -5204,7 +5211,7 @@ Start 这条路（`service.go`）与运行期的 `applyPlan` 共用同一个判�
 |---|---|---|
 | 钉网卡 | 原生就行，不需要 helper | A53 的 root 侧跑 |
 | 系统代理 | **仍然生效** | `sudo -n -u chery … gsettings get org.gnome.system.proxy mode` 读得到值——`desktopPrefix()` 早就按 `$SUDO_USER` 落回桌面用户再写（`gnome.go` 顶上那段注释就是这个理由）。**"root 写不进 dconf"是错的**，此前把它当成了不转 root 的理由 |
-| 托盘 | **会没有** | `sudo -n env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus gdbus call --session …` → `Error connecting: The connection is closed`（两次同果）。会话总线按 EXTERNAL 认 uid，root 不是例外；托盘走的是 SNI，要的就是这条总线 |
+| 托盘 | **2026-11-03 起有** | root 进程自己仍连不上会话总线（EXTERNAL 认 uid），但面板现在拉起桌面用户身份的 `--tray-helper` 子进程，由它注册 SNI；`busctl --user list` 能看到 `StatusNotifierItem-… wps_app-gui` |
 
 再加一条不在表里的：面板是 WebKitGTK 进程，转 root 之后「root 只造 socket、不终结 TLS」这条边界
 就没了——用户浏览的明文对 root 可见，而这台机器上还跑着别人的第二个写入者共用的仓库产物。
@@ -5229,10 +5236,9 @@ sudo -n setsid nohup env HOME=/home/chery/wps_app DISPLAY=:0 \
   `192.168.0.104%wlx001f0578cdff`，经面板取页 `204 / 0.52s`。
 - **dial helper 一个都不起**（`ps` 里既无 `--dial-helper` 也无 `--tun-helper`）。换身份这一步本身又验了
   第二条链：普通权限实例优雅退出后 **4 秒内 helper 自收、`/tmp/wps_app-dial-helper-*` 清空**，机器上不留 root 进程。
-- **托盘按预测没了**：`14:31:15 systray error: failed to connect to DBus: dbus: connection closed by user`，
-  `busctl --user` 里 wps 的 `StatusNotifierItem` 归零。窗口本身在（`xdotool search --pid` 找到 2160×1440
-  `IsViewable` 那个），但应用是 `HideWindowOnClose`——**托盘没了，关掉窗口就没有任何东西能把它叫回来**，
-  只能杀进程重启。这条必须在用户面前说足。
+- **托盘后来补上了（2026-11-03）**：root 进程自己仍连不上会话总线，但面板会拉起
+  桌面用户身份的 `--tray-helper` 子进程，由它注册 SNI；`busctl --user list` 里能看到
+  `StatusNotifierItem-… wps_app-gui`。关窗口现在直接退出并收尾，不再隐藏进程。
 - 还有一条不在预测里、只有切换时才撞得上：**接管方向反了**——普通用户起的实例 kill 不动 root 面板，
   要回到 uid 1000 必须先 `sudo` 停掉这一个。
 
@@ -5308,11 +5314,11 @@ root 这台失败 **0 条、成功 17 条**。也就是说**内置卡上的钉�
 | iptables 报 `unexpected ! flag before --match` | `!` 必须写在 `-m owner` 之后：`-m owner ! --uid-owner 0` |
 | 本机 hysteria2 服务端 + TUN 客户端同机，连接疯狂重建 | 服务端解析域名拿到我们发的假 IP，连接被路由回 tun 形成环路。换一台机器当服务端，或让服务端以 root 跑并用独立的 resolv.conf。trojan 节点同理，且它的环路表现为「目标连不上」而不是重连风暴 |
 | 切换模式后部分站点仍按旧路由走，或某个被污染过的域名一直连不上 | **systemd-resolved 的缓存在作怪**：它可能还留着劫持生效前拿到的伪造 IP（例如 `www.google.com → 104.244.42.197` / `2001::1`），命中缓存就不会向上游发查询，我们也就没有机会改判它。`sudo resolvectl flush-caches` 后立刻恢复成假 IP。假 IP 本身 TTL 只有 60s，浏览器自己的 DNS 缓存要另算 |
-| TUN 起不来，日志说缺权限 | 两条路：`sudo ./wps_app-gui`（但托盘会没，见 §4.3），或普通用户起面板 + 配 `tun.helper` 提权命令（推荐）。面板 TUN 卡片的「最近错误」与原样显示原因，「特权路径」一行告诉你当前走的是哪条 |
+| TUN 起不来，日志说缺权限 | 两条路：`sudo ./wps_app-gui`（2026-11-03 起托盘由桌面用户身份的助手代挂，见 §4.3），或普通用户起面板 + 配 `tun.helper` 提权命令（推荐）。面板 TUN 卡片的「最近错误」与原样显示原因，「特权路径」一行告诉你当前走的是哪条 |
 | 明明配了免密 sudo，`tun.helper` 还是起不来 | 看**启动面板的那个 shell** 有没有 `NoNewPrivs: 1`（`grep NoNewPrivs /proc/self/status`）。带这个标志的进程（受限 shell、沙箱、部分 CI）fork 出来的子进程一律继承，setuid 的 `sudo` 直接失效，且**清不掉**。改在普通终端里起面板，或交给 `systemd-run --user` 起（用户服务不继承该标志） |
 | 日志/面板说 `helper 协议版本 N 不被支持（本程序是 M）`，TUN 怎么点都开不起来 | 这是**面板与 helper 不是同一个构建**（`make build-gui` 覆盖了 `tun.helper` 指着的那个文件，而老面板还在跑；或反过来）。面板那行现在直接说该动哪一边：M 比面板新就**用那个文件重启面板**，比面板旧就**用当前构建刷新那个文件**。重启之前 TUN 一定开不了，SOCKS5/HTTP 不受影响；见 §0.5 的 A41 与 ACCEPTANCE A41 |
 | 日志/面板说「没有去叫 root：…」 | A43 的预检在动 root 之前就拦下了：`tun.helper` 那个文件自报的提权协议与本程序不同，叫了也是白叫。同一句话会指出该重启面板还是该重新构建那个文件；想自己确认一眼就跑 `<那个文件> -version`，看它第二行报的协议号 |
-| 点了窗口 X 号，界面没了、又找不到托盘图标 | 十有八九是面板以 root 跑：root 连不上用户会话总线，`systray` 注册失败（日志第一行 `systray error: failed to connect to DBus`）。代理其实还在跑，`pgrep -x wps_app-gui` 能看到。改用 `tun.helper` 并以普通用户启动即可（§4.3） |
+| 点了窗口 X 号，界面没了、又找不到托盘图标 | 2026-11-03 起 root 面板会拉起桌面用户身份的托盘助手；先看 `pgrep -af -- '--tray-helper'` 和 `busctl --user list \| grep wps_app-gui`。没有助手时看日志「系统托盘桥不可用」；点 X 是隐藏到托盘，真正退出用托盘「退出」或 SIGTERM。 |
 | 起新实例报「锁被 PID xxx 占着…无法确认它是谁」 | 旧实例是 root 起的，普通用户既读不到它的 `/proc/<pid>/exe` 也 kill 不动它。用 sudo 启动新的，或先 `sudo kill <pid>`。同一用户起的实例会自动接管 |
 | 上次异常退出后本机 DNS 全超时 | nat 表里残留了劫持规则而网卡已消失。`sudo ./wps_app-gui -tun-reset`（正常启动时也会自动先清一遍） |
 | 端口被占用 | `ss -tlnp \| grep 7891` 看占用方，改 `inbounds` 里的 `listen` |

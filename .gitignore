@@ -8,6 +8,7 @@
 *.sysproxy.want
 *.log
 *.log.*
+/wps_app-gui.out
 
 # 构建产物
 /wps_app

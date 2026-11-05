@@ -194,6 +194,23 @@ func TestValidateErrors(t *testing.T) {
 			body: minimalYAML + "sysproxy:\n  backend: windows\n",
 			want: "sysproxy.backend",
 		},
+		{
+			// 只配了一半的内网分层以前能 Load 通过，然后被装配层悄悄降级成
+			// "纯公网"：用户以为配好了，实际一次都没生效。
+			name: "只配内网上游没有后缀",
+			body: minimalYAML + "dns:\n  internal_servers: [\"10.180.191.11\"]\n",
+			want: "internal_domains",
+		},
+		{
+			name: "只配内网后缀没有上游",
+			body: minimalYAML + "dns:\n  internal_domains: [\".corp.example\"]\n",
+			want: "internal_servers",
+		},
+		{
+			name: "内网上游有空项",
+			body: minimalYAML + "dns:\n  internal_servers: [\"\", \"10.180.191.11\"]\n  internal_domains: [\".corp.example\"]\n",
+			want: "internal_servers",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

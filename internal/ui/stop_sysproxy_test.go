@@ -65,6 +65,12 @@ type fakeGsettings struct {
 	onMode func(mode string)
 	// probeFails 用来模拟这台机器根本没有 gsettings（无桌面/CI/总线挂了）。
 	probeFails bool
+	// writesGoNowhere 模拟「命令返回成功，写却没落到桌面」：
+	// gsettings 写进 dconf 影子库时就是这样——退出码 0，读回来的还是原值。
+	writesGoNowhere bool
+	// readsFail 模拟「读命令本身失败」：D-Bus 卡住、dconf 服务不可达、后端超时。
+	// 与"读到了但值是 none"必须分得开：前者什么都不能断定，因此不能撤账。
+	readsFail bool
 }
 
 func newDesktop(mode, httpAddr, socksAddr string) *fakeGsettings {
@@ -155,6 +161,11 @@ func (f *fakeGsettings) Run(_ context.Context, args, _ []string) (string, error)
 		if i+3 >= len(args) {
 			return "", fmt.Errorf("假桌面的 get 参数不全: %v", args)
 		}
+		if f.readsFail {
+			// 模拟 D-Bus 卡住 / 后端超时：命令本身失败，桌面什么都没答。
+			// 这一档与"读到了但值是 none"必须分得开——前者什么都不能断定。
+			return "", fmt.Errorf("Failed to communicate with dconf service（假桌面）")
+		}
 		v, ok := f.vals[args[i+2]+"/"+args[i+3]]
 		if !ok {
 			return "", fmt.Errorf("schema %s 没有键 %s", args[i+2], args[i+3])
@@ -166,8 +177,10 @@ func (f *fakeGsettings) Run(_ context.Context, args, _ []string) (string, error)
 		}
 		key := args[i+2] + "/" + args[i+3]
 		val := args[i+4]
-		f.vals[key] = val
 		f.sets = append(f.sets, key+"="+val)
+		if !f.writesGoNowhere {
+			f.vals[key] = val
+		}
 		if key == schema+"/mode" && f.onMode != nil {
 			f.onMode(unq(val))
 		}

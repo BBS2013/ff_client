@@ -69,6 +69,22 @@ type Resolver struct {
 	timeout time.Duration
 	ttl     time.Duration
 
+	// internalServers 是「内网专用」的上游，与 servers 分开。
+	//
+	// 为什么要分开：公司内网的 DNS 对外网域名是会污染的（实测 www.google.com
+	// 被答成 157.240.7.20，落在 Facebook 段），而公网 DNS 对内网域名同样答不对
+	// （yfjira.mychery.com 被答成华为云 WAF 的公网入口 123.60.194.157，
+	// 拨过去只会拿到 418 拦截页）。两边各错一半，混在一个列表里互相竞速，
+	// 结果就是同一份配置在 1/3 的时间里不可用。
+	//
+	// 分层之后：内网域名的答案只从内网上游取，公网域名的答案只从公网上游取，
+	// 不存在竞速，也就不存在"看运气"。代价是要能判断"这个域名算不算内网"——
+	// 那由调用方通过 domain_suffixes 给出，不在解析器里猜。
+	internalServers []string
+	// domainSuffixes 是走内网上游的域名后缀（小写、带前导点）。
+	// 空表示不启用内网分层，所有域名都走公网上游。
+	domainSuffixes []string
+
 	// tunnel 未注入时，PathTunnel 自动退化成直连而不是报错：
 	// 规则判定拿不到 IP 会退到兜底策略，那比「隧道没起来所以整个分流不干活」好。
 	tunnel atomic.Pointer[TunnelDial]
@@ -84,6 +100,15 @@ type Resolver struct {
 
 // New 创建解析器。servers 为空时返回错误。
 func New(servers []string, timeout, ttl time.Duration) (*Resolver, error) {
+	return NewWithInternal(servers, nil, nil, timeout, ttl)
+}
+
+// NewWithInternal 创建解析器，并额外指定内网专用的上游与域名后缀。
+//
+// internalServers 为空时与 New 等价（不启用内网分层）。
+// domainSuffixes 为空时内网上游不会被使用——没有后缀就无从判断某个域名算不算内网，
+// 而"对所有域名都问内网 DNS"正是要避开的做法：内网 DNS 对外网域名是污染的。
+func NewWithInternal(servers, internalServers, domainSuffixes []string, timeout, ttl time.Duration) (*Resolver, error) {
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("dns: no upstream servers configured")
 	}
@@ -110,13 +135,60 @@ func New(servers []string, timeout, ttl time.Duration) (*Resolver, error) {
 	if len(clean) == 0 {
 		return nil, fmt.Errorf("dns: no valid upstream servers")
 	}
+	cleanInternal := cleanServers(internalServers)
+	cleanSuffix := cleanSuffixes(domainSuffixes)
+	// 有内网上游却没有后缀，等于内网上游永远不会被问到——那不如直接报错，
+	// 否则用户以为自己配好了内网分层，实际上它一次都没生效。
+	if len(cleanInternal) > 0 && len(cleanSuffix) == 0 {
+		return nil, fmt.Errorf("dns: 配了内网 DNS 上游却没有内网域名后缀，内网分层不会生效")
+	}
 	return &Resolver{
-		servers:  clean,
-		timeout:  timeout,
-		ttl:      ttl,
-		cache:    make(map[string]*cacheEntry),
-		inflight: make(map[string]*call),
+		servers:         clean,
+		internalServers: cleanInternal,
+		domainSuffixes:  cleanSuffix,
+		timeout:         timeout,
+		ttl:             ttl,
+		cache:           make(map[string]*cacheEntry),
+		inflight:        make(map[string]*call),
 	}, nil
+}
+
+// cleanServers 把上游列表洗成 host:port 形式，空项丢掉。
+func cleanServers(servers []string) []string {
+	clean := make([]string, 0, len(servers))
+	for _, s := range servers {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		host, port, err := net.SplitHostPort(s)
+		if err != nil {
+			host, port = s, "53"
+		}
+		clean = append(clean, net.JoinHostPort(host, port))
+	}
+	return clean
+}
+
+// cleanSuffixes 洗后缀列表：统一小写、补前导点、去重。
+func cleanSuffixes(suffixes []string) []string {
+	out := make([]string, 0, len(suffixes))
+	seen := make(map[string]bool)
+	for _, s := range suffixes {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		if !strings.HasPrefix(s, ".") {
+			s = "." + s
+		}
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // SetTunnel 注入（或传 nil 清掉）隧道拨号器。
@@ -515,6 +587,118 @@ func (r *Resolver) hasServer(want string) bool {
 	return false
 }
 
+// hasInternalAddr 判断这批地址里有没有"内网地址"。
+//
+// 判据是 RFC1918（10/8、172.16/12、192.168/16）、CGNAT（100.64/10）与 ULA（fc00::/7）。
+//
+// 为什么不把回环（127/8）算进来：回环地址是**环路信号**，不是内网地址。
+// 解析器一旦把域名答成 127.0.0.1，连接就会回到本机——
+// direct.go 的 checkLoop 只能挡住"拨自己的入站端口"，挡不住"拨本机的另一个服务"。
+// 把它当内网答案等于把污染放进来，正是这一层要防的事。
+//
+// 链接本地（169.254/16、fe80::/10）同样排除：它只在链路上有意义，
+// 跨路由器不可达，与"公司内网服务"不是一回事。
+func hasInternalAddr(addrs []netip.Addr) bool {
+	for _, a := range addrs {
+		if isInternalAddr(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// internalPrefixes 是"内网地址"对应的网段：
+// RFC1918（10/8、172.16/12、192.168/16）、CGNAT（100.64/10）与 ULA（fc00::/7）。
+//
+// 刻意不含回环（127/8）与链接本地（169.254/16、fe80::/10）：
+// 前者是环路信号，后者只在链路上有意义，与"公司内网服务"不是一回事。
+var internalPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("fc00::/7"),
+}
+
+// isInternalAddr 判断单个地址是不是内网地址（不含回环与链接本地）。
+func isInternalAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	if a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() {
+		return false
+	}
+	for _, p := range internalPrefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// prioritizeInternal 把内网地址排到候选集前面，公网地址保留在后面。
+//
+// 不丢弃公网地址：多地址重试（direct.go 的 preferV4）需要完整候选集，
+// 内网地址连不上时仍应有机会试公网那一条。
+func prioritizeInternal(addrs []netip.Addr) []netip.Addr {
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if isInternalAddr(a) {
+			out = append(out, a)
+		}
+	}
+	for _, a := range addrs {
+		if !isInternalAddr(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// serversFor 决定这个域名该问哪些上游。
+//
+// 内网后缀的域名走内网上游，其余走公网上游。两组不混在一起：
+// 混在一起就是"谁先回来谁说了算"，而两边的答案各错一半（见 query 的注释）。
+//
+// 内网 DNS 对外网域名是污染的（实测 www.google.com 被答成 Facebook 段），
+// 公网 DNS 对内网域名也是错的（实测 yfjira.mychery.com 被答成 WAF 公网入口）。
+// 所以**分组是按域名走的，不是按答案走的**——
+// 不去猜"这个答案像不像内网地址"，而是先由配置说清哪些域名算内网。
+func (r *Resolver) serversFor(host string) []string {
+	servers, _ := r.routeFor(host)
+	return servers
+}
+
+// routeFor 在 serversFor 之上多答一句「这是不是内网那一层」。
+//
+// 裁决规则必须按层分开，所以调用方不能只看上游列表：两层拿到的是两个不同的
+// 切片，但真正决定语义的是"这组上游属不属于内网"。用一个布尔值说出来，
+// 比让 query 去比切片地址（或再调一次 serversFor 猜）可靠。
+func (r *Resolver) routeFor(host string) (servers []string, internal bool) {
+	if len(r.internalServers) == 0 || len(r.domainSuffixes) == 0 {
+		return r.servers, false
+	}
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	for _, suffix := range r.domainSuffixes {
+		if h == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(h, suffix) {
+			return r.internalServers, true
+		}
+	}
+	return r.servers, false
+}
+
+// InternalServers 是内网专用的上游列表（按配置的顺序）。
+func (r *Resolver) InternalServers() []string {
+	out := make([]string, len(r.internalServers))
+	copy(out, r.internalServers)
+	return out
+}
+
+// DomainSuffixes 是走内网上游的域名后缀。
+func (r *Resolver) DomainSuffixes() []string {
+	out := make([]string, len(r.domainSuffixes))
+	copy(out, r.domainSuffixes)
+	return out
+}
+
 // Servers 是配置里那几个上游，按配置的顺序。
 // 面板要能把"问的是哪几个"写出来，而它不该自己去猜顺序。
 func (r *Resolver) Servers() []string {
@@ -523,39 +707,121 @@ func (r *Resolver) Servers() []string {
 	return out
 }
 
-// query 并行查询所有上游，任一成功即采用其结果。
+// query 并行查询同一层的所有上游，然后裁决。
+//
+// 旧语义是「任一成功即采用」——那等于拼延迟。实测（公司内网 + 公网双栈）：
+//
+//	127.0.0.53  ~23ms   -> 172.25.51.92    （公司内网真实地址）
+//	119.29.29.29 ~30ms  -> 123.60.194.157  （华为云 WAF 入口，回 418 拦截页）
+//	223.5.5.5   ~42ms   -> 123.60.194.157
+//
+// 三家都"成功"（都给出了合法地址），于是谁先回来谁说了算：
+// 30 次实测里内网地址只赢了 20 次。**失败的 1/3 不是偶发抖动**——
+// 答案会被 5 分钟 TTL 缓存黏住，坏答案一进来，接下来 5 分钟全部拨 WAF 入口，
+// 表现是日志里一片 DIRECT、页面全是「访问被拦截！」。
+//
+// 现在是两层，各走各的上游，互不竞速：
+//
+//	内网后缀的域名 -> 只问 internalServers（公司 DNS）
+//	其余域名      -> 只问 servers（公网 DNS）
+//
+// 裁决规则**按层不同**，这是这条函数里最容易改错的一处：
+//
+//	内网层：私有段（RFC1918 / CGNAT / ULA）只有公司 DNS 才会给，所以出现私有
+//	       地址就直接用它，不必等其余上游。层内没有私有地址时才退回"先到先得"。
+//	公网层：私有地址恰恰是污染的典型手法（把域名指到 10.x 或回环），所以**不**
+//	       让私有地址赢；第一份非空的公网答案就是答案。
+//
+// 两条共同点：拿到第一个可用答案就返回，不再等其余上游。等齐所有上游等于把
+// 未命中延迟从"最快的那家"变成"最慢的那家"——有一家上游黑洞时每次未命中都要
+// 打满 timeout，而这段时间里已经拿到的正确答案被白白丢掉。
+//
+// 回环地址不参与内网优先：127.0.0.1 是环路信号（见 direct.go 的 checkLoop），
+// 把它当成"内网答案"会把连接引回本机。
 func (r *Resolver) query(ctx context.Context, host string, path Path) ([]netip.Addr, error) {
+	servers, internal := r.routeFor(host)
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("dns %s: 没有可用的上游", host)
+	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	// cancel 不只是省资源：第一份可用答案到手后，其余上游的查询还挂在 ctx 上，
+	// 它们要么拖住 net.Resolver 的连接，要么在我们已经返回之后才醒来。
 	defer cancel()
 
 	type result struct {
 		addrs []netip.Addr
 		err   error
 	}
-	results := make(chan result, len(r.servers))
-	for _, srv := range r.servers {
+	results := make(chan result, len(servers))
+	for _, srv := range servers {
 		go func(server string) {
 			ips, err := r.queryOne(ctx, server, host, path)
 			results <- result{addrs: ips, err: err}
 		}(srv)
 	}
 
-	var lastErr error
-	for range r.servers {
+	var (
+		lastErr  error
+		best     []netip.Addr
+		haveBest bool
+		// polluted 记住公网层看到的私有地址。它不参与裁决，只作最后兜底：
+		// 所有上游都给私有地址时（分裂视野的域名确实存在）总比解析失败强。
+		polluted     []netip.Addr
+		havePolluted bool
+	)
+	for range servers {
 		select {
 		case res := <-results:
-			if res.err == nil && len(res.addrs) > 0 {
-				return res.addrs, nil
-			}
 			if res.err != nil {
 				lastErr = res.err
+				continue
 			}
+			if len(res.addrs) == 0 {
+				continue
+			}
+			// 内网层：私有地址胜出，直接用它，不必等其余上游。
+			if internal {
+				if hasInternalAddr(res.addrs) {
+					return prioritizeInternal(res.addrs), nil
+				}
+				if !haveBest {
+					best, haveBest = res.addrs, true
+				}
+				continue
+			}
+			// 公网层：私有地址**不是**答案，是污染的典型形状（把域名指到 10.x）。
+			// 记下来兜底，继续等一份像样的公网答案——但绝不为它提前返回。
+			if hasInternalAddr(res.addrs) {
+				if !havePolluted {
+					polluted, havePolluted = res.addrs, true
+				}
+				continue
+			}
+			// 公网层的第一份非空公网答案就是答案，与旧语义一致。
+			return res.addrs, nil
 		case <-ctx.Done():
+			// 已经拿到过可用答案时绝不能把它丢掉：超时只是"其余上游没回"，
+			// 不是"这次解析失败"。丢掉它等于让调用方为一次成功的解析再付一次失败。
+			if haveBest {
+				logx.Debugf("dns: %s 有上游未在 %v 内应答，采用先到的答案 %v", host, r.timeout, best)
+				return best, nil
+			}
+			if havePolluted {
+				logx.Debugf("dns: %s 只拿到公网上游给的私有地址 %v（可能是污染），按兜底采用", host, polluted)
+				return polluted, nil
+			}
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
 			return nil, fmt.Errorf("dns %s: %w", host, lastErr)
 		}
+	}
+	if haveBest {
+		return best, nil
+	}
+	if havePolluted {
+		logx.Debugf("dns: %s 所有公网上游都只给了私有地址 %v（可能是污染），按兜底采用", host, polluted)
+		return polluted, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no answer")
@@ -638,6 +904,13 @@ collect:
 			return nil, lastErr
 		case <-ctx.Done():
 			timer.Stop()
+			// 整个 query 的预算用完了，但这一台上游可能已经把答案给了
+			// （A 回来了、AAAA 还在路上，正是最常见的形状）。把拿到的那份交出去：
+			// 让一次已经成功的解析因为"另一个族没回"变成失败，等于把
+			// 上游的慢算成目标不可达，而调用方还要为它再付一次重试。
+			if len(out) > 0 {
+				break collect
+			}
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}

@@ -101,20 +101,67 @@ func ledgerLogLine(prev, next SysProxyLedger) string {
 }
 
 // desktopPointsAtUs 读一次桌面设置，只为回答"这组设置是不是我们该负责的"。
-//
-// 比的是配置里那两个入站地址。面板开关写的是**实际绑定**的地址（inboundAddrs），
-// 两者只有在 `listen: 127.0.0.1:0`（让内核分配端口）这种配置下才会不一致，
-// 那种情况下这一行会说"没有记账"而不是"没人负责还原"——少说一句，不会说错。
-// 读不到设置时同样按"不是我们的"处理：宁可少说一句，也不要凭一份读不出来的设置报警。
 func (a *App) desktopPointsAtUs() bool {
+	ok, _ := a.desktopPointsAtUsDetail()
+	return ok
+}
+
+// desktopPointsAtUsDetail 除了答案，还带一句"桌面现在写着什么"。
+//
+// 报错时用得上：只说"不是我们的"，用户无从判断是写歪了、读失败了，
+// 还是桌面真被别的程序改了。
+func (a *App) desktopPointsAtUsDetail() (bool, string) {
+	ok, detail, _ := a.desktopPointsAtUsProbe()
+	return ok, detail
+}
+
+// desktopPointsAtUsProbe 是 desktopPointsAtUsDetail 加上"读没读到"这一位。
+//
+// 三档必须分得开，因为调用方的动作完全不同：
+//
+//	读到了、是我们的   -> 继续
+//	读到了、不是我们的 -> 这次写入没生效，可以撤账
+//	**根本读不到**     -> 什么都不知道，绝不能撤账
+//
+// 第三档以前被并进第二档（"读不到就当不是我们的，免得冤枉人"），代价是：
+// dconf 慢半拍、一次 D-Bus 抖动、或者后端恰好超时，都会让一次**已经写上桌面**
+// 的开启被判失败，并把那份唯一的记账删掉。之后退出时就认不出桌面正指着我们，
+// 那个指向已关闭端口的死指针留在桌面上——而全机应用只会报「代理连接被拒绝」。
+func (a *App) desktopPointsAtUsProbe() (ok bool, detail string, readable bool) {
 	st, err := a.withTimeoutRead()
 	if err != nil {
-		// 三条后端的 Read 在读失败时都会把原因写进 st.Error，所以这里只看 err；
-		// 读不到就当不是我们的——凭一份读不出来的设置报警是冤枉人。
-		return false
+		return false, "读不到桌面设置：" + err.Error(), false
 	}
-	backend, httpAddr, socksAddr := a.sysProxyTarget()
-	return sysproxy.LikesOurs(st, sysproxy.Config{
-		Enable: true, Backend: backend, HTTPAddr: httpAddr, SOCKSAddr: socksAddr,
-	})
+	c := a.desktopExpect()
+	ok = sysproxy.LikesOurs(st, c)
+	return ok, fmt.Sprintf("桌面当前 mode=%s http=%s socks=%s（本客户端应是 http=%s socks=%s）",
+		st.Mode, st.HTTP, st.SOCKS, c.HTTPAddr, c.SOCKSAddr), true
+}
+
+// desktopExpect 给出"桌面该长什么样"。
+//
+// 比的是**实际在监听**的两个入站地址（服务跑着的时候），不是配置里声明的那些：
+// 面板开关写的是 inboundAddrs，拿配置里的地址去比，`listen: 127.0.0.1:0`
+// 那种配置下必然对不上，于是每次都判成"桌面不是我们的"——
+// 后果是退出时把用户的设置当成别人的乱还原。
+// 服务没跑的时候没有实际地址可问，退回配置里声明的地址，
+// 否则启动时"收回残留指针"那一路会永远失效。
+//
+// 两个入站各自补：只开了 socks5 时，http 那一格退回配置里的 :0 没有意义，
+// 而**已经对上的那一格绝不能跟着一起退**。以前是"缺一个就整份换成配置"，
+// 于是同一个"只开一种入站"的配置下，读回永远对不上 → 判成开启失败 →
+// 记账被删 → 退出时认不出桌面正指着我们，死指针留在桌面上。
+func (a *App) desktopExpect() sysproxy.Config {
+	c := a.sysProxyEnableConfig()
+	if c.HTTPAddr == "" || c.SOCKSAddr == "" {
+		_, cfgHTTP, cfgSOCKS := a.sysProxyTarget()
+		// 只补拿不到实际地址的那一格；拿得到的那一格保持实际值。
+		if c.HTTPAddr == "" {
+			c.HTTPAddr = cfgHTTP
+		}
+		if c.SOCKSAddr == "" {
+			c.SOCKSAddr = cfgSOCKS
+		}
+	}
+	return c
 }

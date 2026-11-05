@@ -24,7 +24,7 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution
+.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks
 
 all: build
 
@@ -50,11 +50,23 @@ frontend:
 	cd frontend && npm run build
 	./scripts/check-dist.sh
 
-## 单独验一次“index.html 引用的哈希资源真的在磁盘上”。
+## 单独验一次“index.html 引用的哈希资源真的在磁盘上、而且已入库”。
 ## 2026-11-02 的教训：只提交 tracked 文件时，index.html 会指向未跟踪的新 assets，
 ## go:embed 进二进制的页面直接白屏；这个检查已挂在上面的 frontend 目标里。
+## 2026-11-05 同一形状又来了一次，所以它现在还会对照 git 索引（见脚本头）。
 dist-check:
 	@./scripts/check-dist.sh
+
+## 安装仓库自带的 git 钩子。不是 .git/hooks 里放一份副本就算数：
+## 钩子本身随仓库版本化（scripts/hooks/），装的这一步才是一次性动作。
+## 没有 .git（解压出来的源码包）时安静跳过，不当作错误。
+hooks:
+	@if [ -d .git/hooks ]; then \
+		install -m 0755 scripts/hooks/pre-commit .git/hooks/pre-commit; \
+		echo "已安装 pre-commit 钩子"; \
+	else \
+		echo "没有 .git，跳过钩子安装"; \
+	fi
 
 ## 前端纯函数测试 + 覆盖率闸门（format/ageclock/nodetests/probes）。
 ## 组件交互仍靠人工点验；这里守的是"算得对不对"。

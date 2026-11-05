@@ -175,6 +175,9 @@ func (s *Service) ProbeDNS(ctx context.Context, host string, fresh bool, upstrea
 	}
 	if cfg != nil {
 		out.Upstreams = append(out.Upstreams, cfg.DNS.Servers...)
+		// 内网上游一并列出：分层之后同一个域名只会问其中一组，
+		// 面板得让人看见"内网域名问的是公司 DNS"这件事真的配上了。
+		out.Upstreams = append(out.Upstreams, cfg.DNS.InternalServers...)
 	}
 	if err != nil {
 		out.Note = "没问到地址：" + err.Error()

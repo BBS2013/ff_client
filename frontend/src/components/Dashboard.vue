@@ -528,6 +528,29 @@ const split = computed(() => {
             只影响判成直连的域名（代理域名领假 IP，本来就不做解析）；上游恢复后自己就好，不需要重启。
           </span>
         </p>
+        <!-- 「TUN 已启用」不等于「本机流量进得来」：DNS 劫持只在系统解析器把查询
+             发往一个没被豁免的地址时才成立，而这件事没人保证——这台机器的唯一上游
+             恰好就在豁免清单里。它坏起来的样子是「面板全绿、应用连不通后端」，
+             所以这一格必须自己开口，不能只留在设置页里。 -->
+        <p
+          v-if="status.tun.running && status.tun.hijackDns && (status.tun.resolverFeeds === 'no' || status.tun.resolverFeeds === 'unverified')"
+          class="alert warn tail"
+        >
+          <template v-if="status.tun.resolverFeeds === 'no'">
+            系统解析器的查询没进 TUN：不认代理环境变量的程序仍从物理出口裸奔。
+          </template>
+          <template v-else> 没能验证系统解析器的查询有没有进 TUN（认代理的程序不受影响）。 </template>
+          <span class="mut">
+            {{ status.tun.resolverDetail }}。要手动接：resolvectl dns 网卡名 {{ status.tun.dns }}
+          </span>
+        </p>
+        <p v-else-if="status.tun.resolverFeeds === 'taken-over'" class="alert tail">
+          系统解析器已由面板改接到 {{ status.tun.dns }}（{{ status.tun.resolverLink }}，原为
+          {{ (status.tun.resolverPrev ?? []).join(' ') || '没有上游' }}）。
+          <span class="mut">
+            停用 TUN 会写回原值；中途被强杀时原值记在配置文件旁边的 resolver.state 里，下次启用会先收回来。
+          </span>
+        </p>
       </section>
 
       <section class="card">
@@ -794,6 +817,8 @@ const split = computed(() => {
 .switch-item {
   display: flex;
   align-items: center;
+  /* 说明文字长短不一，开关必须靠右对齐；只靠 gap 会让三个开关停在三条竖线上。 */
+  justify-content: space-between;
   gap: var(--sp-4);
   padding: 10px 0;
   border-bottom: 1px solid var(--line);

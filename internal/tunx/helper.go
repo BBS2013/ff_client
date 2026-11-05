@@ -194,6 +194,13 @@ func validIfaceName(s string) bool {
 	if s == "" || len(s) > 15 { // IFNAMSIZ-1，超了内核直接报错
 		return false
 	}
+	// 前导 '-' 一律拒绝：`ip ... dev -x` 与 `iptables -o -x` 里，
+	// iproute2 / iptables 会把以 '-' 开头的独立参数当成选项解析。
+	// 内核确实允许这种接口名（有人真建过），所以它不是"不可能发生的输入"，
+	// 而是"一旦出现就会让命令语义变形"的输入——这类必须在入口挡掉。
+	if strings.HasPrefix(s, "-") {
+		return false
+	}
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':

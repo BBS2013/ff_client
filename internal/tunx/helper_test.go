@@ -315,7 +315,9 @@ func TestTUNProvisionUsesHelperAndReleases(t *testing.T) {
 	conf.Helper = []string{"sudo", "-n", "./wps_app", "--tun-helper"}
 	rt := router.New(mustEngine(t), outbound.NewSet(outbound.NewDirect(time.Second), nil), time.Second)
 
-	tun, err := New(Options{Conf: conf, Router: rt, Upstreams: []string{"223.5.5.5"}})
+	// 同 helper_mismatch_test.go：显式非 root，确保测的是 helper 分支。
+	uid := 1000
+	tun, err := New(Options{Conf: conf, Router: rt, UID: &uid, Upstreams: []string{"223.5.5.5"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,6 +336,7 @@ func TestTUNProvisionUsesHelperAndReleases(t *testing.T) {
 		Open:    func(string) (int, error) { return devFD, nil },
 		MTU:     func(string) (uint32, error) { return uint32(conf.MTU), nil },
 		Timeout: 5 * time.Second,
+		PeerUID: func(*net.UnixConn) (int, error) { return 1000, nil },
 	})
 
 	plan, err := tun.buildPlan(context.Background())

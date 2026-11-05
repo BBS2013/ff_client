@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"wps_app/internal/config"
@@ -34,12 +35,24 @@ func (s *Service) startTUN(cfg *config.Config) error {
 	}
 
 	t, err := tunx.New(tunx.Options{
-		Conf:      cfg.TUN,
-		Router:    rt,
-		Lookup:    resolve.LookupIP,
-		Reg:       reg,
-		Bypass:    s.selfEgressIPs(cfg, resolve),
-		Upstreams: append([]string(nil), cfg.DNS.Servers...),
+		Conf:   cfg.TUN,
+		Router: rt,
+		Lookup: resolve.LookupIP,
+		Reg:    reg,
+		Bypass: s.selfEgressIPs(cfg, resolve),
+		// Upstreams 是 iptables 放行清单：发往这些地址的 :53 查询原样放行，
+		// 不被自己的劫持规则改写。
+		//
+		// 内网上游必须一起列进来——否则解析器问公司 DNS 的那条查询会被
+		// 自己劫持到 tun 的 DNS 上，形成"问自己"的环（route.go 的 RETURN 规则
+		// 只按这份清单放行）。公网上游原本就在清单里，内网上游是新增的那一半。
+		// 清单与 strict_route 的绕行路由共用 resolverUpstreamHosts，
+		// 免得"两处该一致"只靠注释守着（那里漏过内网那一半）。
+		Upstreams: resolverUpstreamHosts(cfg),
+		// 接管系统解析器那笔账落在配置文件旁边：换配置文件就等于换一台机器的账本。
+		// 而这份清单（公网+内网上游）正是劫持收不到查询时要去核对的那一半，
+		// 两者由同一个配置推导，不该在两个地方各写一遍。
+		ConfigPath: s.ConfigPath(),
 	})
 	if err != nil {
 		return err
@@ -116,14 +129,45 @@ func (s *Service) selfEgressIPs(cfg *config.Config, resolve *dnsx.Resolver) []st
 			logx.Warnf("TUN: 解析代理服务端 %s 失败，strict_route 的防环路路由不完整: %v", host, rerr)
 		}
 	}
-	for _, srv := range cfg.DNS.Servers {
-		h, _, serr := net.SplitHostPort(srv)
-		if serr != nil {
-			h = srv
-		}
-		if ip := net.ParseIP(h); ip != nil {
+	for _, srv := range resolverUpstreamHosts(cfg) {
+		if ip := net.ParseIP(srv); ip != nil {
 			out = append(out, ip.String())
 		}
+	}
+	return out
+}
+
+// resolverUpstreamHosts 列出解析器会去连的上游主机（已剥掉端口，未过滤成 IP）。
+//
+// 为什么要有这一处：同一份上游清单在两处被用到，而"两处该一致"这件事
+// 只靠注释守着是不够的——
+//   - iptables 的放行清单（tunx 的 Upstreams）：发往这些地址的 :53 原样放行，
+//     否则解析器问上游的查询会被自己的劫持规则改写，形成"问自己"；
+//   - strict_route 的绕行路由（selfEgressIPs）：这些地址必须钉回物理网关，
+//     否则接管默认路由之后，连上游 DNS 的包也会进 tun。
+//
+// 以前后一处只用了 cfg.DNS.Servers（公网那一半），内网上游只进了前一处。
+// 结果是在默认关闭的 strict_route 下开内网分层：公网 DNS 有绕行、内网 DNS 没有，
+// 于是问公司 DNS 的查询进了 tunnel，而它恰恰是内网域名唯一能问的那条路。
+// 按配置里"内网上游是公网上游之外的另一半"这个事实，两处都该是全集。
+func resolverUpstreamHosts(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	all := make([]string, 0, len(cfg.DNS.Servers)+len(cfg.DNS.InternalServers))
+	all = append(all, cfg.DNS.Servers...)
+	all = append(all, cfg.DNS.InternalServers...)
+	out := make([]string, 0, len(all))
+	for _, srv := range all {
+		srv = strings.TrimSpace(srv)
+		if srv == "" {
+			continue
+		}
+		h, _, err := net.SplitHostPort(srv)
+		if err != nil {
+			h = srv
+		}
+		out = append(out, h)
 	}
 	return out
 }

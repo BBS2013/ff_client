@@ -262,3 +262,23 @@ func listenPort(listen string) string {
 	}
 	return listen
 }
+
+// LiveInstance 返回这份配置当前正在运行的面板（PID 与可执行路径）。
+//
+// 只认锁文件里那个 PID，并再次确认它确实是本程序；没有就返回 ok=false。
+// CLI 的 `-sysproxy on` 用它把系统代理记账交给真正的宿主，而不是交给
+// 一个写完就退出的命令行进程（见 sysproxy.AdoptLedger）。
+func LiveInstance(configPath string) (pid int, exe string, ok bool) {
+	pid = lockHolderPID(configPath)
+	if pid <= 0 || pid == os.Getpid() || !processAlive(pid) {
+		return 0, "", false
+	}
+	id, err := identifyProcess(pid)
+	if err != nil || !id.same {
+		return 0, "", false
+	}
+	if id.precise {
+		exe = id.desc
+	}
+	return pid, exe, true
+}

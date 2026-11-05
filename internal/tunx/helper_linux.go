@@ -36,6 +36,18 @@ type HelperServer struct {
 	MTU func(name string) (uint32, error)
 	// Timeout 是单个请求的处理上限，默认 20s。
 	Timeout time.Duration
+	// PeerUID 读连接对端的 uid；nil 即内核 SO_PEERCRED。
+	//
+	// 单测以 root 跑时，进程内 helper 的对端恒为 0，而用例为了走 helper
+	// 分支会把计划里的 uid 钉成普通用户；这是测试环境差异，不是被测行为。
+	PeerUID func(*net.UnixConn) (int, error)
+}
+
+func (h *HelperServer) peerUID(conn *net.UnixConn) (int, error) {
+	if h.PeerUID != nil {
+		return h.PeerUID(conn)
+	}
+	return peerUID(conn)
 }
 
 func (h *HelperServer) open(name string) (int, error) {
@@ -87,7 +99,7 @@ func (h *HelperServer) serveRequest(conn *net.UnixConn) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	_ = conn.SetDeadline(deadline)
 
-	peer, perr := peerUID(conn)
+	peer, perr := h.peerUID(conn)
 
 	raw, err := readFrame(conn)
 	if err != nil {
@@ -429,6 +441,16 @@ func (c HelperClient) Run(ctx context.Context, req HelperRequest) (HelperReply, 
 	if timeout <= 0 {
 		timeout = 25 * time.Second
 	}
+	// 调用方的 ctx 也必须参与预算：TUN 停用只给 15s，helper 自己再等 25s
+	// 会让一次正常退出卡过接管窗口，旧实例被 kill -9 后留下半拆的 TUN。
+	if deadline, ok := ctx.Deadline(); ok {
+		if left := time.Until(deadline); left < timeout {
+			timeout = left
+		}
+	}
+	if timeout <= 0 {
+		return HelperReply{}, -1, ctx.Err()
+	}
 
 	dir, err := os.MkdirTemp("", "wps_app-tun-helper-") // MkdirTemp 的目录就是 0700，属主是本进程 uid
 	if err != nil {
@@ -514,6 +536,8 @@ func (c HelperClient) Run(ctx context.Context, req HelperRequest) (HelperReply, 
 	var res acceptResult
 	select {
 	case res = <-done:
+	case <-ctx.Done():
+		res = acceptResult{err: ctx.Err()}
 	case <-time.After(timeout):
 		res = acceptResult{err: errors.New("等 helper 连接超时")}
 	}

@@ -37,7 +37,10 @@ var distFS embed.FS
 // 把内嵌那份前端交给 ui 包，让设置页能报出"界面是哪一份构建"（internal/ui/buildinfo.go）。
 // 在这里赋值而不是让 ui 包自己 embed：界面文件只存在于带 gui 标签的构建里，
 // 而 ui 包要在没有那个标签的测试里也能编译。
-func init() { ui.DistFS = distFS }
+func init() {
+	ui.DistFS = distFS
+	runTrayHelper = ui.RunTrayHelper
+}
 
 // guiDefault 让这份产物双击即出窗口。
 //
@@ -102,7 +105,13 @@ func runGUI(configPath, logFile string, logOpened bool) error {
 		systray.Quit()
 	}
 
-	go ui.RunTray(app, showWindow, shutdown)
+	// root 面板连不上桌面用户的会话总线，托盘由桌面用户身份的子进程显示；
+	// 普通用户启动时仍然同进程跑，少一个进程。
+	if os.Geteuid() == 0 {
+		go ui.RunTrayBridge(app, showWindow, shutdown)
+	} else {
+		go ui.RunTray(app, showWindow, shutdown)
+	}
 
 	// Ctrl+C 与 systemd 的 SIGTERM 走和托盘「退出」同一条路径，
 	// 这样托盘图标不会在进程死后留下幽灵项，入站端口也能正常释放。
@@ -159,7 +168,8 @@ func runGUI(configPath, logFile string, logOpened bool) error {
 				logx.Errorf("GUI 启动代理失败: %v", serr)
 			}
 		},
-		// 关窗口只是隐藏，代理与托盘继续跑——这是常驻控制面板的前提。
+		// 点 X 隐藏到托盘，代理、TUN 与系统代理继续跑。
+		// 真正退出走托盘「退出」、SIGTERM/SIGINT；那时才在 OnShutdown 里收尾。
 		HideWindowOnClose: true,
 		OnShutdown: func(context.Context) {
 			// Close 幂等（摘钩子置 nil、Stop 判空），与下面的兜底调用可共存。
@@ -167,6 +177,11 @@ func runGUI(configPath, logFile string, logOpened bool) error {
 				logx.Errorf("退出时停止代理出错: %v", err)
 			}
 			systray.Quit()
+			// Wails 在 Linux 上关窗后不保证主循环一定收尾；用户要的是
+			// 「关窗口 = 进程结束」，这里在清理完成后强制退出，避免留下一个
+			// 没有窗口、没有托盘、只占着内存的孤儿进程。托盘助手会随
+			// socket 关闭自行退出（它连不上就会 systray.Quit）。
+			os.Exit(0)
 		},
 	})
 

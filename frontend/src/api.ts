@@ -511,7 +511,13 @@ function demoBridge(): AppBridge {
           killArmed: false,
           killV4: false,
           killV6: false,
-          killReason: ''
+          killReason: '',
+          // demo 页取"已接管"这一档：它是四档里唯一会同时用到 link 与 prev 的，
+          // 只演示 yes 的话那两格永远渲染不到，字段名写错了也没人发现。
+          resolverFeeds: 'taken-over',
+          resolverDetail: '已把 wlp3s0f0 的上游从 10.180.191.11 10.180.191.12 改接为 172.19.0.2',
+          resolverLink: 'wlp3s0f0',
+          resolverPrev: ['10.180.191.11', '10.180.191.12']
         },
         startedAt: running ? started : 0,
         uptimeMs: running ? Date.now() - started : 0,
@@ -948,7 +954,12 @@ function demoBridge(): AppBridge {
         killArmed: false,
         killV4: false,
         killV6: false,
-        killReason: ''
+        killReason: '',
+        // 与上面 Status() 里那份 demo 保持一致：同一个页面两条来源不能各说一套。
+        resolverFeeds: 'taken-over',
+        resolverDetail: '已把 wlp3s0f0 的上游从 10.180.191.11 10.180.191.12 改接为 172.19.0.2',
+        resolverLink: 'wlp3s0f0',
+        resolverPrev: ['10.180.191.11', '10.180.191.12']
       }
     },
     async SetSystemProxy() {

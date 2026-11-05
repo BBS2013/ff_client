@@ -3,8 +3,9 @@
 //
 // 为什么用 1 秒轮询而不是 Wails 事件订阅：
 // 事件订阅要把「谁在订阅、何时退订」和窗口生命周期对齐，托盘隐藏、面板重开
-// 这些路径很容易漏掉退订导致回调打在已销毁的组件上。轮询没有这类竞态，
-// 而且窗口隐藏时可以直接停掉，代理照样跑，CPU 也不涨。
+// 这些路径很容易漏掉退订导致回调打在已销毁的组件上。轮询没有这类竞态。
+// 窗口隐藏时只停 1 秒的总览轮询；系统代理那一路 5 秒定时器留着，
+// 否则从托盘恢复时一旦漏掉 visibilitychange，开关就会停在旧状态。
 //
 // 忙态分两层也在这里定：全局动作（启停、切模式、切节点、TUN、系统代理）共用
 // 一个 busy，它们会互相打断，灰掉是对的；页内动作（测速、存节点、改规则、
@@ -22,6 +23,7 @@ import type { LogEntry, Pending, ProfileTest, Status, SysProxyLedger, SystemProx
 import { formatClock, modeText, TUN_PHASE_TEXT, tunPhase } from './format'
 import { nodeTests } from './nodetests'
 import { agoText } from './ageclock'
+import { releaseWritten, resyncBeforeRelease } from './optimistic'
 import {
   errorText,
   isDemo,
@@ -104,7 +106,12 @@ const EMPTY_STATUS: Status = {
     killArmed: false,
     killV4: false,
     killV6: false,
-    killReason: ''
+    killReason: '',
+    // 拿到第一份真状态之前只能是"没验过"：把它显示成"没生效"会凭空造一条告警。
+    resolverFeeds: 'unverified',
+    resolverDetail: '',
+    resolverLink: '',
+    resolverPrev: []
   },
   startedAt: 0,
   uptimeMs: 0,
@@ -282,9 +289,35 @@ const staleAt = computed(() =>
 /** 日志增量拉取的游标：下次带上本地最大的 Seq。 */
 let logCursor = 0
 let timer: number | null = null
-let polling = false
-/** 轮询进行中又来了一次（例如某个操作做完要立刻回读），记一笔，本轮结束补一次。 */
-let pollAgain = false
+let sysTimer: number | null = null
+/**
+ * 状态轮询的请求序号（与 sysSeq 同一套做法，理由也同一份）。
+ *
+ * 这里以前是一把「正在拉」的布尔锁，外加一个 pollAgain 标记。它在
+ * **调用会挂住**的场合会永久锁死：窗口隐藏到托盘时 Wails 绑定调用可能不返回，
+ * polling 一直为 true，之后每次 poll() 只把 pollAgain 置上就返回，
+ * 于是重新显示窗口后那一轮永远走不完，总览停在旧数字上，
+ * 而界面上没有任何一处说"读不到"。
+ *
+ * 序号版本：每次 poll() 自增，只有最新一次的结果允许落地；
+ * 旧请求晚到一律丢弃，不阻塞后续轮询。
+ */
+let pollSeq = 0
+/**
+ * 本轮已经发出去、还没落定的那条请求。act() 的 resync 要能等它：
+ * "操作前发出的那一轮"回来时带的是旧状态，用它当回读等于没等。
+ */
+let inflight: Promise<void> | null = null
+/**
+ * 系统代理读数的请求序号。
+ *
+ * 与状态轮询同一套：窗口隐藏到托盘时，Wails 绑定调用可能不返回，
+ * 锁会永久卡在 true，之后每次回读都被吞掉，开关就永远停在旧状态。
+ * 改成序号后，旧请求即使晚到也只会被新结果覆盖，不会阻塞后续轮询。
+ */
+let sysSeq = 0
+/** 记账读数单独的序号：它与桌面读数各读各的，乱序返回时也要能丢掉旧的那份。 */
+let ledgerSeq = 0
 
 /**
  * 用户点下去、后端还没回读到的那几个瞬间，见 types.ts 的 Pending。
@@ -395,38 +428,44 @@ function mergeLogs(patch: Awaited<ReturnType<typeof logs>>): void {
 }
 
 async function poll(): Promise<void> {
-  if (polling) {
-    // 正在拉的那一轮可能已经带着"操作前"的状态发出去了。这里不能直接 return：
-    // act() 的 finally 会 await 它，静默跳过就等于让用户再多等一个轮询周期。
-    pollAgain = true
-    return
-  }
-  polling = true
-  try {
-    do {
-      pollAgain = false
+  const seq = ++pollSeq
+  // 这一轮之前正在飞的那条（如果有）先记下来，返回时 act() 的回读要等它，
+  // 否则"等回读"等到的可能是操作前发出的那一轮。
+  const prev = inflight
+  const run = (async () => {
+    if (prev) {
+      // 上一轮还在飞时不等它，但要保证它落地时会被序号规则丢掉。
+      void prev.catch(() => {})
+    }
+    try {
       // 三个读数各拿各的。Promise.all 的语义是"一个坏全作废"：
       // 流量拉失败会把还活着的 Status 一起冻在旧值上，而顶栏照样写"运行中"。
       const [s, t] = await Promise.allSettled([status(), traffic()])
       const bad: string[] = []
       if (s.status === 'fulfilled') {
-        snap.value = s.value
+        // 只有最新一次的结果允许落地：旧请求晚到不能把新状态冲回去。
+        if (seq === pollSeq) snap.value = s.value
       } else {
         bad.push(`状态 ${errorText(s.reason)}`)
       }
       if (t.status === 'fulfilled') {
-        tr.value = t.value
+        if (seq === pollSeq) tr.value = t.value
       } else {
         bad.push(`流量 ${errorText(t.reason)}`)
       }
       if (view.value === 'logs') {
         try {
-          mergeLogs(await logs(logCursor))
-          logsLoaded.value = true
+          const patch = await logs(logCursor)
+          if (seq === pollSeq) {
+            mergeLogs(patch)
+            logsLoaded.value = true
+          }
         } catch (err) {
           bad.push(`日志 ${errorText(err)}`)
         }
       }
+      // 过期的这一轮不该改写提示：它说的是当时那一刻的事，而界面已经前进了。
+      if (seq !== pollSeq) return
       if (bad.length === 0) {
         pollError.value = ''
         loadedOnce.value = true
@@ -436,12 +475,41 @@ async function poll(): Promise<void> {
         const at = lastOkAt.value > 0 ? `，界面停在 ${formatClock(lastOkAt.value)}` : ''
         pollError.value = `读取失败：${bad.join('；')}${at}`
       }
-    } while (pollAgain)
-  } catch (err) {
-    pollError.value = `读取状态失败：${errorText(err)}`
+    } catch (err) {
+      if (seq === pollSeq) {
+        pollError.value = `读取状态失败：${errorText(err)}`
+      }
+    }
+  })()
+  inflight = run
+  try {
+    await run
   } finally {
-    polling = false
+    if (inflight === run) inflight = null
   }
+}
+
+/**
+ * 等「操作发出去之后」才开始的那一轮状态回读落地。
+ *
+ * 关键在时序：act() 里 fn() 已经 await 过了，所以此刻调 poll() 发出的请求
+ * 一定晚于操作；但**操作前**已经飞出去的那一轮可能还在路上，它的结果带的是
+ * 旧状态。所以这里先等它，再发新一轮，再等新一轮。
+ *
+ * 为什么值得这么绕：这正是 optimistic.ts 那套顺序的前半段。撤乐观值之前
+ * 必须拿到"操作之后"的读数；拿到的是旧读数，界面就会闪回上一次的值——
+ * 旧值是「关」时，用户看到的就是「点开系统代理它自己又关掉了」。
+ */
+async function pollAfterAction(): Promise<void> {
+  const stale = inflight
+  if (stale) {
+    try {
+      await stale
+    } catch {
+      // 旧那一轮失败不影响这一轮：下面这次才是要等的那次。
+    }
+  }
+  await poll()
 }
 
 // 切到日志页要立刻补一批，不能等下一次轮询。
@@ -458,29 +526,65 @@ watch(view, (v) => {
 
 /** 记账那一行也一样不在 Status 里，而且读它可能要再问一次后端，所以跟着桌面读数一起补。 */
 async function pollLedger(): Promise<void> {
+  const seq = ++ledgerSeq
   try {
-    ledger.value = await systemProxyLedger()
+    const next = await systemProxyLedger()
+    // 与桌面读数同一条规则：旧请求晚到不能把新的记账冲回去。
+    // 这一条以前漏了——5 秒定时器与操作后的回读天然会叠（单次读数预算 10 秒），
+    // 于是旧的 orphan / live 文案可以盖住刚读到的那份。
+    if (seq === ledgerSeq) ledger.value = next
   } catch (err) {
-    ledger.value = { ...ERR_LEDGER, text: `读不到记账：${errorText(err)}` }
+    if (seq === ledgerSeq) {
+      ledger.value = { ...ERR_LEDGER, text: `读不到记账：${errorText(err)}` }
+    }
   }
 }
 
 /** 系统代理不在 Status 里，单独读：桌面侧可能被别的程序改，所以每次重新显示窗口都补读一次。 */
 async function pollSys(): Promise<void> {
+  const seq = ++sysSeq
   // 两份读数各读各的：记账读不懂不该让桌面那栏退回"读取中"，反过来也一样。
   void pollLedger()
   try {
-    sys.value = await systemProxyStatus()
+    const next = await systemProxyStatus()
+    // 只采用最新一次请求的结果：旧请求晚到不能把新状态冲回去。
+    if (seq === sysSeq) {
+      sys.value = next
+    }
   } catch (err) {
     // 不能只把错误塞进全局提示、让 sys 停在 null：那一栏会一直显示"读取中…"，
     // 而它其实已经确定读不到了。合成一个"只有 error"的读数，
     // 三个组件里现成的 sys.error 分支就会把它讲对。
-    sys.value = { ...EMPTY_SYS, error: errorText(err) }
+    if (seq === sysSeq) {
+      sys.value = { ...EMPTY_SYS, error: errorText(err) }
+    }
   }
 }
 
-/** 包一层：所有全局操作共用同一套忙状态与错误提示，避免每个按钮各写一遍。 */
-async function act(name: string, fn: () => Promise<void>, done: string, p: Partial<Pending> = {}): Promise<void> {
+/**
+ * 包一层：所有全局操作共用同一套忙状态与错误提示，避免每个按钮各写一遍。
+ *
+ * resync 是可选的「回读」：动作做完后先把界面该显示的那份读数拿回来，
+ * 再撤掉乐观值。系统代理那一栏的真相在桌面设置里，不在这次动作的返回值里；
+ * 不先回读就撤，界面会闪一下上一次轮询的旧值（旧值是「关」时，
+ * 用户看到的就是「点开就自动关闭」）。
+ *
+ * 两个顺序细节都是踩过的：
+ *
+ *  1. **busy 必须活到回读结束**。以前在 finally 第一行就清掉，于是从那一刻到
+ *     回读落地之间，按钮又变成可点的，而 pending 还在——用户再点一次，
+ *     两次动作的乐观值互相覆盖，先回来的那个 release 会把后一次的也删掉。
+ *     gsettings 单次读数预算 10 秒，这个窗口是实实在在的。
+ *  2. **release 只删仍等于本次写入的那些键**。动作期间界面上可能已经有更新的
+ *     乐观值（另一个键、或同键的新目标），无差别删除等于把别人的状态一起清了。
+ */
+async function act(
+  name: string,
+  fn: () => Promise<void>,
+  done: string,
+  p: Partial<Pending> = {},
+  resync?: () => Promise<void>
+): Promise<void> {
   if (busy.value !== '') {
     return
   }
@@ -491,16 +595,24 @@ async function act(name: string, fn: () => Promise<void>, done: string, p: Parti
     flash(done)
   } catch (err) {
     flash(`${done.replace(/。$/, '')}失败：${errorText(err)}`)
+  }
+  try {
+    await resyncBeforeRelease(() => releasePending(p), resync ?? pollAfterAction)
   } finally {
     busy.value = ''
-    const rest = { ...pending.value }
-    for (const k of Object.keys(p) as Array<keyof Pending>) {
-      delete rest[k]
-    }
-    pending.value = rest
-    // 操作后立刻拉一次，界面不等下一秒的轮询。
-    await poll()
   }
+  // 操作后立刻拉一次，界面不等下一秒的轮询。
+  // 不 await：这次刷新哪怕在窗口隐藏时挂住，也不能拖住调用方后续的 pollSys。
+  void poll()
+}
+
+/**
+ * 撤掉本次写入的乐观键，但只撤"仍然等于本次目标值"的那些。
+ *
+ * 判据与理由见 optimistic.ts 的 releaseWritten。
+ */
+function releasePending(written: Partial<Pending>): void {
+  pending.value = releaseWritten(pending.value, written)
 }
 
 const onStart = (): Promise<void> => act('start', startProxy, '已启动代理。')
@@ -542,8 +654,11 @@ const onSysProxy = (enable: boolean): Promise<void> =>
     'sysproxy',
     () => setSystemProxy(enable),
     enable ? '系统代理已指向本客户端。' : '系统代理已关闭。',
-    { sysproxy: enable }
-  ).then(pollSys)
+    { sysproxy: enable },
+    // 撤乐观值之前先把桌面读数拿回来：否则界面会闪一下旧读数，
+    // 看起来就是「点开就自动关闭」。
+    pollSys
+  )
 
 /** 开它要重建隧道让代理真的换到 USB 无线那张卡上，所以同样先拨 knob 再等后端。 */
 const onIfaceSplit = (enable: boolean): Promise<void> =>
@@ -674,26 +789,51 @@ function onKeydown(e: KeyboardEvent): void {
 }
 
 function onVisibility(): void {
-  // 窗口被隐藏（托盘模式、或最小化）就不必再轮询，代理本身照常运行。
+  // 窗口被隐藏（托盘模式、或最小化）时只停 1 秒的总览轮询。
+  // 系统代理那个 5 秒定时器不能停：Wails 在 Linux 上从托盘恢复窗口时
+  // 不一定补发 visibilitychange，一旦停掉，开关就会永远停在旧状态。
   if (document.hidden) {
-    stopTimer()
+    stopFastTimer()
   } else {
-    startTimer()
-    void poll()
-    void pollSys()
+    wakePolling()
   }
+}
+
+/** 窗口重新可见或拿到焦点：恢复快轮询，并立刻补读两份状态。 */
+function wakePolling(): void {
+  startTimer()
+  void poll()
+  void pollSys()
 }
 
 function startTimer(): void {
   if (timer === null) {
     timer = window.setInterval(() => void poll(), POLL_MS)
   }
+  // 桌面代理可能在启动流程或别的程序里被改；只靠 onMounted 读一次，
+  // 就会在界面留下一个永久的「未开启」，而 gsettings 早已是 manual。
+  //
+  // 这个定时器刻意不随窗口隐藏而清掉：隐藏时浏览器最多把它节流，
+  // 重新显示后会自己恢复；清掉再等 visibilitychange 就可能永远等不到。
+  if (sysTimer === null) {
+    sysTimer = window.setInterval(() => void pollSys(), 5000)
+  }
 }
 
-function stopTimer(): void {
+/** 只停 1 秒的总览轮询；窗口隐藏时没必要每秒拉一次。 */
+function stopFastTimer(): void {
   if (timer !== null) {
     window.clearInterval(timer)
     timer = null
+  }
+}
+
+/** 真正卸载时才把两个定时器都收掉。 */
+function stopAllTimers(): void {
+  stopFastTimer()
+  if (sysTimer !== null) {
+    window.clearInterval(sysTimer)
+    sysTimer = null
   }
 }
 
@@ -702,12 +842,16 @@ onMounted(() => {
   void poll()
   void pollSys()
   document.addEventListener('visibilitychange', onVisibility)
+  // 从托盘恢复时焦点事件比 visibilitychange 可靠：有些窗口管理器只给焦点、
+  // 不改 WebKit 的 visibilityState。两条都接上，谁先到就谁触发。
+  window.addEventListener('focus', wakePolling)
   window.addEventListener('keydown', onKeydown)
 })
 
 onBeforeUnmount(() => {
-  stopTimer()
+  stopAllTimers()
   document.removeEventListener('visibilitychange', onVisibility)
+  window.removeEventListener('focus', wakePolling)
   window.removeEventListener('keydown', onKeydown)
 })
 </script>

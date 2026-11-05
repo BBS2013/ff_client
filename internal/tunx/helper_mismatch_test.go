@@ -217,6 +217,7 @@ func TestHelperMismatchForgottenOnSuccess(t *testing.T) {
 		Open:    func(string) (int, error) { return devFD, nil },
 		MTU:     func(string) (uint32, error) { return uint32(tun.conf.MTU), nil },
 		Timeout: 5 * time.Second,
+		PeerUID: func(*net.UnixConn) (int, error) { return 1000, nil },
 	})
 	plan, err := tun.buildPlan(context.Background())
 	if err != nil {
@@ -324,10 +325,15 @@ func helperTUNT(t *testing.T) *TUN {
 	conf.Enable = true
 	conf.Helper = []string{"sudo", "-n", "/home/dev/wps_app", "--tun-helper"}
 	rt := router.New(mustEngine(t), outbound.NewSet(outbound.NewDirect(time.Second), nil), time.Second)
+	// 显式钉住非 root：helper 路径只对普通用户存在，root 面板会直接开网卡
+	// （见 helperArgvFor）。测试若跟着跑测试的 uid 走，在 root 下会静默
+	// 改测另一条分支，正好漏掉这一组要守的东西。
+	uid := 1000
 	tun, err := New(Options{
 		Conf:      conf,
 		Router:    rt,
 		Runner:    &dualRunner{},
+		UID:       &uid,
 		Upstreams: []string{"223.5.5.5"},
 		Bypass:    []string{"223.5.5.5"},
 	})

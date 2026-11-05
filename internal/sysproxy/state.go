@@ -215,6 +215,18 @@ func Restore(ctx context.Context, r Runner, statePath string) error {
 	return os.Remove(statePath)
 }
 
+// Forget 丢掉一份记账，不做任何还原。
+//
+// 用于「改动其实没有落到桌面」的情形：记账描述的是一次没发生的改动，
+// 留着它会让退出时的还原去动一个并不属于我们的设置——
+// 而那个设置可能正指着用户自己配的别的代理。
+func Forget(statePath string) error {
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // RecoverIfStale 在进程启动时调用：状态文件还在、但记账里那个实例已经确定不在了，
 // 说明上次是异常退出，把设置还原回去。返回是否做了还原。
 //
@@ -481,4 +493,26 @@ func orNone(mode string) string {
 		return "none"
 	}
 	return mode
+}
+
+// AdoptLedger 把一份账记的宿主改成正在运行的面板。
+//
+// 命令行 `-sysproxy on` 是一次性进程：它调用 Enable 时会把宿主写成了自己，
+// 然后立刻退出。若当时面板正在跑，这份账就指向一个已经死掉的 PID，
+// 下次启动的自愈会把用户刚打开的系统代理又关掉。让 CLI 在 Enable 之后
+// 把账交给 lock 文件里那个活着的面板，账才对得上人。
+func AdoptLedger(statePath string, pid int, exe string) error {
+	if pid <= 0 {
+		return fmt.Errorf("记账宿主 PID 不合法: %d", pid)
+	}
+	st, err := peekSaved(statePath)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return nil // 没有账可改：不要凭空造一份
+	}
+	st.PID = pid
+	st.Exe = exe
+	return writeState(statePath, *st)
 }

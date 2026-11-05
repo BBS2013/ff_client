@@ -8,7 +8,13 @@ export default defineConfig({
     environment: 'node',
     coverage: {
       provider: 'v8',
-      include: ['src/format.ts', 'src/ageclock.ts', 'src/nodetests.ts', 'src/probes.ts'],
+      include: [
+        'src/format.ts',
+        'src/ageclock.ts',
+        'src/nodetests.ts',
+        'src/probes.ts',
+        'src/optimistic.ts'
+      ],
       reporter: ['text'],
       thresholds: {
         lines: 80,

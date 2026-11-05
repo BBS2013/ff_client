@@ -58,6 +58,11 @@ type App struct {
 	// 总开关关闭会连带停服务，所以下一次启动要把指针放回去；服务本来就没跑、
 	// 用户只关了桌面那一路不置位，启动时也不该替他改桌面。
 	sysProxyPaused bool
+	// sysProxyUnverified 非空表示「设置已写入，但读回桌面始终失败」：
+	// 写入成功、只是这个进程读不回来（D-Bus 抖动、dconf 慢半拍、后端超时）。
+	// 它不是失败——记账必须保留（那是退出时唯一能还原的依据），
+	// 而界面要说的话与「开启失败」完全不同，所以单独记一份原因。
+	sysProxyUnverified string
 }
 
 // New 装配 GUI 用的服务与统计。它会注册一个日志钩子并启动速率采样 goroutine，
@@ -569,6 +574,24 @@ func (a *App) SystemProxyStatus() sysproxy.Status {
 	if err != nil && st.Error == "" {
 		st.Error = err.Error()
 	}
+	if err != nil {
+		return st
+	}
+	// 这一读成功了。既然读得回来，就顺手把「已写入、尚未读回确认」那条提示撤掉：
+	// 那一条的意义只是"这个进程此刻看不到桌面"，看得到就没它的事了。
+	// 顺手也判一次归属——读回来的正是我们写的那一组时，用户什么提示都不需要。
+	if a.sysProxyUnverifiedDetail() != "" {
+		if sysproxy.LikesOurs(st, a.desktopExpect()) {
+			a.clearSysProxyUnverified()
+		}
+	}
+	if st.Error == "" && st.Note == "" {
+		// 只在没有别的提示时占这一格：后端自己的 Note（例如 env 只对之后启动的
+		// 进程有效）比这条更该说。
+		if d := a.sysProxyUnverifiedDetail(); d != "" {
+			st.Note = "设置已写入，但本进程读回桌面时始终失败，尚未确认生效（" + d + "）。记账保留，退出时会照账还原。"
+		}
+	}
 	return st
 }
 
@@ -660,11 +683,71 @@ func (a *App) enableSystemProxy() error {
 	}); err != nil {
 		return err
 	}
+	// 写完必须读回一次。gsettings 写进别的 dconf 数据库时退出码照样是 0，
+	// 面板不能在这种时候说"已开启"——那正是开关点开就自己弹回来的原因：
+	// 界面读的是同一个写错地方的地方，读回来是 none，开关于是立刻弹回关闭。
+	//
+	// 读回要多试几次：桌面设置不是写完那一刻就能读到的，
+	// 刚写完就读有可能读到旧值——那种情况下报"失败"等于让用户根本开不了代理。
+	//
+	// 读不回来的三种结局里只有一种该撤账：
+	//
+	//	读到了、确实指向我们 —— 成功。
+	//	读到了、不是我们     —— 写入没生效（典型：写进了别的 dconf 库）。
+	//	                        这份账描述的是一次没发生的改动，必须删掉，
+	//	                        否则退出时的还原会去动一个不属于我们的设置。
+	//	**一次都没读到**     —— 什么都不知道。这时**保留记账**：它记的是
+	//	                        "改动前的原样"，是退出时唯一能还原的依据；
+	//	                        删了它，桌面就永久指着本客户端，而端口已经关了。
+	//
+	// 第三档以前是并进第二档的（"读不到就当不是我们的"），一次 D-Bus 抖动
+	// 就能把一次已经写成功的开启判失败、顺手删账，于是死指针留在桌面上。
+	if ok, detail, confirmed := a.waitDesktopPointsAtUs(); !ok {
+		if !confirmed {
+			// 账留着，把状态标成"已写入、尚未读回确认"：界面可以据此说
+			// "设置已写，但还没确认生效"，而不是"失败"。
+			a.markSysProxyUnverified(detail)
+			logx.Warnf("系统代理已写入，但读回桌面设置始终失败（保留记账以便退出时还原）: %s", detail)
+			a.setSysProxyPaused(false)
+			a.writeSysProxyIntent(true)
+			return nil
+		}
+		if err := sysproxy.Forget(statePath); err != nil {
+			logx.Warnf("桌面没被接管，但记账没删掉（%s）: %v", statePath, err)
+		}
+		return fmt.Errorf("已写入系统代理设置，但读回时桌面并未指向本客户端（%s）", detail)
+	}
+	a.clearSysProxyUnverified()
 	a.setSysProxyPaused(false) // 现在这根指针是用户要的了，停止时该由停止拔掉它
 	a.writeSysProxyIntent(true)
 	logx.Infof("系统代理总开关开启：代理已启动并指向本客户端入站（http %s / socks %s），记账 %s",
 		c.HTTPAddr, c.SOCKSAddr, statePath)
 	return nil
+}
+
+// waitDesktopPointsAtUs 写完之后的读回：多试几次。
+//
+// 返回最后一次读到的桌面内容，好让报错说清"桌面现在是什么样"；
+// confirmed 为假表示**一次都没读到**（不是"读到了但不是我们"）。
+// 两者对调用方的意义完全不同：前者什么都不能断定，后者可以确定写入没生效。
+func (a *App) waitDesktopPointsAtUs() (ok bool, detail string, confirmed bool) {
+	const attempts = 5
+	detail = ""
+	readable := false
+	for i := 0; i < attempts; i++ {
+		var d string
+		var r bool
+		ok, d, r = a.desktopPointsAtUsProbe()
+		readable = readable || r
+		if ok {
+			return true, d, true
+		}
+		detail = d
+		if i < attempts-1 {
+			time.Sleep(400 * time.Millisecond)
+		}
+	}
+	return false, detail, readable
 }
 
 // disableSystemProxyOnly 只恢复桌面设置，不碰服务、不碰持久状态。
@@ -753,6 +836,33 @@ func (a *App) takeSysProxyPaused() bool {
 	v := a.sysProxyPaused
 	a.sysProxyPaused = false
 	return v
+}
+
+// markSysProxyUnverified 记下「设置已写入、但读回始终失败」这一档。
+//
+// 它不是失败：写入调用返回了 0，桌面很可能已经指过来，只是这个进程读不回来
+// （D-Bus 抖动、dconf 慢半拍、后端暂时超时）。界面要说的话与"开启失败"
+// 完全不同——前者用户什么都不用做，后者要用户去改配置。
+// 状态只活在内存里：重启之后要么读得回（一切正常），要么读不回（那时仍然
+// 报不出来，但记账还在，退出时会照账还原）。为一条提示去写盘不值得。
+func (a *App) markSysProxyUnverified(detail string) {
+	a.sysProxyMu.Lock()
+	defer a.sysProxyMu.Unlock()
+	a.sysProxyUnverified = detail
+}
+
+// clearSysProxyUnverified 在一次成功读回之后把那条提示撤掉。
+func (a *App) clearSysProxyUnverified() {
+	a.sysProxyMu.Lock()
+	defer a.sysProxyMu.Unlock()
+	a.sysProxyUnverified = ""
+}
+
+// sysProxyUnverifiedDetail 给状态投影用：空串表示没有这回事。
+func (a *App) sysProxyUnverifiedDetail() string {
+	a.sysProxyMu.Lock()
+	defer a.sysProxyMu.Unlock()
+	return a.sysProxyUnverified
 }
 
 // inboundAddrs 取当前实际监听的 http 与 socks5 地址，

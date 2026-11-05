@@ -290,7 +290,7 @@ func (s *Service) prepare() error {
 	}
 	logx.SetLevel(logx.ParseLevel(cfg.Log.Level))
 
-	resolver, err := dnsx.New(cfg.DNS.Servers, cfg.DNS.Timeout.Duration, cfg.DNS.Cache.Duration)
+	resolver, err := newResolver(cfg)
 	if err != nil {
 		return err
 	}
