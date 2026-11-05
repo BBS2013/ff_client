@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +42,34 @@ type HelperServer struct {
 	// 单测以 root 跑时，进程内 helper 的对端恒为 0，而用例为了走 helper
 	// 分支会把计划里的 uid 钉成普通用户；这是测试环境差异，不是被测行为。
 	PeerUID func(*net.UnixConn) (int, error)
+	// OnlyActions 非空时，只有列在这里的动作会被执行，其余一律拒绝。
+	//
+	// 这是**常驻** dial-helper 的收窄手段，也是它唯一该有的形状：那个进程活得很久、
+	// 套接字又在用户可及的位置，同 uid 的任何进程都连得上。让它继续接受一整份
+	// 提权协议（装默认路由、DNAT :53、挂 DROP 链、开 tun 网卡）等于给一个同 uid
+	// 的普通进程配了半个 root——它本来只需要"替我要一条钉在网卡上的 socket"。
+	//
+	// 一次性 tun-helper 不设它（走完整的 RoutePlan 协议），因为那个进程做完就退出，
+	// 而且它的套接字只在一个由 root 亲手建、随后立即删掉的目录里存在几十毫秒。
+	OnlyActions map[string]bool
+}
+
+// actionAllowed 报告这个动作在这个 helper 实例上被允许执行。
+func (h *HelperServer) actionAllowed(action string) bool {
+	if len(h.OnlyActions) == 0 {
+		return true
+	}
+	return h.OnlyActions[action]
+}
+
+// allowedActionList 是给报错用的动作清单（按键排序，输出稳定）。
+func (h *HelperServer) allowedActionList() string {
+	out := make([]string, 0, len(h.OnlyActions))
+	for a := range h.OnlyActions {
+		out = append(out, a)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }
 
 func (h *HelperServer) peerUID(conn *net.UnixConn) (int, error) {
@@ -111,6 +140,17 @@ func (h *HelperServer) serveRequest(conn *net.UnixConn) (bool, error) {
 	req, err := decodeRequest(raw)
 	if err != nil {
 		return true, h.reply(conn, HelperReply{Err: err.Error()}, nil)
+	}
+	// 收窄后的实例只认白名单里的动作，而且这一句要排在**所有**业务校验之前。
+	//
+	// 排在前面的理由不是效率，是排障：一个被收窄的 helper 收到 up/kill 时，
+	// 它该说的是"这个助手不接受这个动作"，而不是"你的 RoutePlan 缺了 prev 字段"。
+	// 后者会让看日志的人去补请求参数，而正确结论是"你连错东西了/这条通道不该有
+	// 这个能力"。安全上的判断也要求先拒：下面的校验会碰 req 的各个字段，
+	// 而那些字段属于一个我们根本不打算执行的动作。
+	if !h.actionAllowed(req.Action) {
+		return true, h.reply(conn, HelperReply{Err: fmt.Sprintf(
+			"这个提权助手不接受动作 %q（只允许 %s）", req.Action, h.allowedActionList())}, nil)
 	}
 	if verr := req.validate(); verr != nil {
 		return true, h.reply(conn, HelperReply{Err: verr.Error()}, nil)
@@ -467,6 +507,12 @@ type HelperClient struct {
 func (c HelperClient) Run(ctx context.Context, req HelperRequest) (HelperReply, int, error) {
 	if len(c.Argv) == 0 && c.Spawn == nil {
 		return HelperReply{}, -1, errors.New("没有配置 tun.helper 命令")
+	}
+	// 只在真的要走 sudo 时核对：单测的 Spawn 路径没有外部二进制。
+	if c.Spawn == nil {
+		if err := checkHelperBinary(helperBinaryFromArgv(c.Argv)); err != nil {
+			return HelperReply{}, -1, err
+		}
 	}
 	if err := req.validate(); err != nil {
 		return HelperReply{}, -1, err

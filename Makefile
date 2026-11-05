@@ -24,7 +24,7 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks
+.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper
 
 all: build
 
@@ -253,6 +253,26 @@ soak-once:
 ## 而 README 里那条"先评估再考虑 eBPF"的结论只有能被重跑，才不是空话。
 probe-attribution:
 	./scripts/probe-socket-attribution.sh
+
+## install-helper 把提权用的那份产物装到 root 拥有的位置。
+##
+## 为什么不是"直接用仓库里的 ./wps_app-gui"：sudoers 只认**路径**，不认内容。
+## 仓库目录属于普通用户、可写，于是同一个用户的任何进程（git checkout、
+## go build、一次误 mv）都能换掉那个文件，下一次 helper 调用就以 root 执行。
+## 装到 /usr/local/libexec 之后，那条免密规则指向的文件只有 root 能改。
+##
+## 装完记得把 config.yaml 里的 tun.helper 指向这里（README §4.3 有完整的
+## sudoers 片段），并在面板里重启一次让它重新读配置。
+HELPER_DIR  ?= /usr/local/libexec/wps_app
+HELPER_BIN  := $(HELPER_DIR)/wps_app-gui
+
+install-helper: $(GUI_BIN)
+	@install -d -o root -g root -m 0755 $(HELPER_DIR)
+	@install -o root -g root -m 0755 $(GUI_BIN) $(HELPER_BIN)
+	@echo "已安装 $(HELPER_BIN)（root:root 0755，目录 root:root 0755）"
+	@echo "接下来：把 config.yaml 的 tun.helper 改成"
+	@echo "  [\"sudo\", \"-n\", \"$(HELPER_BIN)\", \"--tun-helper\"]"
+	@echo "并在 /etc/sudoers.d/ 里只放行这一条完整 argv（README §4.3）。"
 
 clean:
 	rm -f $(GUI_BIN)

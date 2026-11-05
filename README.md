@@ -943,12 +943,34 @@ tun:
 （见 `internal/ui/form.go`），状态卡片上能看到当前走的是哪条特权路径。
 不想让整个 `sudo` 免密的话，可以只放行这一条命令：
 
+**先把产物的 helper 装到 root 拥有的位置**（`make install-helper`）：
+
+```
+make install-helper          # 装到 /usr/local/libexec/wps_app/wps_app-gui
+                             # root:root 0755，目录同样 root:root 0755
+```
+
+**为什么必须装出去，不能直接用仓库里的 `./wps_app-gui`**：sudoers 只认路径、
+不认内容。仓库目录属于普通用户、可写，于是同一个用户的任何进程（`git checkout`、
+`go build`、一次误 `mv`）都能换掉那个文件，下一次 helper 调用就以 root 执行了。
+装到 `/usr/local/libexec` 之后，那条免密规则指向的文件只有 root 能改。
+
+面板在调 `sudo` 之前也会自己核一遍：文件属主必须是 root、不能是符号链接、
+组与其他用户都不可写。不符合时不提权，直接报错并指出该跑什么。
+
 ```
 # /etc/sudoers.d/wps_app-tun-helper
-# 路径指着产物文件本身：单产物之后，面板与 helper 是同一个文件，
-# 所以这条规则放行的正是 ./wps_app-gui —— 换句话说，面板能以 root 起的
-# 只有那一次 helper 调用（参数被钉死成 --tun-helper）。
-chery ALL=(root) NOPASSWD: /home/chery/wps_app/wps_app-gui --tun-helper --tun-helper-connect=*
+# 只放行这一条完整 argv，不要写成 `--tun-helper --tun-helper-connect=*`：
+# sudoers 的通配符能匹配空格，于是那个 `*` 等于允许在 --tun-helper-connect
+# 后面再追加任意参数。面板每次都会自动补上套接字路径，规则里不需要通配。
+cery ALL=(root) NOPASSWD: /usr/local/libexec/wps_app/wps_app-gui --tun-helper
+```
+
+`config.yaml` 里对应改成：
+
+```yaml
+tun:
+  helper: ["sudo", "-n", "/usr/local/libexec/wps_app/wps_app-gui", "--tun-helper"]
 ```
 
 > **为什么不给二进制 `setcap` 就完事**：配地址、加路由、挂 iptables 劫持都是 exec 出去的
@@ -956,6 +978,13 @@ chery ALL=(root) NOPASSWD: /home/chery/wps_app/wps_app-gui --tun-helper --tun-he
 > 子进程仍是无特权的普通 uid。症状很具体——打开 `/dev/net/tun` 成功（这一步在本进程里做），
 > 紧接着 `ip addr add` 报 `RTNETLINK answers: Operation not permitted`。
 > 现在这条路就是它的正式替代：特权只落在 helper 那一次调用上。
+
+> **常驻 dial-helper 的边界更窄**：`--dial-helper` 那个进程只接受 `dialbind` 一个动作。
+> 它与一次性 helper 的差别不只是寿命——套接字放在用户自己的运行目录里，
+> 同一个 uid 的任何进程都连得上，也能算出正确的 uid 通过 `SO_PEERCRED`。
+> 让它复用完整的提权协议，等于给一个同 uid 的普通进程配了半个 root
+> （装默认路由、DNAT `:53`、挂 DROP 链、开 tun 网卡）。加新动作之前先问一句：
+> 它真的需要 root 吗，同 uid 的进程发这个请求会造成我们不想负责的后果吗。
 
 `hijack_dns: true` 时用 iptables 把本机 `:53` 出向查询重定向到 `tun.dns`。
 下面三条边界都是踩过坑的，改动前请先读代码注释：

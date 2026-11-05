@@ -76,10 +76,16 @@ for c in ip iptables; do
   fi
 done
 
-if sudo -n true 2>/dev/null; then
-  ok "免密 sudo 可用，可以直接跑面板或用 tun.helper"
+if [ "$(id -u)" -eq 0 ]; then
+  note "现在是 root：面板不该以 root 跑（托盘连不上会话总线，配置/账本会变 root:root）"
+elif sudo -n -l /usr/local/libexec/wps_app/wps_app-gui >/dev/null 2>&1; then
+  ok "免密 sudo 放行了提权 helper（/usr/local/libexec/wps_app/wps_app-gui）"
+elif sudo -n true 2>/dev/null; then
+  note "免密 sudo 可用，但那是**不限命令**的。更安全的做法是只放行 helper 那一条 argv："
+  note "  先 make install-helper，再把 README §4.3 那条 sudoers 片段放进 /etc/sudoers.d/"
 else
-  note "免密 sudo 不可用：想用 TUN 就 sudo ./wps_app-gui config.yaml，或者只用系统代理模式"
+  note "没有免密 sudo：TUN 与按网卡分流都用不了，系统代理模式不受影响"
+  note "  想用 TUN：make install-helper，然后按 README §4.3 配一条只放行 helper 的 sudoers 规则"
 fi
 
 echo "== 端口占用 =="

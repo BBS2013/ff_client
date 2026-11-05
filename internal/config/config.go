@@ -18,6 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"wps_app/internal/logx"
+	"wps_app/internal/safestate"
 	"wps_app/internal/sudoown"
 )
 
@@ -710,7 +711,7 @@ func backup(path string) error {
 		default:
 			return fmt.Errorf("创建原始备份 %s: %w", orig, oerr)
 		}
-		if err := os.WriteFile(path+BackupSuffix, old, 0o600); err != nil {
+		if err := safestate.WriteFile(path+BackupSuffix, old, 0o600); err != nil {
 			return fmt.Errorf("backup %s: %w", path+BackupSuffix, err)
 		}
 		restoreBackupOwner(path + BackupSuffix)

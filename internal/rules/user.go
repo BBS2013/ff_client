@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"wps_app/internal/logx"
+	"wps_app/internal/safestate"
 	"wps_app/internal/sudoown"
 )
 
@@ -340,7 +341,7 @@ func SaveUserRules(path string, list []UserRule) error {
 		return err
 	}
 	if old, err := os.ReadFile(path); err == nil {
-		if err := os.WriteFile(path+".bak", old, 0o644); err != nil {
+		if err := safestate.WriteFile(path+".bak", old, 0o644); err != nil {
 			return fmt.Errorf("备份 %s.bak: %w", path, err)
 		}
 		restoreUserFileOwner(path + ".bak")
@@ -364,6 +365,11 @@ func SaveUserRules(path string, list []UserRule) error {
 		return err
 	}
 	if err := os.Chmod(name, 0o644); err != nil {
+		return err
+	}
+	// 目标可能是符号链接：root 面板写规则文件时跟着链接走，等于让普通用户
+	// 指定 root 往任意路径写内容。rename 之前查一遍。
+	if err := safestate.RejectSymlink(path); err != nil {
 		return err
 	}
 	if err := os.Rename(name, path); err != nil {

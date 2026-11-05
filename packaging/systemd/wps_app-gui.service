@@ -15,7 +15,14 @@ RestartSec=2
 KillSignal=SIGTERM
 TimeoutStopSec=40
 KillMode=mixed
+# UMask=0077：面板写出来的日志、账本、诊断文件一律 0600。
+# 默认 022 会让 config.yaml.log 变成 0644——那里面是逐条连接的访问日志
+# （访问过哪些域名），不该让同机的其他用户读到。程序自己也会 chmod，
+# 但 umask 是唯一管得住"新建文件那一刻"的东西。
+UMask=0077
 # 不要加 NoNewPrivileges=yes：TUN helper 依赖 setuid sudo。
+# 也不要加 PrivateTmp=yes：面板与 root helper 要靠 /tmp 下的 unix 套接字
+# 握手，两个不同的私有 /tmp 会让它们互相看不见。
 # 面板与 tun.helper 是同一个二进制（2026-10-29 起只有一个产物），
 # 所以 config.yaml 里 tun.helper 那条要指着同一个绝对路径。
 # GUI 需要会话总线与显示。若 systemd --user 没有继承，先执行：

@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"wps_app/internal/safestate"
 	"wps_app/internal/sudoown"
 )
 
@@ -221,39 +222,14 @@ func desktopPrefixAs(user string, uid int, busPath string) (args []string, env [
 	}, nil
 }
 
-// writeFileAtomic 先写临时文件、fsync、再 rename。
+// writeFileAtomic 先写临时文件、fsync、再 rename，并且拒绝跟随符号链接。
 //
 // 代理设置文件被改坏的后果是"整机断网且看不出原因"，所以这里必须原子替换：
 // 直接 truncate 重写的话，中途断电/被杀会留下半截文件。
+// 实现搬到 internal/safestate：这个仓库有五处会在提权之后写状态文件，
+// 而它们都需要同一条"别跟符号链接走"的保证（理由见那个包的头注释）。
 func writeFileAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".wps-sysproxy-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	// kioskrc 里没有秘密，但沿用 0600：它是我们改出来的文件，
-	// 没必要让别的用户能改（能被改就意味着代理指向可以被别人悄悄换掉）。
-	if err := os.Chmod(name, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
+	if err := safestate.WriteFile(path, data, 0o600); err != nil {
 		return err
 	}
 	// root 面板替桌面用户写文件时（见 sudoown 包注释），账必须记在

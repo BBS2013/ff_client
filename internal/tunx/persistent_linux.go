@@ -15,6 +15,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"wps_app/internal/logx"
 )
 
 // 这个文件把"提权 helper"从**一次请求一个进程**改成**一个常驻进程**。
@@ -34,6 +38,28 @@ import (
 
 // dialHelperOwnerFlag 是 helper 侧用来认领套接字属主的参数。
 const dialHelperOwnerFlag = "--dial-helper-owner="
+
+// dialHelperParentFlag 是「谁是我的主人」——面板**自己**的 pid。
+//
+// 为什么必须单独传：helper 的父进程是 sudo，不是面板。面板被 kill -9 之后
+// sudo 仍在等子进程，父进程检查（kill(ppid,0)）会一直成功，于是这个握着 root
+// 的常驻进程永远不走、套接字一直可连。传 pid 之后就能直接看 /proc/<pid>。
+const dialHelperParentFlag = "--dial-helper-parent="
+
+// dialHelperParentPID 从 argv 里取出面板 pid；没传或读不懂时返回 0。
+func dialHelperParentPID() int {
+	for _, a := range os.Args[1:] {
+		if !strings.HasPrefix(a, dialHelperParentFlag) {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimPrefix(a, dialHelperParentFlag))
+		if err != nil || pid <= 0 {
+			return 0
+		}
+		return pid
+	}
+	return 0
+}
 
 // ServeConnLoop 在**一条**连接上连续处理多次请求，直到对端收工。
 //
@@ -57,18 +83,36 @@ func (h *HelperServer) ServeConnLoop(conn *net.UnixConn) error {
 // ownerUID=0 表示「面板自己就是 root」（整个面板由 sudo 拉起时就是这个数）：
 // 那时套接字本来就归 root，跳过 chown，不是错误。
 // 面板退出后这个进程必须跟着走——否则机器上会留一个握着 root 的常驻进程。
+//
+// **它只接受 dialbind 一个动作。**
+//
+// 这是这个文件里最要紧的一条约束。常驻 helper 与一次性 tun-helper 的差别不只是
+// 寿命：它的套接字放在用户自己的运行目录里，同一个 uid 的任何进程都连得上，
+// 也能算出正确的 uid 通过 SO_PEERCRED。让它继续复用完整的 serveRequest，
+// 等于给一个同 uid 的普通进程配了半个 root——它可以要求 root 装默认路由、
+// 把本机 :53 DNAT 到任意地址、挂一条 DROP 全站的链、或者开一块 tun 网卡。
+// 而它本来只需要一件事：替我要一条钉在指定网卡上、已连通的 socket。
 func RunDialHelper(ctx context.Context, socketPath string, ownerUID int) error {
 	if socketPath == "" {
 		return errors.New("dial helper 需要一个套接字路径")
 	}
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return fmt.Errorf("建 dial helper 套接字目录: %w", err)
+	dir := filepath.Dir(socketPath)
+	if err := secureSocketDir(dir, ownerUID); err != nil {
+		return err
 	}
+	// umask 放到 bind 之前：套接字文件由内核创建，权限只在这一刻能定。
+	// 先 bind 再 chmod 有一段"文件已经存在、权限还是 0755"的窗口，
+	// 而这段时间恰恰是别人可以抢着连进来的窗口。
+	prevMask := unix.Umask(0o077)
 	ln, err := net.Listen("unix", socketPath)
+	unix.Umask(prevMask)
 	if err != nil {
 		return fmt.Errorf("监听 dial helper 套接字 %s: %w", socketPath, err)
 	}
 	defer func() { _ = ln.Close() }()
+	// 目录属主已经是桌面用户，套接字在 0700 目录里本来就只对那个 uid 可见；
+	// 但显式 chown + 0600 仍然要做：有人把路径配到了别处（比如 /tmp 下的固定名），
+	// 目录属主未必是我们期望的那个。
 	if ownerUID > 0 {
 		if err := os.Chown(socketPath, ownerUID, -1); err != nil {
 			return fmt.Errorf("把 dial helper 套接字交给 uid %d: %w", ownerUID, err)
@@ -77,31 +121,22 @@ func RunDialHelper(ctx context.Context, socketPath string, ownerUID int) error {
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		return fmt.Errorf("设 dial helper 套接字权限: %w", err)
 	}
-	// 面板没了就收工：一个握着重启权的常驻 root 进程不该比它的主人活得久。
-	ppid := os.Getppid()
-	go func() {
-		t := time.NewTicker(3 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if ppid <= 1 {
-					return
-				}
-				if err := syscall.Kill(ppid, 0); err != nil && errors.Is(err, syscall.ESRCH) {
-					_ = ln.Close()
-					return
-				}
-			}
-		}
-	}()
+	// 面板没了就收工：一个握着 root 的常驻进程不该比它的主人活得久。
+	//
+	// 这里以前看 ppid，而 ppid 是 **sudo**——面板被 kill -9 之后 sudo 还在等子进程，
+	// Kill(ppid,0) 一直成功，于是这个 root 进程永远留着，套接字也一直可连。
+	// 现在优先用面板通过 argv 传进来的真实 pid（--dial-helper-parent）；没传才退回 ppid。
+	watchParent(ctx, ln)
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
-	srv := &HelperServer{Timeout: 25 * time.Second}
+	// 只有这一个动作。加新动作前先问一句：它需要 root 吗？同 uid 的进程
+	// 发这个请求，会造成我们不想负责的后果吗？
+	srv := &HelperServer{
+		Timeout:     25 * time.Second,
+		OnlyActions: map[string]bool{ActionDialBind: true},
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -122,7 +157,85 @@ func RunDialHelper(ctx context.Context, socketPath string, ownerUID int) error {
 	}
 }
 
-// PersistentHelper 是**常驻**提权 helper 的客户端：让一个 root 子进程一直活着，
+// secureSocketDir 确保套接字所在目录是真实的、属主正确的 0700 目录。
+//
+// 三步都必须有，各自防一种具体的攻击：
+//
+//  1. MkdirAll 0700（不是 0777，也不是先建再 chmod）：目录一开始就不该让别人写。
+//  2. Lstat + !ModeSymlink：root 在这个路径上 bind 时，如果某一层是指向别处的
+//     符号链接，套接字就会被建到攻击者挑的位置，紧接着的 Chown 还会把那个位置
+//     交给他。Lstat 看的是链接本身而不是目标，所以能识破。
+//  3. Stat 核对属主：目录必须是 ownerUID 的（或 root 的，ownerUID=0 时）。
+//     别人拥有的目录里我们无权保证"没有别人能替换里面的东西"。
+func secureSocketDir(dir string, ownerUID int) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("建 dial helper 套接字目录: %w", err)
+	}
+	li, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("查看 dial helper 套接字目录: %w", err)
+	}
+	if li.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("dial helper 套接字目录 %s 是符号链接，拒绝在里面建套接字", dir)
+	}
+	if !li.IsDir() {
+		return fmt.Errorf("dial helper 套接字目录 %s 不是目录", dir)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("收紧 dial helper 套接字目录权限: %w", err)
+	}
+	// 属主核对：root 写进去的东西，不能落在一个别人能改的目录里。
+	//
+	// 允许三种情况：目录属于 root（root 自己建的）、属于 ownerUID（面板自己建的
+	// 私有目录，0700 下别人进不来）、或者当前进程就是那个 owner。除此之外拒绝：
+	// 一个第三方拥有的目录意味着我们无法保证里面不会被人替换。
+	st, ok := li.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("读不到 dial helper 套接字目录的属主")
+	}
+	cur := uint32(os.Geteuid())
+	if st.Uid != 0 && st.Uid != uint32(ownerUID) && st.Uid != cur {
+		return fmt.Errorf("dial helper 套接字目录 %s 属于 uid %d（期望 0、%d 或 %d），拒绝在其中建套接字",
+			dir, st.Uid, ownerUID, cur)
+	}
+	return nil
+}
+
+// watchParent 在面板消失时关掉监听，让这个 root 进程退出。
+//
+// 判据的顺序是有讲究的：先看 argv 传进来的真实面板 pid（dialHelperParentFlag），
+// 没有才看 ppid。ppid 是 sudo，而 sudo 在面板被 kill -9 之后仍会等子进程，
+// Kill(ppid,0) 一直成功——这正是"root helper 比主人活得久"的成因。
+func watchParent(ctx context.Context, ln net.Listener) {
+	pid := dialHelperParentPID()
+	// pid<=1：没有可看的父进程（或父进程是 init），只能靠 ctx。
+	if pid <= 1 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				// /proc/<pid> 是否存在比 kill(pid,0) 更可靠：
+				// 后者对"同一个 pid 被复用"看不出来，而 root 进程活得久，
+				// pid 复用在这里不是理论问题。
+				if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); err != nil {
+					logx.Debugf("dial helper: 面板进程 %d 已不在，退出", pid)
+					_ = ln.Close()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// SecureSocketDir 是 secureSocketDir 的导出包装，给用例用。
+func SecureSocketDir(dir string, ownerUID int) error { return secureSocketDir(dir, ownerUID) }
+
 // 每次拨号只向它要一条 socket，不再为每条流付 sudo 与进程起落。
 //
 // 2026-11-03 之前这里只有一条 unix 连接，整次往返都抱在一把互斥锁里。
@@ -299,8 +412,17 @@ func (p *PersistentHelper) start(ctx context.Context) error {
 			return fmt.Errorf("拉起常驻提权 helper: %w", err)
 		}
 	} else {
+		// 与一次性 helper 同一条纪律：调 sudo 之前先核对被提权执行的那个文件。
+		// sudoers 只认路径，而路径往往指向用户可写的仓库目录。
+		if err := checkHelperBinary(helperBinaryFromArgv(p.Argv)); err != nil {
+			p.drop()
+			return err
+		}
 		argv := append(append([]string{}, p.Argv...),
-			"--dial-helper", "--dial-helper-connect="+path, dialHelperOwnerFlag+strconv.Itoa(os.Getuid()))
+			"--dial-helper", "--dial-helper-connect="+path,
+			dialHelperOwnerFlag+strconv.Itoa(os.Getuid()),
+			// 传面板自己的 pid，而不是让 helper 去看 ppid（那是 sudo）。
+			dialHelperParentFlag+strconv.Itoa(os.Getpid()))
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Stderr = &p.stderr
 		if err := cmd.Start(); err != nil {
