@@ -24,7 +24,7 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper
+.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper cover
 
 all: build
 
@@ -80,6 +80,12 @@ frontend-test:
 ## 240 秒既够最慢的那个包，又能在挂住时把 goroutine 栈打出来，直接点名是谁在等锁。
 test:
 	go test ./... -timeout 240s
+
+## cover 写出覆盖率文件，不设阈值。数字在 dist/ 下，不进仓库。
+cover:
+	mkdir -p dist
+	go test ./... -count=1 -coverprofile=dist/coverage.out -timeout 240s
+	go tool cover -func=dist/coverage.out | tail -1
 
 ## test-offline 在一个只有回环的网络命名空间里跑全套测试：
 ## 任何一条用例只要还偷偷依赖真实 DNS / 外网 / 本机路由，这里就会红。

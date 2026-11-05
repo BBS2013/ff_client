@@ -10,7 +10,7 @@
 // 忙态分两层也在这里定：全局动作（启停、切模式、切节点、TUN、系统代理）共用
 // 一个 busy，它们会互相打断，灰掉是对的；页内动作（测速、存节点、改规则、
 // 保存配置）由各自组件自己管，不该让「正在测速」把顶栏的「停止」也灰掉。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, markRaw, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Dashboard from './components/Dashboard.vue'
 import LogStream from './components/LogStream.vue'
 import Nodes from './components/Nodes.vue'
@@ -443,13 +443,14 @@ async function poll(): Promise<void> {
       const [s, t] = await Promise.allSettled([status(), traffic()])
       const bad: string[] = []
       if (s.status === 'fulfilled') {
-        // 只有最新一次的结果允许落地：旧请求晚到不能把新状态冲回去。
-        if (seq === pollSeq) snap.value = s.value
+        // markRaw：快照是只读投影，做成深层响应式会让几百条连接每秒都被代理一遍。
+        // 组件读字段、不改字段，整包替换就够触发更新。
+        if (seq === pollSeq) snap.value = markRaw(s.value)
       } else {
         bad.push(`状态 ${errorText(s.reason)}`)
       }
       if (t.status === 'fulfilled') {
-        if (seq === pollSeq) tr.value = t.value
+        if (seq === pollSeq) tr.value = markRaw(t.value)
       } else {
         bad.push(`流量 ${errorText(t.reason)}`)
       }

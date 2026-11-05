@@ -40,6 +40,11 @@ rc=$?
 after=$(count_samples)
 
 if ((rc == 0)); then
+  if printf '%s' "$out" | grep -q 'no fuzz tests'; then
+    echo "✗ $PKG/$NAME 没有这个模糊目标（go test 仍返回 0，门禁会假绿）" >&2
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    exit 1
+  fi
   printf '%s\n' "$out" | tail -2
   exit 0
 fi

@@ -168,6 +168,13 @@ type NodeTraffic struct {
 // 超出上限的新条目并进一个「其余」桶，界面上的总数仍然对得上。
 const ruleKeyCap = 256
 
+// ruleHitCap 是命中次数表的上限，与字节账同一量级。
+// ruleHitOverflow 收纳超出上限的新键，避免「见过的主机数」无界增长。
+const (
+	ruleHitCap      = 256
+	ruleHitOverflow = "（其余规则）"
+)
+
 // ruleRowsShown 是给界面看的行数（含那一条合并行）。
 const ruleRowsShown = 12
 
@@ -378,6 +385,11 @@ func (r *Registry) countRuleHitLocked(matched string) {
 		// 按规则的字节账同属"本次会话的读数"：只清命中不清字节，
 		// 界面上就会留下"规则页说没命中过、流量页说它刚搬了 2GB"。
 		r.ruleClosed = make(map[string]ruleBytes)
+	}
+	// 键跟着「规则 + via 主机」走时，不同主机会无限长。字节账有上限，
+	// 命中次数以前没有。超过上限的新键并进溢出桶，已经在册的键继续累加。
+	if _, ok := r.ruleHits[matched]; !ok && len(r.ruleHits) >= ruleHitCap {
+		matched = ruleHitOverflow
 	}
 	r.ruleHits[matched]++
 }

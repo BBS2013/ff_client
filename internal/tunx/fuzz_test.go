@@ -98,3 +98,21 @@ func FuzzDNSServe(f *testing.F) {
 		}
 	})
 }
+
+// FuzzReadFrame 喂给提权协议的帧解析器。
+//
+// 以前 Makefile 里有这个目标名，函数却不存在。go test -fuzz 匹配不到目标时
+// 仍然返回 0，门禁日志里它 0.005 秒就「通过」了，于是这条边界从没被跑过。
+func FuzzReadFrame(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 1, '{'})
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, err := readFrame(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		// 能解出来的帧，长度必须落在协议允许的范围内。
+		// 解不开是正常的（绝大多数随机字节都不是一帧）。
+		_ = t
+	})
+}

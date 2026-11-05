@@ -178,7 +178,7 @@ function render(): void {
   // notMerge=true 表示不与旧配置合并、直接整体替换：点数每秒都在变，
   // 合并反而要额外处理新旧长度不一致。代价是丢掉动画过渡，
   // 但采样间隔本来就 1 秒，平滑动画在这里只会让曲线看起来在追赶。
-  chart.setOption(option(), { notMerge: true })
+  chart.setOption(option(), { notMerge: false, lazyUpdate: true })
 }
 
 /** 从隐藏切到可见时容器才有宽度，这时必须补一次 resize + 重绘。 */

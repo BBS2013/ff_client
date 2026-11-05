@@ -37,6 +37,7 @@ if [ "$SKIP_FRONTEND" -eq 0 ]; then
   # node_modules 已有就不重装，CI 里首次跑会自动落到这里。
   [ -d node_modules ] || npm ci
   npm run build
+  "$ROOT/scripts/check-dist.sh"
   # vite.config.ts 里 outDir 是相对 frontend/ 的 'dist'。
   # gui.go 的 //go:embed all:frontend/dist 按这个路径找，别改成 ../frontend/dist。
   [ -f "$ROOT/frontend/dist/index.html" ] || { echo "前端产物缺失: frontend/dist/index.html" >&2; exit 1; }
@@ -46,7 +47,7 @@ fi
 echo "==> 编译 GUI 二进制"
 # Wails 的 GTK 后端必须走 CGO，CGO_ENABLED=0 编不出窗口。
 mkdir -p "$(dirname "$OUT")"
-CGO_ENABLED=1 go build -tags "$TAGS" -ldflags="$LDFLAGS" -o "$OUT" .
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -tags "$TAGS" -ldflags="$LDFLAGS" -o "$OUT" .
 
 echo "完成: $OUT ($(du -h "$OUT" | cut -f1))"
 echo "提示: 这是唯一产物——面板、代理、root 侧 tun.helper 都指着它。"

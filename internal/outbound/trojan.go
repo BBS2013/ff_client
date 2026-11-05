@@ -42,6 +42,9 @@ type Trojan struct {
 	insecure     bool
 	passwordHash string
 	handshakeTO  time.Duration
+	// sessions 让同一节点的后续连接复用 TLS 会话票证，少一次握手往返。
+	// 不做连接池：服务端把一条 TLS 连接当成一条转发流的边界。
+	sessions tls.ClientSessionCache
 
 	mu        sync.Mutex
 	connected bool
@@ -111,6 +114,7 @@ func NewTrojan(sc config.ServerConfig, handshakeTimeout time.Duration, resolver 
 		insecure:     sc.TLS.Insecure,
 		passwordHash: hex.EncodeToString(sum[:]),
 		handshakeTO:  handshakeTimeout,
+		sessions:     tls.NewLRUClientSessionCache(64),
 	}, nil
 }
 
@@ -204,6 +208,7 @@ func (t *Trojan) DialContext(ctx context.Context, target string) (net.Conn, erro
 		ServerName:         t.sni,
 		InsecureSkipVerify: t.insecure, //nolint:gosec // 由配置显式决定，trojan 节点常用自签证书
 		NextProtos:         []string{trojanALPN},
+		ClientSessionCache: t.sessions,
 	})
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = tc.SetDeadline(deadline)

@@ -78,7 +78,7 @@ if ! pkg-config --exists webkit2gtk-4.0 2>/dev/null || ! pkg-config --exists gtk
   echo "   装上开发包再打包：sudo apt install libgtk-3-dev libwebkit2gtk-4.0-dev" >&2
   exit 1
 fi
-go build -trimpath -tags "gui production" -ldflags "$LDFLAGS" -o "$STAGE/wps_app-gui" "$ROOT"
+go build -trimpath -buildvcs=false -tags "gui production" -ldflags "$LDFLAGS" -o "$STAGE/wps_app-gui" "$ROOT"
 "$STAGE/wps_app-gui" -version >"$STAGE/BUILD-INFO.txt"
 
 say "拷资源与文档"
