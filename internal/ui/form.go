@@ -25,6 +25,8 @@ type InboundForm struct {
 	// Username/Password 是掩码值，不是明文；HTTP 入站恒为空。
 	Username string `json:"username"`
 	Password string `json:"password"`
+	// AllowLAN 与 config.InboundConfig.allow_lan 对应；面板无单独开关，但保存时必须原样带回。
+	AllowLAN bool `json:"allowLan"`
 }
 
 // TUNForm 是 TUN 模式的可编辑形态。字段与 config.TUNConfig 一一对应，
@@ -101,7 +103,7 @@ func readForm(path string) (ConfigForm, error) {
 		},
 	}
 	for _, in := range cfg.Inbounds {
-		item := InboundForm{Type: in.Type, Listen: in.Listen}
+		item := InboundForm{Type: in.Type, Listen: in.Listen, AllowLAN: in.AllowLAN}
 		if in.Username != "" {
 			item.Username = MaskedSecret
 		}
@@ -159,7 +161,11 @@ func writeForm(path string, f ConfigForm) error {
 	if len(f.Inbounds) > 0 {
 		inbounds := make([]config.InboundConfig, 0, len(f.Inbounds))
 		for _, in := range f.Inbounds {
-			item := config.InboundConfig{Type: strings.TrimSpace(in.Type), Listen: strings.TrimSpace(in.Listen)}
+			item := config.InboundConfig{
+				Type:     strings.TrimSpace(in.Type),
+				Listen:   strings.TrimSpace(in.Listen),
+				AllowLAN: in.AllowLAN,
+			}
 			// 入站的口令与 auth 同理：拿到掩码就沿用原来的，
 			// 留空表示「这条入站不用认证」。
 			old := findInbound(cur.Inbounds, item.Type, item.Listen)

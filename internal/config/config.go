@@ -244,6 +244,9 @@ type InboundConfig struct {
 	// 都非空时启用 RFC 1929 用户名密码认证。
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+	// AllowLAN 显式允许非回环 listen（如 0.0.0.0:7893）在无 socks5 认证时
+	// 对局域网开放。默认 false：误配成对网段监听且无口令时 Validate 会拒绝。
+	AllowLAN bool `yaml:"allow_lan,omitempty"`
 }
 
 type GeoIPConfig struct {
@@ -1008,6 +1011,25 @@ func (c *Config) Validate() error {
 		if in.Type == "http" && (in.Username != "" || in.Password != "") {
 			return fmt.Errorf("inbound %s (%s): http 入站不支持用户名密码认证", in.Type, in.Listen)
 		}
+		loopback, err := listenHostLoopback(in.Listen)
+		if err != nil {
+			return fmt.Errorf("inbound %s (%s): %w", in.Type, in.Listen, err)
+		}
+		if !loopback {
+			hasAuth := strings.TrimSpace(in.Username) != "" && strings.TrimSpace(in.Password) != ""
+			if !hasAuth && !in.AllowLAN {
+				if in.Type == "http" {
+					return fmt.Errorf(
+						"inbound %s (%s): http 入站不支持认证，非回环监听必须显式设置 allow_lan: true（对局域网开放无认证代理风险极大）",
+						in.Type, in.Listen,
+					)
+				}
+				return fmt.Errorf(
+					"inbound %s (%s): 非回环监听必须同时填写 username 与 password，或显式设置 allow_lan: true（对局域网开放无认证代理风险极大）",
+					in.Type, in.Listen,
+				)
+			}
+		}
 	}
 	for _, s := range c.DNS.Servers {
 		if s == "" {
@@ -1235,6 +1257,29 @@ func validateTUNv6(t TUNConfig) error {
 
 // secondHost 返回某个前缀里「网卡的下一个可用地址」，用作假 DNS 的监听地址。
 // 172.19.0.1/30 → 172.19.0.2；网段只有一个可用地址时原样返回。
+// listenHostLoopback 判断 inbound listen 是否只绑定回环。
+// 缺 host（":7891"）、0.0.0.0、:: 以及任意非回环地址均视为 false。
+func listenHostLoopback(listen string) (bool, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil {
+		return false, err
+	}
+	if port == "" {
+		return false, fmt.Errorf("缺端口")
+	}
+	if host == "" {
+		return false, nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true, nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false, fmt.Errorf("listen 主机 %q 不是合法 IP", host)
+	}
+	return ip.IsLoopback(), nil
+}
+
 func secondHost(address string) string {
 	prefix, err := netip.ParsePrefix(address)
 	if err != nil {
