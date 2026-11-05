@@ -98,6 +98,10 @@ func New(cfgPath string) *App {
 		logs:      newLogBuffer(logCapacity),
 		startedAt: time.Now(),
 	}
+	// 实时 LogStream 读的是同一份环形缓冲；在写入时掩码，与导出路径一致。
+	a.logs.mask = func(msg string) string {
+		return diag.MaskTextSecrets(a.svc.DiskConfig(), msg)
+	}
 	a.removeHook = logx.AddHook(a.logs.add)
 	// 崩溃自愈：上一次如果是异常退出（崩溃 / kill -9），桌面会永远停在
 	// mode=manual 指向一个已经不存在的端口——整机断网，且只报「代理连接被拒绝」。

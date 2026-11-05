@@ -93,14 +93,23 @@ func maskAll(text string, secrets []string) string {
 	return text
 }
 
-// MaskText 给报告之外、同样要从这台机器上出去的一份文本用（面板上的「导出日志」）。
-// 判据与报告完全一致；配置读不懂时形状那层照跑，理由同上。
-func MaskText(cfgPath string, text string) string {
-	secrets := []string{}
-	if cfg, err := config.Load(cfgPath); err == nil {
+// MaskTextSecrets 与 MaskText 同一套掩码，但口令集合来自已加载的配置（可复用 service 的磁盘缓存）。
+func MaskTextSecrets(cfg *config.Config, text string) string {
+	var secrets []string
+	if cfg != nil {
 		secrets = collectSecrets(cfg)
 	}
 	return maskAll(text, secrets)
+}
+
+// MaskText 给报告之外、同样要从这台机器上出去的一份文本用（面板上的「导出日志」）。
+// 判据与报告完全一致；配置读不懂时形状那层照跑，理由同上。
+func MaskText(cfgPath string, text string) string {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return maskAll(text, nil)
+	}
+	return MaskTextSecrets(cfg, text)
 }
 
 // hideURLTails / hideURLTail 只留 scheme://host，路径与查询整个隐去。
