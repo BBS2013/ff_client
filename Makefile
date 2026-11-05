@@ -24,7 +24,7 @@ GUI_TAGS := gui production
 GATE_DIR     := dist/gate
 GATE_GUI_BIN := $(GATE_DIR)/wps_app-gui
 
-.PHONY: all build build-gui gate-gui frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper cover
+.PHONY: all build build-gui gate-gui gate-pr frontend frontend-test test test-offline test-netns-fw fuzz-smoke bench latency paint race vet fmt fmt-check gate clean check package acceptance acceptance-tun soak soak-once probe-attribution dist-check hooks install-helper cover
 
 all: build
 
@@ -200,6 +200,11 @@ fmt-check:
 ## 现在这几条都带上了前提检查：解析器在编答案时它们会**带原因地跳过**而不是红
 ## （`switch_test.go::fakeDNSActive`、`diag_test.go::TestReportNormalResolvConfIsQuiet` 已收窄判据）；
 ## 但跳过等于这一格没验，所以门禁轮次仍应在面板停着的时候跑。
+## gate-pr 是 PR / CI 快路径：格式、vet、Go 单测、前端构建（含 vue-tsc 与 dist 自洽）、前端单测。
+## 不含 race / test-offline / test-netns-fw / fuzz-smoke / gate-gui（后者见 .github/workflows/nightly.yml）。
+gate-pr: fmt-check vet test frontend frontend-test
+	@echo "PR 门禁通过（未含 race / 离线 netns / fuzz / gate-gui；本地全套仍用 make gate）"
+
 gate: fmt-check vet test race test-offline test-netns-fw fuzz-smoke frontend frontend-test gate-gui
 	@echo "全套门禁通过（GUI 产物: $(GATE_GUI_BIN)，未触碰 ./$(GUI_BIN)）"
 

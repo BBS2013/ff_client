@@ -5330,6 +5330,8 @@ make gate        # 一条命令跑全套离线门禁，约 2 分钟
 它按顺序做：`fmt-check` → `build` → `vet`（两种 tag）→ `test` → `race` →
 `test-offline` → `fuzz-smoke` → `frontend`（含 `vue-tsc` 类型门）→ `frontend-test` → `gate-gui`。
 **全程不碰外网、不碰线上配置、不碰正在跑的面板**，所以断网的机器和 CI 都能跑。
+GitHub 上对 `main` 的 push/PR 会跑 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)（`make gate-pr` 快路径）；
+`race`、离线 netns、模糊测试与 `gate-gui` 等在 [`.github/workflows/nightly.yml`](.github/workflows/nightly.yml) 里补跑。
 
 这里要分清两条容易混的命令，它们不是一回事：
 
